@@ -45,6 +45,14 @@ def interp_surv(P, t, H=E2):
     return np.exp((1 - w) * np.log(np.maximum(Pg[k], 1e-9)) + w * np.log(np.maximum(Pg[k + 1], 1e-9)))
 
 
+def recompute_cost(n, npf, na, p):
+    """What recomputing n tokens now costs, as decide prices option r: the request's own time
+    x = n f0 (1 + att n / 2000) + t0, plus the delay to the npf requests in prefill and the about na x admitted
+    while it runs, x each. Returns (x, x (1 + npf + na x))."""
+    x = n * p.f0 * (1 + p.att * n / 2000) + p.t0
+    return x, x * (1 + npf + na * x)
+
+
 def decide(S, N, on_disk, idle_g, idle_c, live, p, now, options=OPTIONS, write="rule"):
     """S: P(T > TG) for the idle period (interp_surv of the curve on TG). N: the session's KV tokens.
     on_disk: tokens of it already on disk. idle_g, idle_c: (age, tokens) of the idle periods still open

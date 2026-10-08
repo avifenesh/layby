@@ -39,7 +39,7 @@ class ParkState:
         # that out of the scheduler's hot path
         self.ended = {("g", False): [], ("g", True): [], ("c", False): [], ("c", True): []}
         self.hints: "queue.SimpleQueue" = queue.SimpleQueue()   # (key, surv) from the hint server
-        self.counts = dict(none=0, ins=0, park=0, drop=0, hints=0, late=0, no_entry=0, spill=0)
+        self.counts = dict(none=0, ins=0, park=0, drop=0, hints=0, late=0, no_entry=0, spill=0, defer_giveup=0)
         self.last_decisions: list = []
         # research logs (bounded): one row per placement decision with its cost terms, one per admission with
         # where its prompt came from; served at /log so a run can be read decision by decision

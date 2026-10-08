@@ -167,7 +167,7 @@ stored nothing for that model, and at equal GPU KV the engine ran out of memory 
 
 ## Three adapter lessons
 
-Each one cost real-engine runs before it was found. All three are fixed, and each has a test that fails on the old
+Each one cost real-engine runs before it was found. All four are fixed, and each has a test that fails on the old
 code.
 
 1. **Do not rewrite what is already on disk.** vLLM sends a request-level tier every chunk of the request again on
@@ -183,6 +183,13 @@ code.
    the rest of the session: with the rule off it recomputed 2.02M tokens against 1.10M for stock vLLM. It now walks
    keys last first and copies the running vLLM's own LRU order (`tests/test_policy_prefix.py`,
    `tests/test_policy_lru_parity.py`).
+4. **Bound a deferral at what giving up costs.** vLLM holds a request for whole scheduler steps while the disk tier
+   promotes its prefix to RAM. With two engines on one 0.55 GB/s disk, 33 of 1,908 resumed turns waited 30 to 42
+   minutes for their first token (p99 1,918 s against 286 s with no disk tier). Predicting the disk cost before the
+   first lookup and recomputing instead cut the p99 but recomputed four of five disk returns and raised p50 and p95.
+   The adapter now lets the promotion run and gives up only once the wait exceeds the recompute of the tokens it
+   waits on, at the measured prefill speed: the request is admitted with the prefix RAM can load now and recomputes
+   the rest; the promotion lands in RAM when the disk delivers it (`tests/test_defer_cap.py`).
 
 ## Names
 

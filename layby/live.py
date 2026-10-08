@@ -22,7 +22,7 @@ class Live:
         self.acc = dict(age_g=0.0, w_g=0.0, age_c=0.0, w_c=0.0, ne_g=0.0, ne_c=0.0, miss_g=0.0, miss_c=0.0,
                         busy_cpu=0.0, busy_disk=0.0, pf=0.0,
                         n_cpu=0.0, wait_cpu=0.0, n_disk=0.0, wait_disk=0.0, nw=0.0, n_adm=0.0, qwait=0.0,
-                        n_defer=0.0, defer=0.0)
+                        n_defer=0.0, defer=0.0, n_giveup=0.0, giveup_saved=0.0)
         self.km = {k: np.zeros(len(AG) - 1) for k in ("ev_g", "ce_g", "ev_c", "ce_c", "lg", "lc")}
 
     def tick(self, now):

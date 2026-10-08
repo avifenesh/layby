@@ -10,6 +10,13 @@ Measured here, fed to layby.vllm.state.STATE:
                 deferred while promoting their prefix, the wait from the first deferral (Live n_defer,
                 defer: the measured cost of a restore from disk); waiting and prefilling request
                 counts over time (Live nw, pf)
+  deferral cap  a deferral runs until it has cost what giving up would: once the time since the first
+                deferral exceeds the recompute of the tokens it waits on (prompt - local hit - tokens ready
+                now, at the measured prefill speed, priced as layby.rule prices a recompute), the base lookup
+                runs with every chunk not ready read as a miss, so the scheduler admits the request with the
+                prefix the CPU tier can load now and recomputes the rest (counts defer_giveup, rlog
+                giveup=True). The promotion stays in flight and lands in the CPU tier when the disk delivers
+                it; the seconds that saved are measured then (Live n_giveup, giveup_saved)
   steps         time between consecutive schedules and the tokens prefilled in them (Speeds.step: t0, f0)
   CPU link      per load job: submit to completion, transfer bytes and time from the worker (Speeds.link,
                 Live n_cpu / wait_cpu / busy_cpu)
@@ -32,9 +39,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import Of
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_utils import get_block_hash
+from vllm.v1.kv_offload.base import LookupResult
 from vllm.v1.utils import compute_iteration_details
 
-from layby.rule import TG, decide, interp_surv
+from layby.rule import TG, decide, interp_surv, recompute_cost
 from layby.vllm import server
 from layby.vllm.state import STATE
 
@@ -96,6 +104,22 @@ class _GpuResidency:
         return True
 
 
+class _ReadyOnly:
+    """The offloading manager with every chunk that is not ready now read as a miss. The base lookup run
+    through it returns the prefix the CPU tier can load this step instead of deferring the request; it
+    stops at the first miss, so it starts no promotion past the one in flight."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+    def lookup(self, key, req_context, **kw):
+        r = self.inner.lookup(key, req_context, **kw)
+        return r if r is LookupResult.HIT else LookupResult.MISS
+
+
 def _request_keys(req_status):
     """The request's offloaded chunk keys across every KV group (a hybrid model such as GLM 5.3 Flash keeps MLA
     latents, indexer keys and linear-attention checkpoints in separate groups, and a load needs all of them), in
@@ -139,6 +163,8 @@ class ParkConnector(OffloadingConnector):
         STATE.gpu_tokens = kv_cache_config.num_blocks * STATE.block_tokens
         self._waiting: dict[str, float] = {}           # request id -> time added, until admitted
         self._deferred: dict[str, float] = {}          # request id -> first lookup that deferred it
+        # request id -> its give-up (the deferral it stopped), until the promotion it waited on resolves
+        self._giveups: dict[str, dict] = {}
         # request id -> the GPU-local prefix hit (tokens) vLLM passed to the last lookup. vLLM calls
         # update_state_after_alloc before it sets request.num_computed_tokens, so a new request reads 0 there
         self._local: dict[str, int] = {}
@@ -190,32 +216,114 @@ class ParkConnector(OffloadingConnector):
         super().on_new_request(request)
 
     def get_num_new_matched_tokens(self, request, num_computed_tokens):
-        self._local[request.request_id] = int(num_computed_tokens)
+        rid = request.request_id
+        self._local[rid] = int(num_computed_tokens)
         out = super().get_num_new_matched_tokens(request, num_computed_tokens)
-        if out[0] is None and request.request_id not in self._deferred:
+        if out[0] is not None:
+            return out
+        now = time.monotonic()
+        t0 = self._deferred.get(rid)
+        if t0 is None:
             # the offload tier is promoting part of the prefix (disk -> CPU): the request waits steps
-            self._deferred[request.request_id] = time.monotonic()
+            self._deferred[rid] = now
+            return out
+        alt = _safe("defer cap", self._defer_cap, request, int(num_computed_tokens), now - t0, now)
+        return out if alt is None else alt
+
+    def _defer_cap(self, request, local: int, waited: float, now: float):
+        """The bounded deferral: once the wait since the first deferral exceeds the recompute of the tokens it
+        waits on, give up and return what the base can load now (0 if nothing). None: keep waiting."""
+        cs = self.connector_scheduler
+        rs = cs._req_status.get(request.request_id)
+        if rs is None or rs.transfer_jobs:
+            return None     # the base holds a request with its own transfers in flight; that is not a promotion
+        ready, key = self._ready_tokens(rs, local)
+        n = max(request.num_prompt_tokens - local - ready, 0)
+        L = STATE.live
+        x, cap = recompute_cost(n, L.rate("pf", now), L.rate("n_adm", now), STATE.params())
+        if waited <= cap:
+            return None
+        proxy = _ReadyOnly(cs.manager)
+        cs.manager = proxy
+        try:
+            out = cs.get_num_new_matched_tokens(
+                request, local, max_num_new_tokens=self._max_loadable_tokens(request, local))
+        finally:
+            cs.manager = proxy.inner
+        if out[0] is None:
+            return None     # another request is loading these chunks to the GPU: that wait ends with its load
+        g = self._giveups.get(request.request_id)
+        if g is None or g.get("admitted"):
+            # one give-up per deferral: a request the scheduler could not fit after giving up gives up again
+            # next step without a second count (a preempted request's new deferral is a new give-up)
+            STATE.counts["defer_giveup"] += 1
+            g = self._giveups[request.request_id] = dict(t=now, ctx=rs.req_context)
+        g.update(x=x, waited=waited, cap=cap, ready=ready, n=n, key=key)
+        logger.debug("park: request %s gave up a %.1f s deferral (cap %.2f s, %d tokens ready, %d to recompute)",
+                     request.request_id, waited, cap, ready, n)
         return out
+
+    def _ready_tokens(self, rs, local: int):
+        """Tokens past the local hit that every KV group can load now, and the first chunk key that is not
+        ready. Read from the CPU tier only (no lookup that could start a promotion)."""
+        mgr = self.connector_scheduler.manager
+        prim = getattr(mgr, "primary_tier", mgr)
+        ready, pending = None, None
+        for g, gs in zip(self.connector_scheduler.config.kv_group_configs, rs.group_states):
+            tc = g.tokens_per_chunk
+            start = local // tc
+            n = 0
+            for key in gs.offload_keys[start:]:
+                if prim.lookup(key, rs.req_context) is not LookupResult.HIT:
+                    if pending is None:
+                        pending = key
+                    break
+                n += 1
+            tokens = max(tc * (start + n) - local, 0)
+            ready = tokens if ready is None else min(ready, tokens)
+        return ready or 0, pending
+
+    def _settle_giveups(self, now: float) -> None:
+        """A give-up's saving is known once the promotion it waited on resolves: the chunk is ready in the CPU
+        tier (or gone, the promotion failed or its slot was evicted). The deferral would have ended then at the
+        earliest, so the request saved that remaining wait less the recompute it paid instead."""
+        if not self._giveups:
+            return
+        mgr = self.connector_scheduler.manager
+        prim = getattr(mgr, "primary_tier", mgr)
+        for rid, g in list(self._giveups.items()):
+            if g["key"] is not None and prim.lookup(g["key"], g["ctx"]) is LookupResult.HIT_PENDING:
+                continue
+            STATE.live.add(now, n_giveup=1.0, giveup_saved=(now - g["t"]) - g["x"])
+            del self._giveups[rid]
 
     def _admit(self, request, num_external_tokens):
         t = self._waiting.pop(request.request_id, None)
         td = self._deferred.pop(request.request_id, None)
         local = self._local.pop(request.request_id, None)
+        g = self._giveups.get(request.request_id)
+        if g is not None:
+            if g.get("admitted"):
+                g = None             # an earlier admission's give-up (the request was preempted since)
+            else:
+                g["admitted"] = True
         if td is not None:
             now = time.monotonic()
-            STATE.live.add(now, n_defer=1.0, defer=now - td)
+            # a return whose prefix was on disk paid the wait, and after a give-up the recompute too
+            STATE.live.add(now, n_defer=1.0, defer=now - td + (g["x"] if g is not None else 0.0))
         if t is not None:
             now = time.monotonic()
             STATE.live.add(now, n_adm=1.0, qwait=now - t)
             self._account_misses(request, num_external_tokens, now,
-                                 request.num_computed_tokens if local is None else max(local, request.num_computed_tokens))
+                                 request.num_computed_tokens if local is None else max(local, request.num_computed_tokens),
+                                 g)
 
     def update_state_after_alloc(self, request, blocks, num_external_tokens: int):
         out = super().update_state_after_alloc(request, blocks, num_external_tokens)
         _safe("admission", self._admit, request, num_external_tokens)
         return out
 
-    def _account_misses(self, request, ext: int, now: float, local: int) -> None:
+    def _account_misses(self, request, ext: int, now: float, local: int, giveup=None) -> None:
         """The latency this admission loses to KV the GPU and the CPU tier evicted (and how long
         ago): the load of what comes from outside the GPU, at the CPU link's measured speed and wait,
         and the recompute of what comes from nowhere, at the measured prefill speed; each counted with
@@ -224,8 +332,10 @@ class ParkConnector(OffloadingConnector):
         prompt = request.num_prompt_tokens
         rec = max(prompt - local - ext, 0)
         params = getattr(request, "kv_transfer_params", None) or {}
-        STATE.rlog.append(dict(t=round(now, 3), sess=session_of(params.get("park_key")), P=prompt, local=local,
-                               ext=ext, rec=rec))
+        row = dict(t=round(now, 3), sess=session_of(params.get("park_key")), P=prompt, local=local, ext=ext, rec=rec)
+        if giveup is not None:
+            row.update(giveup=True, wait=round(giveup["waited"], 3), cap=round(giveup["cap"], 3), ready=giveup["ready"])
+        STATE.rlog.append(row)
         del STATE.rlog[:-20000]
         if prompt - local <= 0:
             return
@@ -261,6 +371,7 @@ class ParkConnector(OffloadingConnector):
         now = time.monotonic()
         _safe("idle", STATE.flush_idle, now)
         _safe("hints", self._drain_hints, now)
+        _safe("giveups", self._settle_giveups, now)
         _safe("step", self._step, scheduler_output, now)
         meta = super().build_connector_meta(scheduler_output)
         for job_id, job in meta.load_jobs.items():
@@ -408,3 +519,4 @@ class ParkConnector(OffloadingConnector):
             del self._finished[k]
         self._early = {k: v for k, v in self._early.items() if now - v[0] <= HORIZON}
         self._loads = {j: v for j, v in self._loads.items() if now - v[0] <= HORIZON}
+        self._giveups = {k: g for k, g in self._giveups.items() if now - g["t"] <= HORIZON}
