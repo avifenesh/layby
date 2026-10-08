@@ -1,0 +1,60 @@
+{
+ "name": "Layby real-engine workloads",
+ "description": "Replay workloads for engine/replay.py, drawn from the ReturnBench pools (bench/pools, bench/LICENSES.md). Content-free: token counts, gaps, kinds and Layby-Dwell curves. Each file carries the licenses of the pools it draws from. Check: python scripts/verify_manifest.py.",
+ "files": [
+  {
+   "path": "mix36_w0.json",
+   "bytes": 401647,
+   "sha256": "16843705ca4fb58724696eb7511c60ec15d5829b4d575da300dd46bf2be1d730",
+   "sessions": 36,
+   "turns": 916,
+   "source_pools": [
+    "swechat",
+    "tracelab_claude",
+    "wildchat"
+   ],
+   "licenses": {
+    "swechat": "ODC-BY-1.0",
+    "tracelab_claude": "CC-BY-4.0",
+    "wildchat": "ODC-BY-1.0"
+   },
+   "build": "python engine/build_scaled_workload.py mix36_w0.json 36 0 bench/pools/swechat.json bench/pools/tracelab_claude.json bench/pools/wildchat.json"
+  },
+  {
+   "path": "mix36_real.json",
+   "bytes": 726057,
+   "sha256": "c05e2d8cf083198f6e75a136ceb02872fcb1509c00bb692ab387f507b65c694e",
+   "sessions": 36,
+   "turns": 1649,
+   "source_pools": [
+    "swechat",
+    "tracelab_claude",
+    "wildchat"
+   ],
+   "licenses": {
+    "swechat": "ODC-BY-1.0",
+    "tracelab_claude": "CC-BY-4.0",
+    "wildchat": "ODC-BY-1.0"
+   },
+   "build": "engine/build_real_workload.py from the real-length pools (bench/REAL_LENGTH.md, bench/build/build_replay_pop.py --no-scale) with their Layby-Dwell curves; see engine/REPRODUCE.md"
+  },
+  {
+   "path": "mix150_real.json",
+   "bytes": 3451604,
+   "sha256": "a38009a781d5651a37ae5d8879f60882219552496953c676062516da1cadf572",
+   "sessions": 150,
+   "turns": 7858,
+   "source_pools": [
+    "swechat",
+    "tracelab_claude",
+    "wildchat"
+   ],
+   "licenses": {
+    "swechat": "ODC-BY-1.0",
+    "tracelab_claude": "CC-BY-4.0",
+    "wildchat": "ODC-BY-1.0"
+   },
+   "build": "python engine/build_real_workload.py mix150_real.json 150 --pools swechat.real.json:swechat.real.refs.parquet tracelab_claude.real.json:tracelab_claude.real.refs.parquet wildchat.real.json:wildchat.real.refs.parquet --probs CURVES.parquet (inputs from bench/REAL_LENGTH.md; see engine/REPRODUCE.md)"
+  }
+ ]
+}

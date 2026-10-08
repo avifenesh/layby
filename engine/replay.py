@@ -9,7 +9,8 @@ way they would a real agent. Output length is fixed per turn (ignore_eos). The m
 the idle period after a turn rides on that turn's request as vllm_xargs.park_hint.
 
 Records per turn: session, turn, kind, prompt tokens, hint, TTFT, end-to-end time, queue start.
-Scrapes /metrics before and after.
+Scrapes /metrics before and after. Writes OUT.env.json beside the output (GPUs, driver, torch and CUDA versions,
+repo commit, server version; every field optional).
 
 SGLang (--engine sglang): /generate with input_ids and sampling_params (max_new_tokens, ignore_eos,
 temperature 0), streamed for TTFT; the output token ids come from the stream (cumulative by default,
@@ -25,7 +26,7 @@ turn's park hint is still posted (the session simply does not return within the 
 Usage: replay.py replay.json OUT.jsonl --url http://127.0.0.1:8000 --hint none|gbm|oracle
        [--model Qwen/Qwen3-8B] [--vocab 150000] [--engine vllm|sglang] [--window SECONDS]
 """
-import argparse, asyncio, json, random, time
+import argparse, asyncio, json, os, random, subprocess, sys, time
 import aiohttp
 
 ap = argparse.ArgumentParser()
@@ -243,10 +244,49 @@ async def scrape(http, tag):
     out.write(json.dumps({"metrics": tag, "lines": keep}) + "\n"); out.flush()
 
 
+def _cmd(args):
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=20).stdout.strip() or None
+    except Exception:
+        return None
+
+
+async def write_env(http):
+    """OUT.env.json beside OUT.jsonl: what ran where. Every field is optional and a failure here never fails the run:
+    GPUs (name, driver, memory) from nvidia-smi if present, torch and CUDA versions if torch imports, this repo's
+    commit from git, the server's /version answer (vLLM and SGLang both serve it)."""
+    env = dict(time_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), engine=a.engine, url=a.url, model=a.model,
+               workload=os.path.basename(a.workload), window=a.window, python=sys.version.split()[0],
+               cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"))
+    smi = _cmd(["nvidia-smi", "--query-gpu=name,driver_version,memory.total", "--format=csv,noheader"])
+    if smi:
+        rows = [[c.strip() for c in l.split(",")] for l in smi.splitlines() if l.strip()]
+        env["gpus"] = [dict(name=r[0], driver=r[1], memory=r[2]) for r in rows if len(r) >= 3]
+    try:
+        import torch
+        env["torch"], env["cuda"] = torch.__version__, torch.version.cuda
+    except Exception:
+        pass
+    env["commit"] = _cmd(["git", "-C", os.path.dirname(os.path.abspath(__file__)), "rev-parse", "HEAD"])
+    try:
+        async with http.get(f"{a.url}/version", timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status == 200:
+                j = await r.json(content_type=None)
+                env["server_version"] = j.get("version", j) if isinstance(j, dict) else j
+    except Exception:
+        pass
+    try:
+        with open((a.out[:-6] if a.out.endswith(".jsonl") else a.out) + ".env.json", "w") as f:
+            json.dump(env, f, indent=1); f.write("\n")
+    except Exception as e:
+        print("env.json not written:", repr(e)[:200], file=sys.stderr)
+
+
 async def main():
     global t_zero
     conn = aiohttp.TCPConnector(limit=0)
     async with aiohttp.ClientSession(connector=conn) as http:
+        await write_env(http)
         await scrape(http, "before")
         t_zero = time.time()
         await asyncio.gather(*(run_session(http, s) for s in W["sessions"]))

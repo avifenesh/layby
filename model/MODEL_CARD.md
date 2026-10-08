@@ -188,7 +188,7 @@ Apache-2.0, like the base Laya and ModernBERT weights.
 @misc{fenesh2026layby,
   title  = {Layby: placing idle LLM sessions' KV cache by when they come back},
   author = {Avi Fenesh},
-  note   = {Tiyuvta},
-  year   = {2026}
+  year   = {2026},
+  note   = {arXiv id to follow}
 }
 ```

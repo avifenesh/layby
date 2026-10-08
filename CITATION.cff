@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the paper below."
+title: "Layby"
+abstract: "KV cache placement for idle LLM sessions by when they come back: the cost rule, the Layby-Dwell return-time model, vLLM and SGLang adapters, and ReturnBench."
+repository-code: "https://github.com/avifenesh/layby"
+url: "https://github.com/avifenesh/layby"
+license: Apache-2.0
+authors:
+  - family-names: "Fenesh"
+    given-names: "Avi"
+preferred-citation:
+  type: misc
+  title: "Layby: placing idle LLM sessions' KV cache by when they come back"
+  authors:
+    - family-names: "Fenesh"
+      given-names: "Avi"
+  year: 2026
+  notes: "arXiv id to be added when the paper is posted; the version and doi fields of this file follow with the v1.0.0 tag and its archive."

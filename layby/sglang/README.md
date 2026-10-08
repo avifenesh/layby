@@ -1,7 +1,7 @@
 # park on SGLang 0.5.21
 
 The SGLang adapter for the park cost rule (`layby.rule.decide`). It mirrors the vLLM 0.30 adapter in
-`park/vllm/`: the engine measures itself, the rule places each finished request's KV, the host tier
+`layby/vllm/`: the engine measures itself, the rule places each finished request's KV, the host tier
 evicts by predicted next use, and storage holds only what the rule puts on disk. Target: SGLang 0.5.21
 from PyPI with HiCache (host memory tier, optional L3 storage).
 
@@ -46,9 +46,9 @@ Requests carry `custom_params`, which SGLang passes to the scheduler as
   present, the decision is made at finish.
 
 Native `/generate` takes `custom_params` in `sampling_params`. The OpenAI chat and completions APIs
-take it as a top-level field. The sidecar (`park/sidecar/proxy.py --engine sglang`) sets it.
+take it as a top-level field. The sidecar (`layby/sidecar/proxy.py --engine sglang`) sets it.
 
-Hint port, the same API as `park/vllm/server.py` (the same server, given this adapter's state):
+Hint port, the same API as `layby/vllm/server.py` (the same server, given this adapter's state):
 `POST /hint {"key", "surv": [15]}` or a list of them, `GET /live` (telemetry snapshot), `GET /health`.
 
 ## Arms

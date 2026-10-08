@@ -15,7 +15,16 @@ Arms (run_arms.sh, run_arms_sglang.sh):
 | KW | K in write-through mode (vLLM only) |
 | KD | K with write-back on CPU eviction (vLLM only; a negative result, see the README) |
 
-Workloads are in `workloads/`. The private replay used in the paper (the author's own sessions) is not shipped.
+Workloads are in `workloads/`, with bytes, sha256, source pools and licenses per file in `workloads/MANIFEST.json`
+(`python scripts/verify_manifest.py` checks them; `box_run.sh` runs the check first). The private replay used in the
+paper (the author's own sessions) is not shipped.
+
+Paths. Every script takes its locations from environment variables and falls back to the values the rounds used:
+`LAYBY_ROOT` (this repo; default the checkout the script lives in), `REPLAY` (the workload file; default
+`$HOME/replay.json`), `OUT` (outputs; default `$HOME/out` for the Qwen3-8B boxes, `$DATA/out` for the Nebius VM),
+`KV_DIR` (the disk tier directory, emptied before each arm; default `$HOME/kvdisk` or `$DATA/disk_NAME`), `DATA`
+(the VM's data mount; default `/data`), `HF_HOME` (model cache in `node_prep.sh`; default `$DATA/hf`), `VENV`
+(default `$HOME/venv`). The rounds ran as root, so `$HOME` was root's home.
 
 | file | sessions | turns | contexts |
 |---|---|---|---|
@@ -41,26 +50,29 @@ Hardware: one A100 (40 or 80 GB). Image `vllm/vllm-openai:v0.30.0`. GPU KV 16 Gi
 box's local disk. Check every card for thermal throttling (`nvidia-smi --query-gpu=clocks.sm,temperature.gpu,
 clocks_throttle_reasons.active`); a throttled card runs about 4x slower and its repeat is not comparable.
 
-    # on each box, this repo at /root/layby
-    cp /root/layby/engine/workloads/mix36_w0.json /root/replay.json
-    bash /root/layby/engine/box_run.sh ""   C0 T K      # repeat 1
-    bash /root/layby/engine/box_run.sh .2   T K C0      # repeat 2 on a second box
-    bash /root/layby/engine/box_run.sh .3   K C0 T      # repeat 3 on a third box
+To add: driver and CUDA version of the A100 boxes (the image is pinned; the host driver was not recorded).
 
-Outputs land in `/root/out` (`ARM.jsonl` per turn, `ARM.server.log`, `ARM.park_live.json` telemetry, `ARM.prof.json` and
-`ARM.profw.json` scheduler-thread profiles). Pool:
+    # on each box, inside the image, from a checkout of this repo
+    cp engine/workloads/mix36_w0.json $HOME/replay.json   # REPLAY
+    bash engine/box_run.sh ""   C0 T K      # repeat 1
+    bash engine/box_run.sh .2   T K C0      # repeat 2 on a second box
+    bash engine/box_run.sh .3   K C0 T      # repeat 3 on a third box
+
+Outputs land in `$OUT` (default `$HOME/out`): `ARM.jsonl` per turn, `ARM.env.json` (GPUs, driver, torch and CUDA
+versions, repo commit, server version), `ARM.server.log`, `ARM.park_live.json` telemetry, `ARM.prof.json` and
+`ARM.profw.json` scheduler-thread profiles. Pool:
 
     mkdir pooled && cp box1/{C0,T,K}.jsonl box2/{C0,T,K}.2.jsonl box3/{C0,T,K}.3.jsonl pooled/
-    python engine/pool_arms.py pooled --pair K:C0 --pair K:T --pair T:C0
+    python engine/pool_arms.py pooled --pair K:C0 --pair K:T --pair T:C0 --out pooled/pooled.json
 
 ## 2. SGLang 0.5.21, Qwen3-8B, one A100 per repeat
 
 Image `lmsysorg/sglang:v0.5.21`. Install this repo into the image's own environment (it registers the SGLang plugin
 entry point `park`), then:
 
-    pip install aiohttp -e /root/layby
+    pip install aiohttp -e .                                  # from a checkout of this repo
     VENV=$(dirname $(dirname $(command -v sglang))) WINDOW=0 \
-      bash /root/layby/engine/run_arms_sglang.sh /root/replay.json /root/out 17179869184 30064771072 /root/kvdisk K T C0
+      bash engine/run_arms_sglang.sh $HOME/replay.json $HOME/out 17179869184 30064771072 $HOME/kvdisk K T C0
 
 `run_arms_sglang.sh` runs every arm on SGLang's Python radix tree core (the Layby backend needs it, so the baselines use
 it too).
@@ -72,15 +84,15 @@ disk. Two engines at TP4 (GPUs 0-3 and 4-7). TP8 does not start on this card: th
 no 8-heads-per-rank build. FP8 KV, `--prefix-match-unit 256`, eager mode, GPU KV 4 GiB per GPU (522,156 tokens per
 engine), CPU tier 28 GiB per engine, disk tier on the boot disk (O_DIRECT; it measured 0.55 GB/s).
 
-    # as root on the VM, this repo at /root/layby
-    bash /root/layby/engine/node_prep.sh                      # container `park`, deps, model download; PREP_DONE
-    docker exec park bash /root/layby/engine/smoke.sh         # restore gate; /data/out/SM.client.log ends PASS
-    docker exec -d park bash /root/layby/engine/engine.sh A 0,1,2,3 8000 28765 C0 T K C0.3 T.3 K.3
-    docker exec -d park bash /root/layby/engine/engine.sh B 4,5,6,7 8001 28766 C0.2 T.2 K.2 C0.4 T.4 K.4
+    # as root on the VM, from a checkout of this repo under $HOME (node_prep.sh mounts $HOME and $DATA into the container)
+    bash engine/node_prep.sh                                  # container `park`, deps, model download; PREP_DONE
+    docker exec park bash $PWD/engine/smoke.sh                # restore gate; $OUT/SM.client.log ends PASS
+    docker exec -d park bash $PWD/engine/engine.sh A 0,1,2,3 8000 28765 C0 T K C0.3 T.3 K.3
+    docker exec -d park bash $PWD/engine/engine.sh B 4,5,6,7 8001 28766 C0.2 T.2 K.2 C0.4 T.4 K.4
 
 Both engines run the same arm at the same time, so each disk-using arm shares the disk with its own twin. Each arm is
-bounded by `WINDOW=4500` seconds. Outputs are in `/data/out/A` and `/data/out/B`; A holds repeats 1 and 3, B holds
-2 and 4. Pool as in section 1.
+bounded by `WINDOW=4500` seconds. Outputs are in `$OUT/A` and `$OUT/B` (`OUT` defaults to `$DATA/out`); A holds
+repeats 1 and 3, B holds 2 and 4. Pool as in section 1.
 
 The smoke gate a new model or card must pass before a run: a 120k-token session evicted from the GPU comes back as
 external prefix-cache hits covering the whole prefix, first from the CPU tier and then from disk, with the same greedy

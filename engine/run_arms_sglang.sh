@@ -10,7 +10,7 @@
 # Capacities as run_arms.sh: GPU_KV_BYTES becomes --max-total-tokens (GPU_KV_BYTES / BPT tokens),
 # CPU_BYTES the host pool as --hicache-ratio (CPU_BYTES / GPU_KV_BYTES), DISK_DIR the file backend's
 # directory (SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR, emptied before each arm).
-# Env: MODEL, VENV (default /root/.venv-sglang, with this repo installed: uv pip install -e REPO, which registers the
+# Env: MODEL, VENV (default $HOME/.venv-sglang, with this repo installed: uv pip install -e REPO, which registers the
 #      SGLang plugin entry point `park`), ENGINE_DIR (this directory, default the script's own), BPT (KV bytes per token, all layers; default 147456,
 #      Qwen3-8B bf16: 36 layers x 8 KV heads x 128 x 2 x 2 bytes), PAGE (page size, default 64),
 #      TREE_CORE (default python for every arm: the park backend needs the Python TreeCore, so the
@@ -22,7 +22,7 @@ set -u
 W=$1; O=$2; KV=$3; CPU=$4; DISK=$5; shift 5
 MODEL=${MODEL:-Qwen/Qwen3-8B}
 mkdir -p $O
-VENV=${VENV:-/root/.venv-sglang}; ENGINE_DIR=${ENGINE_DIR:-$(cd "$(dirname "$0")" && pwd)}
+VENV=${VENV:-$HOME/.venv-sglang}; ENGINE_DIR=${ENGINE_DIR:-$(cd "$(dirname "$0")" && pwd)}
 export PATH=$VENV/bin:$PATH
 BPT=${BPT:-147456}; PAGE=${PAGE:-64}
 export SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=${TREE_CORE:-python}

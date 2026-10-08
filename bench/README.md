@@ -61,7 +61,7 @@ KV is 144 KiB per token (Qwen3-8B, bf16). Every policy sees the same engine; onl
 Sessions are test-split sessions of held-out users: users the Layby-Dwell model never saw in training
 or validation (Copilot has no user ids, so its pool takes test-split sessions of any user; the split is
 chronological, so they all come after every training session). Each pool is in `bench/pools/POOL.json`.
-Sources, versions and licenses: [bench/LICENSES.md](bench/LICENSES.md).
+Sources, versions and licenses: [bench/LICENSES.md](LICENSES.md).
 
 ### Schema
 
@@ -122,7 +122,8 @@ How to read it:
   disks.
 - The oracle bounds what prediction can add: 0.88 of wt overall, 0.72 on the slow disk.
 
-The run is deterministic: the same command gives the same rows, bit for bit.
+The run is deterministic: the same command gives the same rows, bit for bit. The exact command, the commit and
+date of the shipped files, the row fields and the diff check are in [reference/README.md](../reference/README.md).
 
 ## Add your own policy
 
@@ -162,7 +163,7 @@ returnbench eval --policy mine=mypkg.mymod:MyPolicy --rules wt cost
 `bench/build/build_all.sh` downloads the four datasets at pinned versions, checks their hashes,
 extracts idle boundaries, applies the same split and user hold-out as the Layby training pipeline, and
 writes the pools. Steps from the boundary files on reproduce the shipped pools exactly on all four
-sources; TraceLab also reproduces end to end from the raw download. See [bench/build/README.md](bench/build/README.md).
+sources; TraceLab also reproduces end to end from the raw download. See [bench/build/README.md](build/README.md).
 
 The survival curves need Layby-Dwell. Without it the rebuilt pools have no curves, and only `C0`, `wt`,
 `cont`, `cj` and `ka` can run on them.
@@ -179,10 +180,7 @@ The survival curves need Layby-Dwell. Without it the rebuilt pools have no curve
 
 ## Layout
 
-```
-sim/          simulator, cost rule, baselines, eval and CLI (python -m sim, or returnbench)
-bench/pools/  the four pools
-bench/build/  extractors and builders, pinned hashes
-reference/    rows and per-cell table of the reference run
-examples/     a policy to start from
-```
+The repository map is the Layout section of the top-level [README](../README.md). The bench's parts: `sim/` (the
+simulator and CLI), `bench/pools/` (the four pools, listed with hashes in `bench/MANIFEST.json`), `bench/build/`
+(extractors and builders), `reference/` (the reference run, `reference/README.md`), `examples/` (a policy to start
+from).

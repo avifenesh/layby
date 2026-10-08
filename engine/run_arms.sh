@@ -21,7 +21,7 @@
 #        again) and L1 eviction at 0.95 (default 0.8). Needs `lmcache` on PATH in the server's environment.
 # A repeat carries a suffix (C0.2 runs arm C0 again into C0.2.*).
 # Usage: run_arms.sh WORKLOAD OUTDIR GPU_KV_BYTES CPU_BYTES DISK_DIR ARM...
-# Env: MODEL (default Qwen/Qwen3-8B), VENV (dir with bin/vllm and bin/python, default /root/.venv), ENGINE_DIR (this
+# Env: MODEL (default Qwen/Qwen3-8B), VENV (dir with bin/vllm and bin/python, default $HOME/.venv), ENGINE_DIR (this
 #      directory, default the script's own), REPO (the layby repo root, default ENGINE_DIR/..), SERVE_ARGS (extra
 #      vllm serve args), OFF_EXTRA (extra kv_connector_extra_config entries, each starting with a comma), MAXLEN
 #      (default 40960), BOOT_WAIT (5 s polls, default 180), REPLAY_TIMEOUT (s, default 5400), VOCAB (replay token
@@ -31,7 +31,7 @@ set -u
 W=$1; O=$2; KV=$3; CPU=$4; DISK=$5; shift 5
 MODEL=${MODEL:-Qwen/Qwen3-8B}
 mkdir -p $O
-VENV=${VENV:-/root/.venv}; ENGINE_DIR=${ENGINE_DIR:-$(cd "$(dirname "$0")" && pwd)}
+VENV=${VENV:-$HOME/.venv}; ENGINE_DIR=${ENGINE_DIR:-$(cd "$(dirname "$0")" && pwd)}
 export PATH=$VENV/bin:$PATH
 REPO=${REPO:-$(dirname $ENGINE_DIR)}
 export PYTHONPATH=$ENGINE_DIR:$REPO:${PYTHONPATH:-}

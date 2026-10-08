@@ -6,7 +6,7 @@ warms, recomputed prompt tokens and CPU<->GPU offload GB per repeat. Ratios (p50
 group and of each --pair, with a session bootstrap (200 resamples) where sessions are keyed per repeat:
 key (i, s) pairs repeat i of one group with repeat i of the other on session s.
 
-Usage: pool_arms.py OUTDIR [--base C0] [--pair V6:Sp ...] [--exclude s002,s008,s014]
+Usage: pool_arms.py OUTDIR [--base C0] [--pair V6:Sp ...] [--exclude s002,s008,s014] [--out pooled.json]
 """
 import argparse, glob, json, os
 import numpy as np
@@ -15,6 +15,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument("d"); ap.add_argument("--base", default="C0")
 ap.add_argument("--pair", action="append", default=[])
 ap.add_argument("--exclude", default="")
+ap.add_argument("--out", help="also write the JSON to this file")
 a = ap.parse_args()
 EX = set(x for x in a.exclude.split(",") if x)
 
@@ -93,3 +94,6 @@ for p in a.pair:
     if x in groups and y in groups:
         out["pairs"][p] = boot(groups[x], groups[y])
 print(json.dumps(out, indent=1))
+if a.out:
+    with open(a.out, "w") as f:
+        json.dump(out, f, indent=1); f.write("\n")

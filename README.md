@@ -26,6 +26,32 @@ Layby has four parts:
     pip install -e ".[sidecar]"      # the sidecar proxy
     pip install -e ".[engine]"       # the real-engine replay client
 
+Tested on: Linux x86_64. The rule, simulator and ReturnBench need Python 3.10 or later and numpy, and run on a CPU.
+The vLLM adapter ran inside the `vllm/vllm-openai:v0.30.0` and `v0.31.0` images, the SGLang adapter inside
+`lmsysorg/sglang:v0.5.21` and in a Python 3.12 venv with `sglang[all]==0.5.21` (torch 2.13.0+cu130). GPUs: A100 40
+and 80 GB (Qwen3-8B rounds) and RTX PRO 6000 on Ubuntu 24.04 with CUDA 13.0 (the GLM round). Driver and CUDA versions
+of the A100 boxes: see `engine/REPRODUCE.md`.
+
+## Quick start: the bench on a CPU
+
+Two cells of ReturnBench, under a minute on 8 cores (`bench/README.md`):
+
+    returnbench eval --rules wt cost --cells wildchat:120 swechat:18 --workloads 2 --seeds 1
+
+It prints this (its rows are a subset of the shipped reference run, `reference/rows.jsonl`, and match it bit for bit):
+
+    geomean over cells of the p95 TTFT ratio (per cell: geomean over workloads)
+    rule      cells  p95/C0  worst  @0.5  @1.5  @3   p95/wt  @0.5  @1.5  @3
+    C0            6    1.00   1.00  1.00  1.00  1.00     1.80  0.98  2.27  2.63
+    wt            6    0.55   1.04  1.02  0.44  0.38     1.00  1.00  1.00  1.00
+    cost          6    0.55   0.84  0.80  0.47  0.44     0.99  0.79  1.07  1.15
+
+The full 33-cell table takes about 6 minutes on 8 cores; its command, expected output and checker are in
+`reference/README.md`. On a GPU box, `engine/smoke.sh` is the install proof for the vLLM adapter: it boots the server
+with the adapter in write-through mode and runs `engine/smoke_restore.py`, whose client log (`$OUT/SM.client.log`)
+ends with the line `PASS` when a session evicted from the GPU comes back from the CPU tier and then from disk with
+the same greedy output, or `FAIL`.
+
 ## Quick start: vLLM
 
 Layby replaces the offloading connector, its CPU-tier policy and its disk tier:
@@ -35,11 +61,11 @@ Layby replaces the offloading connector, its CPU-tier policy and its disk tier:
       "kv_connector_extra_config": {"cpu_bytes_to_use": 30064771072, "offload_prompt_only": false,
         "eviction_policy": "ParkCachePolicy", "cache_policy_module_path": "layby.vllm.policy",
         "spec_name": "TieringOffloadingSpec",
-        "secondary_tiers": [{"type": "ParkFsTier", "module_path": "layby.vllm.fs_tier", "root_dir": "/data/kv",
+        "secondary_tiers": [{"type": "ParkFsTier", "module_path": "layby.vllm.fs_tier", "root_dir": "KV_DIR",
                              "n_read_threads": 16, "n_write_threads": 16}],
         "park_port": 8765}}'
 
-Then put the sidecar in front of the server. It tags each request with a session key, scores each finished turn with
+`KV_DIR` is a directory on the disk tier (the arm runners empty it before each arm). Then put the sidecar in front of the server. It tags each request with a session key, scores each finished turn with
 Layby-Dwell and posts the curve to the adapter's hint port:
 
     python -m layby.sidecar.proxy --upstream http://127.0.0.1:8000 --listen 8100 \
@@ -177,6 +203,20 @@ tests/          CPU tests (vLLM 0.30 and 0.31, SGLang 0.5.21)
 
     PYTHONPATH=. python tests/test_park_vllm_fs.py          # and the other vLLM tests, in a vLLM 0.30 or 0.31 env
     PYTHONPATH=. python -m pytest tests/test_park_sglang.py # in an SGLang 0.5.21 env with this repo installed
+
+## Citation
+
+The paper is "Layby: placing idle LLM sessions' KV cache by when they come back" (2026; arXiv id to follow).
+`CITATION.cff` at the repository root carries the same entry for GitHub and Zenodo.
+
+```
+@misc{fenesh2026layby,
+  title  = {Layby: placing idle LLM sessions' KV cache by when they come back},
+  author = {Avi Fenesh},
+  year   = {2026},
+  note   = {arXiv id to follow}
+}
+```
 
 ## License
 

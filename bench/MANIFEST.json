@@ -1,0 +1,38 @@
+{
+ "name": "ReturnBench pools",
+ "description": "Content-free session pools: token counts, idle gaps, turn kinds, tool names, pool-local user indices and Layby-Dwell survival curves. No text. Sources, pinned revisions and licenses: LICENSES.md. Build: build/build_all.sh. Check: python scripts/verify_manifest.py.",
+ "files": [
+  {
+   "path": "pools/swechat.json",
+   "bytes": 975031,
+   "sha256": "edbab2e271fce66427d46dee8acf19733c52d55b8aa016efe1ece06bcef1c6ca",
+   "source": "SWE-chat (SALT-NLP/SWE-chat, revision f66cca95b14caaa4177f7ed5eaa424608dadcffa)",
+   "license": "ODC-BY-1.0",
+   "curves": true
+  },
+  {
+   "path": "pools/tracelab_claude.json",
+   "bytes": 308417,
+   "sha256": "ff88e49590d5a97cdb59591dd7fd06e11694bfc3525383d6d8267d8eba72723f",
+   "source": "TraceLab public coding-agent trace (uw-syfi/TraceLab release v0.0.2, syfi_coding_trace.duckdb)",
+   "license": "CC-BY-4.0",
+   "curves": true
+  },
+  {
+   "path": "pools/wildchat.json",
+   "bytes": 769969,
+   "sha256": "26c4fca4f07eda91c3e505d1b5e1d59b1cf6fa1d5f47a23d7d55fa7d99fb8eff",
+   "source": "WildChat-4.8M (allenai/WildChat-4.8M, revision c827c6df8fcf008219ffaffa4d1dd77491099367)",
+   "license": "ODC-BY-1.0",
+   "curves": true
+  },
+  {
+   "path": "pools/copilot.json",
+   "bytes": 783728,
+   "sha256": "f635de04994a32dc090c77281f62e8b5f7030866e585000ac0508867934554a9",
+   "source": "GitHub Copilot Coding Agent Traces 2026 (Azure/AzurePublicDataset release ghcp-coding-agent-2026)",
+   "license": "CC-BY-4.0",
+   "curves": false
+  }
+ ]
+}
