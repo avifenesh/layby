@@ -84,6 +84,14 @@ tokens. Heavy is 150 sessions, half is 75.
 | heavy (150 sessions) | 0.67 [0.60, 0.82] | 1.17 [1.15, 1.19] | 0.58 [0.52, 0.70] |
 | half (75 sessions) | 0.95 [0.82, 1.08] | 3.99 [3.28, 4.74] | 0.24 [0.20, 0.28] |
 
+On a slow shared disk, writing every chunk is worse than having no disk at all. Layby writes only what pays: it cuts
+heavy-load p95 by a third and leaves half load where it was. The simulator predicted 0.80, 1.27 and 0.63 for the heavy
+load before the disk arms ran. Layby's heavy-load p99 is its weak point: a few disk sessions returned while the disk
+was saturated. A return-time guard (recompute when a restore would be slower) cut that tail 2 to 3x but raised p50
+and p95, so it is not in this release.
+
+The paper (arXiv, link to follow) has the method, the full tables and the engineering details.
+
 Qwen3-8B on vLLM 0.31.0, one RTX PRO 6000 per VM (two VMs, two repeats), the A100 rounds' capacities (16 GiB GPU KV,
 28 GiB CPU tier), ReturnBench mix36, and a disk tier on the VM's network SSD read with O_DIRECT at 0.48 GB/s. LM is
 LMCache 0.5.5 with its defaults; LMR is LMCache with `--l2-prefetch-policy retain` and a 0.95 L1 eviction watermark,
@@ -109,14 +117,6 @@ LMCache's default prefetch policy deletes a chunk from its CPU tier once the req
 so a returning session reads the disk again; its counters showed more than half of its hits served from disk while
 the CPU tier was half empty. `retain` fixes most of that. LMCache could not run GLM 5.3 Flash here: its connector
 stored nothing for that model, and at equal GPU KV the engine ran out of memory at warmup.
-
-On a slow shared disk, writing every chunk is worse than having no disk at all. Layby writes only what pays: it cuts
-heavy-load p95 by a third and leaves half load where it was. The simulator predicted 0.80, 1.27 and 0.63 for the heavy
-load before the disk arms ran. Layby's heavy-load p99 is its weak point: a few disk sessions returned while the disk
-was saturated. A return-time guard (recompute when a restore would be slower) cut that tail 2 to 3x but raised p50
-and p95, so it is not in this release.
-
-The paper (arXiv, link to follow) has the method, the full tables and the engineering details.
 
 ## Limits
 
