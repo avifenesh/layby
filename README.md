@@ -4,6 +4,9 @@ Layby decides where an idle LLM session's KV cache waits until the session comes
 disk, or nowhere. Agent and chat sessions go idle between turns for seconds to minutes. Their KV is large, and
 recomputing it on return is what makes the next turn slow.
 
+Model: [Avifenesh/layby-dwell](https://huggingface.co/Avifenesh/layby-dwell) on Hugging Face. Paper: arXiv, link to
+follow. Author: [Avi Fenesh](https://github.com/avifenesh), [Tiyuvta](https://tiyuvta.ai).
+
 Layby has four parts:
 
 - **A cost rule** (`layby/rule.py`). For each finished turn it compares the expected cost of keeping the session's
@@ -13,7 +16,8 @@ Layby has four parts:
 - **Layby-Dwell**, the curve. A model that reads what a serving engine sees of a session (the tool calls and their
   arguments, the last assistant texts and human message, token counts, timing) and returns P(next request later
   than t) at 15 horizons from 0.5 s to 30 min. It runs next to the engine, so text never leaves the host; the rule
-  itself only needs the curve. Weights and model card: `model/`. Inference: `layby_dwell/`.
+  itself only needs the curve. Weights: [Avifenesh/layby-dwell](https://huggingface.co/Avifenesh/layby-dwell); model
+  card and release notes: `model/`. Inference: `layby_dwell/`.
 - **Engine adapters** for vLLM 0.30 and 0.31 (`layby/vllm/`) and SGLang 0.5.21 (`layby/sglang/`), plus a sidecar
   proxy (`layby/sidecar/`) that tracks sessions, scores them and sends the curves to the engine.
 - **ReturnBench**, a benchmark on public agent and chat traces with a simulator and baselines (`bench/`, `sim/`), and
