@@ -12,6 +12,13 @@
 #   KD : arm K in demand mode: ins/park sessions written through, none sessions written to disk just before the
 #        CPU tier evicts them (if the write can pay), drop never (a negative result on vLLM 0.30, see README)
 #   SM : smoke: arm K0's server and smoke_restore.py (SMOKE_ARGS) instead of the replay
+#   LM : LMCache 0.5.x (its multiprocess server and vLLM connector), the external baseline: L1 = CPU_BYTES of CPU
+#        memory with LRU, L2 = the disk dir with O_DIRECT and LRU eviction at LM_DISK_GB (default 340), every chunk
+#        written through (LMCache's default store policy). LM_PORT (default 6555; the HTTP port is LM_PORT + 100),
+#        LM_CHUNK (tokens, default 256: a multiple of the engine's block size). LMS: the same stack under
+#        smoke_restore.py. LMR: LM with LMCache keeping what it restores from disk in L1 (--l2-prefetch-policy retain;
+#        the default deletes a prefetched chunk from L1 when its reader ends, so a session's next turn reads the disk
+#        again) and L1 eviction at 0.95 (default 0.8). Needs `lmcache` on PATH in the server's environment.
 # A repeat carries a suffix (C0.2 runs arm C0 again into C0.2.*).
 # Usage: run_arms.sh WORKLOAD OUTDIR GPU_KV_BYTES CPU_BYTES DISK_DIR ARM...
 # Env: MODEL (default Qwen/Qwen3-8B), VENV (dir with bin/vllm and bin/python, default /root/.venv), ENGINE_DIR (this
@@ -38,6 +45,8 @@ for arm in "$@"; do
   case ${arm%%.*} in
     C0) tier="" ;;
     T) ;;
+    LM|LMS|LMR) conn='"kv_connector":"LMCacheMPConnector","kv_connector_module_path":"lmcache.integration.vllm.lmcache_mp_connector"'
+       tier=""; pol=""; extra="\"lmcache.mp.port\":${LM_PORT:-6555}" ;;
     K|K0|KW|KD|SM) pol='"eviction_policy":"ParkCachePolicy","cache_policy_module_path":"layby.vllm.policy"'
        tier=",\"spec_name\":\"TieringOffloadingSpec\",\"secondary_tiers\":[{\"type\":\"ParkFsTier\",\"module_path\":\"layby.vllm.fs_tier\",\"root_dir\":\"$DISK\",\"n_read_threads\":16,\"n_write_threads\":16}]"
        conn='"kv_connector":"ParkConnector","kv_connector_module_path":"layby.vllm.connector"'
@@ -51,16 +60,25 @@ for arm in "$@"; do
   rm -rf $DISK; mkdir -p $DISK
   SHM0=$(ls /dev/shm | grep '^vllm_offload_' | sort)   # other servers' CPU tiers: never touched
   OFF="{$conn,\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"cpu_bytes_to_use\":$CPU,\"offload_prompt_only\":false,$pol$tier$extra${OFF_EXTRA:-}}}"
+  LMP=""
+  case ${arm%%.*} in LM|LMS|LMR)
+    OFF="{$conn,\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{$extra}}"
+    LMX=""; [ ${arm%%.*} = LMR ] && LMX="--l2-prefetch-policy retain --eviction-trigger-watermark 0.95 --eviction-ratio 0.1"
+    L2="{\"type\":\"nixl_store_dynamic\",\"backend\":\"POSIX\",\"backend_params\":{\"file_path\":\"$DISK\",\"use_direct_io\":\"true\",\"max_capacity_gb\":\"${LM_DISK_GB:-340}\"},\"persist_enabled\":false,\"eviction\":{\"eviction_policy\":\"LRU\",\"trigger_watermark\":0.9,\"eviction_ratio\":0.1}}"
+    setsid lmcache server --port ${LM_PORT:-6555} --http-port $(( ${LM_PORT:-6555} + 100 )) --chunk-size ${LM_CHUNK:-256} --separate-object-groups \
+      --l1-size-gb $(( CPU / 1073741824 )) --eviction-policy LRU $LMX --l2-adapter "$L2" > $O/$arm.lmcache.log 2>&1 &
+    LMP=$!; sleep 20 ;;
+  esac
   echo "=== arm $arm $(date -u +%H:%M:%S)"
   setsid $VENV/bin/vllm serve $MODEL --port $PORT --max-model-len ${MAXLEN:-40960} --enable-prefix-caching \
     --kv-cache-memory-bytes $KV --max-num-seqs 64 --enable-prompt-tokens-details ${SERVE_ARGS:-} \
     --kv-transfer-config "$OFF" > $O/$arm.server.log 2>&1 &
   SP=$!
-  trap "kill -9 -- -$SP 2>/dev/null" EXIT INT TERM   # a killed runner takes its server group with it
+  trap "kill -9 -- -$SP ${LMP:+-$LMP} 2>/dev/null" EXIT INT TERM   # a killed runner takes its server groups with it
   for i in $(seq 1 ${BOOT_WAIT:-180}); do curl -sf localhost:$PORT/health >/dev/null && break; kill -0 $SP 2>/dev/null || break; sleep 5; done
-  curl -sf localhost:$PORT/health >/dev/null || { echo "server failed"; tail -30 $O/$arm.server.log; kill -9 -- -$SP 2>/dev/null; wait $SP 2>/dev/null
+  curl -sf localhost:$PORT/health >/dev/null || { echo "server failed"; tail -30 $O/$arm.server.log; kill -9 -- -$SP ${LMP:+-$LMP} 2>/dev/null; wait $SP 2>/dev/null
     comm -13 <(echo "$SHM0") <(ls /dev/shm | grep '^vllm_offload_' | sort) | sed 's|^|/dev/shm/|' | xargs -r rm -f; continue; }
-  if [ ${arm%%.*} = SM ]; then
+  if [ ${arm%%.*} = SM ] || [ ${arm%%.*} = LMS ]; then
     timeout ${REPLAY_TIMEOUT:-5400} $VENV/bin/python $ENGINE_DIR/smoke_restore.py --url http://127.0.0.1:$PORT --model $MODEL \
       --vocab ${VOCAB:-150000} ${SMOKE_ARGS:-} > $O/$arm.client.log 2>&1
   else
@@ -74,6 +92,7 @@ for arm in "$@"; do
   kill $SP; sleep 10
   # hard-kill what the server left behind (engine core): its own process group only, then free its CPU tier
   kill -9 -- -$SP 2>/dev/null
+  [ -n "$LMP" ] && { kill -- -$LMP 2>/dev/null; sleep 5; kill -9 -- -$LMP 2>/dev/null; }
   wait $SP 2>/dev/null; sleep 3
   # a killed server leaks its CPU tier in /dev/shm: remove only files this arm created
   comm -13 <(echo "$SHM0") <(ls /dev/shm | grep '^vllm_offload_' | sort) | sed 's|^|/dev/shm/|' | xargs -r rm -f
