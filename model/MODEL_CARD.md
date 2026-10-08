@@ -109,23 +109,6 @@ come back are censored, and their target spreads over the levels still possible.
 - The author's own Claude Code and Codex sessions.
 - Users' data, under the terms they agreed to.
 
-Rows per source in the 1,670,954-row train split v6 drew from. v6 took its 300K rows at random from
-this split, so each source's share of the 300K is its share here; per-source counts of the sample
-were not recorded.
-
-| source | train rows | share | released | basis |
-|---|---|---|---|---|
-| Copilot Coding Agent Traces 2026 | 600K | 36% | yes, content-free pool `bench/pools/copilot.json` | public license, CC BY 4.0 |
-| SWE-chat (Claude Code 127K, Codex 6K) | 133K | 8% | yes, content-free pool `bench/pools/swechat.json` | public license, ODC-BY |
-| WildChat-4.8M | 234K | 14% | yes, content-free pool `bench/pools/wildchat.json` | public license, ODC-BY |
-| TraceLab (Codex 139K, Claude 116K) | 255K | 15% | yes, content-free pool `bench/pools/tracelab_claude.json` | public license, CC BY 4.0 |
-| The author's own sessions (Codex 343K, Claude Code 108K) | 451K | 27% | no | the author's own data |
-| Users' data | 0 | 0% | no | the terms the users agreed to |
-
-Users' data entered the chain once, in the first round (v1, about 6K rows), and was dropped from v2
-on; from v2 to v6 it is validation and test data only. The pools hold token counts, gaps, kinds and
-tool names, no text.
-
 Only datasets whose licenses allow commercial use. 10% of users (by hash) on every source with real
 user ids were held out of training and validation to measure unseen users.
 
