@@ -3,9 +3,10 @@
   POST /hint  {"key": str, "surv": [15 floats]}   the idle-period curve of a finished (or running)
               request; queued and applied by the scheduler thread at its next step
   GET  /live  telemetry snapshot (rates, measured speeds, residency, decision counts) as JSON
+  GET  /log   every placement decision with its cost terms and every admission with its prompt sources
   GET  /health
 
-The engine adapter passes its state (layby.vllm.state.STATE by default; layby.sglang.state.STATE for
+The engine adapter passes its state (layby.vllm.state.STATE by default; park.sglang.state.STATE for
 SGLang): the server only needs its hint queue and snapshot().
 """
 import json
@@ -37,6 +38,8 @@ class _Handler(BaseHTTPRequestHandler):
             if "windows" in self.path:
                 return self._send(200, prof.windows())
             return self._send(200, prof.report())
+        if self.path == "/log":
+            return self._send(200, dict(decisions=list(self.state.dlog), returns=list(self.state.rlog)))
         if self.path == "/live":
             # read-only and approximate: the scheduler thread may be updating the estimators
             try:

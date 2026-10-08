@@ -139,6 +139,9 @@ class ParkConnector(OffloadingConnector):
         STATE.gpu_tokens = kv_cache_config.num_blocks * STATE.block_tokens
         self._waiting: dict[str, float] = {}           # request id -> time added, until admitted
         self._deferred: dict[str, float] = {}          # request id -> first lookup that deferred it
+        # request id -> the GPU-local prefix hit (tokens) vLLM passed to the last lookup. vLLM calls
+        # update_state_after_alloc before it sets request.num_computed_tokens, so a new request reads 0 there
+        self._local: dict[str, int] = {}
         self._finished: "OrderedDict[str, dict]" = OrderedDict()   # park_key -> request awaiting a curve
         self._early: dict[str, tuple[float, list]] = {}               # park_key -> curve that beat the finish
         self._loads: dict[int, tuple[float, int]] = {}  # load job id -> (submit time, chunks)
@@ -187,6 +190,7 @@ class ParkConnector(OffloadingConnector):
         super().on_new_request(request)
 
     def get_num_new_matched_tokens(self, request, num_computed_tokens):
+        self._local[request.request_id] = int(num_computed_tokens)
         out = super().get_num_new_matched_tokens(request, num_computed_tokens)
         if out[0] is None and request.request_id not in self._deferred:
             # the offload tier is promoting part of the prefix (disk -> CPU): the request waits steps
@@ -196,28 +200,33 @@ class ParkConnector(OffloadingConnector):
     def _admit(self, request, num_external_tokens):
         t = self._waiting.pop(request.request_id, None)
         td = self._deferred.pop(request.request_id, None)
+        local = self._local.pop(request.request_id, None)
         if td is not None:
             now = time.monotonic()
             STATE.live.add(now, n_defer=1.0, defer=now - td)
         if t is not None:
             now = time.monotonic()
             STATE.live.add(now, n_adm=1.0, qwait=now - t)
-            self._account_misses(request, num_external_tokens, now)
+            self._account_misses(request, num_external_tokens, now,
+                                 request.num_computed_tokens if local is None else max(local, request.num_computed_tokens))
 
     def update_state_after_alloc(self, request, blocks, num_external_tokens: int):
         out = super().update_state_after_alloc(request, blocks, num_external_tokens)
         _safe("admission", self._admit, request, num_external_tokens)
         return out
 
-    def _account_misses(self, request, ext: int, now: float) -> None:
+    def _account_misses(self, request, ext: int, now: float, local: int) -> None:
         """The latency this admission loses to KV the GPU and the CPU tier evicted (and how long
         ago): the load of what comes from outside the GPU, at the CPU link's measured speed and wait,
         and the recompute of what comes from nowhere, at the measured prefill speed; each counted with
         what it delays (link busy fraction, requests in prefill), as in the simulator."""
         bt, ct = STATE.block_tokens, STATE.chunk_tokens
-        local = request.num_computed_tokens
         prompt = request.num_prompt_tokens
         rec = max(prompt - local - ext, 0)
+        params = getattr(request, "kv_transfer_params", None) or {}
+        STATE.rlog.append(dict(t=round(now, 3), sess=session_of(params.get("park_key")), P=prompt, local=local,
+                               ext=ext, rec=rec))
+        del STATE.rlog[:-20000]
         if prompt - local <= 0:
             return
         ht = STATE.hash_tokens
@@ -292,11 +301,13 @@ class ParkConnector(OffloadingConnector):
 
     # --- decisions ---------------------------------------------------------------------
     def request_finished(self, request, block_ids):
+        self._local.pop(request.request_id, None)
         out = super().request_finished(request, block_ids)
         _safe("finish", self._on_finish, request, block_ids)
         return out
 
     def request_finished_all_groups(self, request, block_ids):
+        self._local.pop(request.request_id, None)
         out = super().request_finished_all_groups(request, block_ids)
         _safe("finish", self._on_finish, request, block_ids)
         return out
@@ -374,6 +385,15 @@ class ParkConnector(OffloadingConnector):
         STATE.last_decisions.append(dict(opt=d["opt"], eta=round(d["eta"], 2), tokens=entry["tokens"],
                                          Q=round(d["Q"], 3), price_c=round(d["price_c"], 4)))
         del STATE.last_decisions[:-100]
+        L = STATE.live
+        STATE.dlog.append(dict(t=round(now, 3), sess=sess, N=entry["tokens"], opt=d["opt"], price_c=round(d["price_c"], 5),
+                               tot={k: (round(x, 4), round(y, 4)) for k, (x, y) in d["tot"].items()},
+                               p60=round(1.0 - float(np.interp(60.0, TG, S)), 4),
+                               p300=round(1.0 - float(np.interp(300.0, TG, S)), 4),
+                               med=float(TG[np.argmax(S <= 0.5)]) if (S <= 0.5).any() else None,
+                               ne_c=round(L.rate("ne_c", now), 4), w_c=round(L.rate("w_c", now), 3),
+                               npf=round(L.rate("pf", now), 3)))
+        del STATE.dlog[:-20000]
 
     def _prune(self, now: float) -> None:
         self._last_prune = now
