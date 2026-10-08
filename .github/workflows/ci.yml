@@ -1,0 +1,31 @@
+# Thin CI: install, byte-compile, data manifests, the README's two-cell bench quick look against the reference run.
+# GPU tests need a vLLM or SGLang engine and run before a release, not here (engine/REPRODUCE.md).
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  cpu:
+    runs-on: self-hosted
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install into a venv
+        run: |
+          python3 -m venv .venv
+          .venv/bin/python -m pip install -q -e .
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+      - name: Byte-compile
+        run: python3 -m compileall -q layby sim bench engine
+      - name: Data manifests
+        run: python3 scripts/verify_manifest.py
+      - name: Bench quick look matches the reference run
+        run: |
+          Q="$RUNNER_TEMP/quick.jsonl"
+          returnbench eval --rules wt cost --cells wildchat:120 swechat:18 --workloads 2 --seeds 1 --out "$Q"
+          test "$(wc -l < "$Q")" -eq 36
+          ! grep -v -x -F -f reference/rows.jsonl "$Q"
