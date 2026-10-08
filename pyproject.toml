@@ -1,0 +1,30 @@
+[project]
+name = "layby"
+version = "0.1.0"
+description = "Layby: KV cache placement for sessions that come back (cost rule, Layby-Dwell, vLLM and SGLang adapters, ReturnBench)"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+build = ["pandas>=2.0", "pyarrow>=14", "duckdb>=1.0"]
+dwell = ["torch>=2.4", "transformers>=4.48", "safetensors>=0.4", "huggingface_hub>=0.20", "laya>=0.3.26", "pandas>=2.0", "pyarrow>=14"]
+dwell-8bit = ["torchao>=0.18"]
+sidecar = ["aiohttp>=3.9"]
+engine = ["aiohttp>=3.9", "pandas>=2.0", "pyarrow>=14"]
+
+[project.scripts]
+returnbench = "sim.cli:main"
+
+# SGLang loads general plugins from this group in its main and scheduler processes; SGLANG_PLUGINS=park restricts it
+# to this one. The plugin registers the "park" radix cache backend and eviction policy.
+[project.entry-points."sglang.srt.plugins"]
+park = "layby.sglang.plugin:register"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["sim*", "layby_dwell*", "layby*"]

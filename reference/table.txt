@@ -1,0 +1,206 @@
+swechat n=6 disk 0.5 GB/s
+  C0        p50   0.04 s  p95    0.4 s   vs C0: p50 1.00  p95 1.00
+  cost      p50   0.04 s  p95    0.4 s   vs C0: p50 1.00  p95 1.00
+  orc       p50   0.04 s  p95    0.4 s   vs C0: p50 1.00  p95 1.00
+  stk       p50   0.04 s  p95    0.4 s   vs C0: p50 0.99  p95 1.00
+  wt        p50   0.04 s  p95    0.4 s   vs C0: p50 1.00  p95 1.00
+swechat n=6 disk 1.5 GB/s
+  C0        p50   0.04 s  p95    0.4 s   vs C0: p50 1.00  p95 1.00
+  cost      p50   0.04 s  p95    0.4 s   vs C0: p50 1.00  p95 1.00
+  orc       p50   0.04 s  p95    0.4 s   vs C0: p50 1.00  p95 1.00
+  stk       p50   0.04 s  p95    0.4 s   vs C0: p50 0.99  p95 1.00
+  wt        p50   0.04 s  p95    0.4 s   vs C0: p50 1.00  p95 1.00
+swechat n=6 disk 3 GB/s
+  C0        p50   0.04 s  p95    0.4 s   vs C0: p50 1.00  p95 1.00
+  cost      p50   0.04 s  p95    0.4 s   vs C0: p50 1.00  p95 1.00
+  orc       p50   0.04 s  p95    0.4 s   vs C0: p50 1.00  p95 1.00
+  stk       p50   0.04 s  p95    0.4 s   vs C0: p50 0.99  p95 1.00
+  wt        p50   0.04 s  p95    0.4 s   vs C0: p50 1.00  p95 1.00
+swechat n=12 disk 0.5 GB/s
+  C0        p50   0.06 s  p95    1.6 s   vs C0: p50 1.00  p95 1.00
+  cost      p50   0.06 s  p95    1.7 s   vs C0: p50 1.00  p95 0.97
+  orc       p50   0.06 s  p95    1.3 s   vs C0: p50 0.98  p95 0.82
+  stk       p50   0.05 s  p95    2.6 s   vs C0: p50 1.00  p95 1.42
+  wt        p50   0.05 s  p95    1.3 s   vs C0: p50 0.98  p95 0.90
+swechat n=12 disk 1.5 GB/s
+  C0        p50   0.06 s  p95    1.6 s   vs C0: p50 1.00  p95 1.00
+  cost      p50   0.06 s  p95    1.6 s   vs C0: p50 0.99  p95 0.94
+  orc       p50   0.06 s  p95    1.3 s   vs C0: p50 0.98  p95 0.82
+  stk       p50   0.05 s  p95    2.1 s   vs C0: p50 1.00  p95 1.21
+  wt        p50   0.05 s  p95    1.3 s   vs C0: p50 0.99  p95 0.88
+swechat n=12 disk 3 GB/s
+  C0        p50   0.06 s  p95    1.6 s   vs C0: p50 1.00  p95 1.00
+  cost      p50   0.06 s  p95    1.7 s   vs C0: p50 1.00  p95 0.93
+  orc       p50   0.06 s  p95    1.3 s   vs C0: p50 0.98  p95 0.81
+  stk       p50   0.05 s  p95    1.6 s   vs C0: p50 0.99  p95 1.06
+  wt        p50   0.06 s  p95    1.4 s   vs C0: p50 0.99  p95 0.86
+swechat n=18 disk 0.5 GB/s
+  C0        p50   0.33 s  p95   25.3 s   vs C0: p50 1.00  p95 1.00
+  cost      p50   0.33 s  p95   13.3 s   vs C0: p50 0.55  p95 0.67
+  orc       p50   0.23 s  p95   12.4 s   vs C0: p50 0.51  p95 0.62
+  stk       p50   0.30 s  p95   12.9 s   vs C0: p50 0.52  p95 0.70
+  wt        p50   0.25 s  p95   12.1 s   vs C0: p50 0.51  p95 0.74
+swechat n=18 disk 1.5 GB/s
+  C0        p50   0.33 s  p95   25.3 s   vs C0: p50 1.00  p95 1.00
+  cost      p50   0.26 s  p95    9.3 s   vs C0: p50 0.42  p95 0.47
+  orc       p50   0.23 s  p95   10.0 s   vs C0: p50 0.41  p95 0.47
+  stk       p50   0.26 s  p95   10.9 s   vs C0: p50 0.45  p95 0.57
+  wt        p50   0.22 s  p95    9.5 s   vs C0: p50 0.38  p95 0.48
+swechat n=18 disk 3 GB/s
+  C0        p50   0.33 s  p95   25.3 s   vs C0: p50 1.00  p95 1.00
+  cost      p50   0.22 s  p95    9.5 s   vs C0: p50 0.38  p95 0.45
+  orc       p50   0.21 s  p95    9.3 s   vs C0: p50 0.37  p95 0.44
+  stk       p50   0.25 s  p95   10.6 s   vs C0: p50 0.44  p95 0.56
+  wt        p50   0.20 s  p95    8.8 s   vs C0: p50 0.36  p95 0.44
+swechat+tracelab_claude+wildchat n=18 disk 0.5 GB/s
+  C0        p50   0.09 s  p95    3.9 s   vs C0: p50 1.00  p95 1.00
+  cost      p50   0.09 s  p95    4.0 s   vs C0: p50 1.00  p95 1.02
+  orc       p50   0.09 s  p95    3.7 s   vs C0: p50 0.96  p95 0.90
+  stk       p50   0.09 s  p95    4.8 s   vs C0: p50 1.00  p95 1.12
+  wt        p50   0.09 s  p95    4.1 s   vs C0: p50 0.97  p95 1.01
+swechat+tracelab_claude+wildchat n=18 disk 1.5 GB/s
+  C0        p50   0.09 s  p95    3.9 s   vs C0: p50 1.00  p95 1.00
+  cost      p50   0.09 s  p95    3.6 s   vs C0: p50 0.97  p95 0.96
+  orc       p50   0.08 s  p95    3.5 s   vs C0: p50 0.96  p95 0.88
+  stk       p50   0.08 s  p95    3.7 s   vs C0: p50 0.97  p95 0.93
+  wt        p50   0.08 s  p95    3.5 s   vs C0: p50 0.96  p95 0.90
+swechat+tracelab_claude+wildchat n=18 disk 3 GB/s
+  C0        p50   0.09 s  p95    3.9 s   vs C0: p50 1.00  p95 1.00
+  cost      p50   0.09 s  p95    3.6 s   vs C0: p50 0.97  p95 0.94
+  orc       p50   0.09 s  p95    3.5 s   vs C0: p50 0.96  p95 0.88
+  stk       p50   0.08 s  p95    3.5 s   vs C0: p50 0.95  p95 0.90
+  wt        p50   0.08 s  p95    3.5 s   vs C0: p50 0.95  p95 0.89
+swechat+tracelab_claude+wildchat n=36 disk 0.5 GB/s
+  C0        p50  29.51 s  p95   80.0 s   vs C0: p50 1.00  p95 1.00
+  cost      p50   9.68 s  p95   55.7 s   vs C0: p50 0.38  p95 0.69
+  orc       p50   8.96 s  p95   51.3 s   vs C0: p50 0.36  p95 0.67
+  stk       p50   8.68 s  p95   60.9 s   vs C0: p50 0.34  p95 0.74
+  wt        p50  10.77 s  p95  113.5 s   vs C0: p50 0.54  p95 1.41
+swechat+tracelab_claude+wildchat n=36 disk 1.5 GB/s
+  C0        p50  29.51 s  p95   80.0 s   vs C0: p50 1.00  p95 1.00
+  cost      p50   6.26 s  p95   27.2 s   vs C0: p50 0.24  p95 0.34
+  orc       p50   6.25 s  p95   28.7 s   vs C0: p50 0.22  p95 0.34
+  stk       p50   7.29 s  p95   57.6 s   vs C0: p50 0.30  p95 0.63
+  wt        p50   6.39 s  p95   30.9 s   vs C0: p50 0.23  p95 0.37
+swechat+tracelab_claude+wildchat n=36 disk 3 GB/s
+  C0        p50  29.51 s  p95   80.0 s   vs C0: p50 1.00  p95 1.00
+  cost      p50   5.64 s  p95   22.5 s   vs C0: p50 0.21  p95 0.28
+  orc       p50   5.68 s  p95   22.7 s   vs C0: p50 0.21  p95 0.28
+  stk       p50   7.82 s  p95   57.1 s   vs C0: p50 0.29  p95 0.61
+  wt        p50   5.63 s  p95   24.1 s   vs C0: p50 0.21  p95 0.29
+tracelab_claude n=12 disk 0.5 GB/s
+  C0        p50   0.09 s  p95    1.3 s   vs C0: p50 1.00  p95 1.00
+  cost      p50   0.09 s  p95    1.4 s   vs C0: p50 1.01  p95 1.04
+  orc       p50   0.09 s  p95    1.1 s   vs C0: p50 0.99  p95 0.93
+  stk       p50   0.09 s  p95    1.3 s   vs C0: p50 0.99  p95 1.05
+  wt        p50   0.09 s  p95    1.3 s   vs C0: p50 1.00  p95 1.00
+tracelab_claude n=12 disk 1.5 GB/s
+  C0        p50   0.09 s  p95    1.3 s   vs C0: p50 1.00  p95 1.00
+  cost      p50   0.09 s  p95    1.3 s   vs C0: p50 1.01  p95 1.01
+  orc       p50   0.09 s  p95    1.1 s   vs C0: p50 0.99  p95 0.93
+  stk       p50   0.09 s  p95    1.3 s   vs C0: p50 0.99  p95 0.99
+  wt        p50   0.09 s  p95    1.3 s   vs C0: p50 1.00  p95 0.98
+tracelab_claude n=12 disk 3 GB/s
+  C0        p50   0.09 s  p95    1.3 s   vs C0: p50 1.00  p95 1.00
+  cost      p50   0.09 s  p95    1.2 s   vs C0: p50 1.03  p95 0.98
+  orc       p50   0.09 s  p95    1.1 s   vs C0: p50 0.99  p95 0.92
+  stk       p50   0.09 s  p95    1.1 s   vs C0: p50 0.99  p95 0.95
+  wt        p50   0.09 s  p95    1.2 s   vs C0: p50 0.99  p95 0.95
+tracelab_claude n=18 disk 0.5 GB/s
+  C0        p50   0.55 s  p95   16.4 s   vs C0: p50 1.00  p95 1.00
+  cost      p50   0.53 s  p95   12.5 s   vs C0: p50 0.87  p95 0.75
+  orc       p50   0.44 s  p95   11.9 s   vs C0: p50 0.77  p95 0.72
+  stk       p50   0.48 s  p95   12.6 s   vs C0: p50 0.79  p95 0.78
+  wt        p50   0.66 s  p95   11.9 s   vs C0: p50 0.90  p95 0.87
+tracelab_claude n=18 disk 1.5 GB/s
+  C0        p50   0.55 s  p95   16.4 s   vs C0: p50 1.00  p95 1.00
+  cost      p50   0.52 s  p95   10.6 s   vs C0: p50 0.80  p95 0.59
+  orc       p50   0.40 s  p95   10.4 s   vs C0: p50 0.78  p95 0.59
+  stk       p50   0.51 s  p95   11.1 s   vs C0: p50 0.82  p95 0.69
+  wt        p50   0.47 s  p95    9.9 s   vs C0: p50 0.82  p95 0.59
+tracelab_claude n=18 disk 3 GB/s
+  C0        p50   0.55 s  p95   16.4 s   vs C0: p50 1.00  p95 1.00
+  cost      p50   0.48 s  p95   10.3 s   vs C0: p50 0.78  p95 0.56
+  orc       p50   0.41 s  p95    9.8 s   vs C0: p50 0.77  p95 0.55
+  stk       p50   0.47 s  p95   10.4 s   vs C0: p50 0.79  p95 0.69
+  wt        p50   0.44 s  p95    9.2 s   vs C0: p50 0.79  p95 0.54
+tracelab_claude n=25 disk 0.5 GB/s
+  C0        p50   7.91 s  p95   65.0 s   vs C0: p50 1.00  p95 1.00
+  cost      p50   5.57 s  p95   43.5 s   vs C0: p50 0.72  p95 0.61
+  orc       p50   5.02 s  p95   39.4 s   vs C0: p50 0.69  p95 0.61
+  stk       p50   5.94 s  p95   49.1 s   vs C0: p50 0.75  p95 0.72
+  wt        p50   5.54 s  p95   97.2 s   vs C0: p50 0.73  p95 1.46
+tracelab_claude n=25 disk 1.5 GB/s
+  C0        p50   7.91 s  p95   65.0 s   vs C0: p50 1.00  p95 1.00
+  cost      p50   3.56 s  p95   21.4 s   vs C0: p50 0.54  p95 0.33
+  orc       p50   4.01 s  p95   21.3 s   vs C0: p50 0.54  p95 0.34
+  stk       p50   5.22 s  p95   46.5 s   vs C0: p50 0.69  p95 0.67
+  wt        p50   4.15 s  p95   25.7 s   vs C0: p50 0.55  p95 0.38
+tracelab_claude n=25 disk 3 GB/s
+  C0        p50   7.91 s  p95   65.0 s   vs C0: p50 1.00  p95 1.00
+  cost      p50   3.69 s  p95   18.9 s   vs C0: p50 0.49  p95 0.29
+  orc       p50   3.23 s  p95   18.8 s   vs C0: p50 0.47  p95 0.29
+  stk       p50   5.10 s  p95   45.0 s   vs C0: p50 0.66  p95 0.66
+  wt        p50   3.86 s  p95   19.4 s   vs C0: p50 0.49  p95 0.30
+wildchat n=60 disk 0.5 GB/s
+  C0        p50   0.07 s  p95    1.1 s   vs C0: p50 1.00  p95 1.00
+  cost      p50   0.07 s  p95    1.2 s   vs C0: p50 1.00  p95 0.89
+  orc       p50   0.06 s  p95    0.7 s   vs C0: p50 0.93  p95 0.53
+  stk       p50   0.07 s  p95    2.5 s   vs C0: p50 1.04  p95 1.65
+  wt        p50   0.07 s  p95    1.6 s   vs C0: p50 0.96  p95 1.13
+wildchat n=60 disk 1.5 GB/s
+  C0        p50   0.07 s  p95    1.1 s   vs C0: p50 1.00  p95 1.00
+  cost      p50   0.07 s  p95    0.9 s   vs C0: p50 0.99  p95 0.70
+  orc       p50   0.06 s  p95    0.6 s   vs C0: p50 0.93  p95 0.48
+  stk       p50   0.07 s  p95    1.1 s   vs C0: p50 1.03  p95 0.82
+  wt        p50   0.07 s  p95    0.8 s   vs C0: p50 0.96  p95 0.63
+wildchat n=60 disk 3 GB/s
+  C0        p50   0.07 s  p95    1.1 s   vs C0: p50 1.00  p95 1.00
+  cost      p50   0.07 s  p95    0.7 s   vs C0: p50 0.96  p95 0.58
+  orc       p50   0.06 s  p95    0.6 s   vs C0: p50 0.93  p95 0.46
+  stk       p50   0.07 s  p95    0.8 s   vs C0: p50 1.01  p95 0.62
+  wt        p50   0.07 s  p95    0.6 s   vs C0: p50 0.96  p95 0.53
+wildchat n=120 disk 0.5 GB/s
+  C0        p50   0.46 s  p95   27.2 s   vs C0: p50 1.00  p95 1.00
+  cost      p50   0.46 s  p95   26.8 s   vs C0: p50 1.07  p95 0.83
+  orc       p50   0.18 s  p95   11.3 s   vs C0: p50 0.43  p95 0.47
+  stk       p50   0.95 s  p95   25.0 s   vs C0: p50 1.82  p95 0.90
+  wt        p50   0.26 s  p95   12.7 s   vs C0: p50 0.67  p95 0.70
+wildchat n=120 disk 1.5 GB/s
+  C0        p50   0.46 s  p95   27.2 s   vs C0: p50 1.00  p95 1.00
+  cost      p50   0.29 s  p95   11.5 s   vs C0: p50 0.60  p95 0.45
+  orc       p50   0.17 s  p95   10.2 s   vs C0: p50 0.36  p95 0.37
+  stk       p50   0.31 s  p95   10.4 s   vs C0: p50 0.64  p95 0.38
+  wt        p50   0.21 s  p95    9.5 s   vs C0: p50 0.44  p95 0.36
+wildchat n=120 disk 3 GB/s
+  C0        p50   0.46 s  p95   27.2 s   vs C0: p50 1.00  p95 1.00
+  cost      p50   0.21 s  p95    9.5 s   vs C0: p50 0.44  p95 0.40
+  orc       p50   0.16 s  p95   10.0 s   vs C0: p50 0.33  p95 0.36
+  stk       p50   0.22 s  p95    9.5 s   vs C0: p50 0.46  p95 0.34
+  wt        p50   0.18 s  p95    9.2 s   vs C0: p50 0.37  p95 0.33
+wildchat n=211 disk 0.5 GB/s
+  C0        p50  78.11 s  p95  207.7 s   vs C0: p50 1.00  p95 1.00
+  cost      p50  36.50 s  p95  151.6 s   vs C0: p50 0.42  p95 0.72
+  orc       p50  31.01 s  p95  151.5 s   vs C0: p50 0.32  p95 0.72
+  stk       p50  47.73 s  p95  179.3 s   vs C0: p50 0.56  p95 0.85
+  wt        p50  70.35 s  p95  187.3 s   vs C0: p50 0.74  p95 0.90
+wildchat n=211 disk 1.5 GB/s
+  C0        p50  78.11 s  p95  207.7 s   vs C0: p50 1.00  p95 1.00
+  cost      p50  14.99 s  p95  105.4 s   vs C0: p50 0.14  p95 0.50
+  orc       p50  11.29 s  p95  103.3 s   vs C0: p50 0.12  p95 0.50
+  stk       p50  14.62 s  p95  102.2 s   vs C0: p50 0.15  p95 0.49
+  wt        p50  13.28 s  p95  103.7 s   vs C0: p50 0.14  p95 0.50
+wildchat n=211 disk 3 GB/s
+  C0        p50  78.11 s  p95  207.7 s   vs C0: p50 1.00  p95 1.00
+  cost      p50  11.20 s  p95   97.5 s   vs C0: p50 0.11  p95 0.47
+  orc       p50   9.82 s  p95   96.2 s   vs C0: p50 0.09  p95 0.47
+  stk       p50  11.65 s  p95   96.8 s   vs C0: p50 0.11  p95 0.46
+  wt        p50  11.43 s  p95   96.5 s   vs C0: p50 0.11  p95 0.47
+
+geomean over cells of the p95 TTFT ratio (per cell: geomean over workloads)
+rule      cells  p95/C0  worst  @0.5  @1.5  @3   p95/wt  @0.5  @1.5  @3
+C0           33    1.00   1.00  1.00  1.00  1.00     1.46  1.01  1.68  1.84
+wt           33    0.68   1.46  0.99  0.60  0.54     1.00  1.00  1.00  1.00
+stk          33    0.78   1.65  0.96  0.72  0.68     1.14  0.97  1.21  1.24
+cost         33    0.66   1.04  0.82  0.61  0.57     0.96  0.83  1.03  1.04
+orc          33    0.60   1.00  0.71  0.57  0.53     0.88  0.72  0.95  0.98

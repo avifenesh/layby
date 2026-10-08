@@ -1,0 +1,5 @@
+# sha256 of each boundary file after LC_ALL=C sort (extractor output order is not fixed; content is)
+0ba5c67b63fef6efeb70e6bc95e479e755b7a956355bdb950be791442716f144  swechat.bnd.jsonl
+1ee565eb50061d820513d72a5376789681c3df7f90f00ca260445f1e07e25cca  tracelab.bnd.jsonl
+295ae7cd8802d23a37e46bff91e7c37e0d5146dbbfa53a8e10a4eb402f959c10  wildchat.bnd.jsonl
+615f1d5e7a7388beb527075afc453869daafc9dd35ed66e77515e85ad7aefa11  copilot.bnd.jsonl
