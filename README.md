@@ -105,43 +105,66 @@ In the simulator, over 33 cells of ReturnBench (11 pool and load settings, disks
 return time. Write-through is best on fast disks (0.54 at 3 GB/s against 0.57) and worst on slow ones: up to 1.46 of C0
 at 0.5 GB/s, where it floods the disk. The cost rule is never worse than 1.04 of C0 in any cell.
 
-GLM 5.3 Flash FP8 on vLLM 0.31.0, one Nebius node with 8x RTX PRO 6000: two TP4 engines (the two repeats) share a
-network SSD read with O_DIRECT at 0.55 GB/s, so no page cache helps. ReturnBench at real length, contexts up to 260k
-tokens. Heavy is 150 sessions, half is 75.
+GLM 5.3 Flash FP8 on vLLM 0.31.0, Nebius nodes with 8x RTX PRO 6000: two TP4 engines (the two repeats of each row)
+share a network SSD read with O_DIRECT at 0.55 GB/s, so no page cache helps. ReturnBench at real length, contexts up
+to 260k tokens. Heavy is 150 sessions, half is 75. Node 1 ran the adapter before the local-hit fix (lesson 4 below).
+Node 2 ran the heavy load again with the fixed adapter, with and without the wait cap (lesson 5). The cap is the
+default; K without it is the uncapped operating point.
 
 | load | K vs C0 | T vs C0 | K vs T |
 |---|---|---|---|
-| heavy (150 sessions) | 0.67 [0.60, 0.82] | 1.17 [1.15, 1.19] | 0.58 [0.52, 0.70] |
-| half (75 sessions) | 0.95 [0.82, 1.08] | 3.99 [3.28, 4.74] | 0.24 [0.20, 0.28] |
+| heavy, node 1, before the fix | 0.67 [0.60, 0.82] | 1.17 [1.15, 1.19] | 0.58 [0.52, 0.70] |
+| heavy, node 2, K with the wait cap (default) | 0.79 [0.73, 0.85] | 1.35 [1.31, 1.42] | 0.59 [0.54, 0.63] |
+| heavy, node 2, K without the cap | 0.59 [0.52, 0.70] | 1.35 [1.31, 1.42] | 0.44 [0.38, 0.53] |
+| half, node 1 (75 sessions) | 0.95 [0.82, 1.08] | 3.99 [3.28, 4.74] | 0.24 [0.20, 0.28] |
 
-On a slow shared disk, writing every chunk is worse than having no disk at all. Layby writes only what pays: it cuts
-heavy-load p95 by a third and leaves half load where it was. The simulator predicted 0.80, 1.27 and 0.63 for the heavy
-load before the disk arms ran. Layby's heavy-load p99 is its weak point: a few disk sessions returned while the disk
-was saturated. A return-time guard (recompute when a restore would be slower) cut that tail 2 to 3x but raised p50
-and p95, so it is not in this release.
+Node 2 per engine (A / B), resumed-turn TTFT in seconds:
+
+| arm | p50 | p95 | p99 | recomputed |
+|---|---|---|---|---|
+| C0, no disk | 54.3 / 62.5 | 275 / 278 | 286 / 286 | 61% / 62% |
+| T, write-through | 58.3 / 58.7 | 394 / 353 | 460 / 480 | 56% / 56% |
+| K, no cap | 13.6 / 10.1 | 153 / 167 | 1919 / 829 | 39% / 35% |
+| K, wait cap (default) | 14.6 / 20.8 | 222 / 208 | 283 / 290 | 39% / 40% |
+
+On a slow shared disk, writing every chunk is worse than having no disk at all. Layby writes only what pays: with the
+fixed adapter and no cap it cuts heavy-load p95 to 0.59 of C0, with the cap to 0.79, and it leaves half load where it
+was. The simulator predicted 0.80, 1.27 and 0.63 for the heavy load before the disk arms ran. Without the cap the p99
+is a starvation tail: 33 of 1,908 turns on engine A waited 30 to 42 minutes while a disk promotion of their prefix
+was stuck behind a saturated disk. The cap removes that tail (p99 283 and 290 s against 286 for C0) and costs 1.34x at
+p95 and 1.47x at p50 against the uncapped adapter, because each give-up recomputes a prompt of about 58k tokens on a
+prefill-bound engine. A 30-minute wait is a failed request in production, so the cap ships as the default. An earlier
+return-time guard (recompute before the first lookup when a restore would be slower) cut the tail on node 1 but
+recomputed four of five disk returns; it is not in this release.
 
 The paper (arXiv, link to follow) has the method, the full tables and the engineering details.
 
-Qwen3-8B on vLLM 0.31.0, one RTX PRO 6000 per VM (two VMs, two repeats), the A100 rounds' capacities (16 GiB GPU KV,
-28 GiB CPU tier), ReturnBench mix36, and a disk tier on the VM's network SSD read with O_DIRECT at 0.48 GB/s. LM is
-LMCache 0.5.5 with its defaults; LMR is LMCache with `--l2-prefetch-policy retain` and a 0.95 L1 eviction watermark,
-the best setting we found for it.
+Qwen3-8B on vLLM 0.31.0, one RTX PRO 6000 per VM, the A100 rounds' capacities (16 GiB GPU KV, 28 GiB CPU tier),
+ReturnBench mix36, and a disk tier on the VM's network SSD read with O_DIRECT at 0.48 GB/s. Three repeats per arm:
+repeats 1 and 2 on two VMs, one each; repeat 3 of every arm on one further VM. K is Layby after the local-hit fix
+(lesson 4); its repeat 3 shares the VM with the other arms' repeat 3, and its repeats 1 and 2 ran on VMs of the same
+type, not the same box. The adapter before the fix (two repeats) is kept as its own row. This round ran without the
+wait cap, which was built after it. LM is LMCache 0.5.5 with its defaults; LMR is LMCache with
+`--l2-prefetch-policy retain` and a 0.95 L1 eviction watermark, the best setting we found for it.
 
 | arm | p50 (s) | p95 (s) | p99 (s) |
 |---|---|---|---|
-| C0, no disk | 0.12 / 0.12 | 5.7 / 7.8 | 10.4 / 15.3 |
-| T, write-through | 0.13 / 0.12 | 8.9 / 13.4 | 91 / 165 |
-| K, Layby | 0.15 / 0.14 | 5.6 / 5.2 | 9.8 / 12.3 |
-| LM, LMCache defaults | 12.3 / 15.3 | 51 / 63 | 63 / 83 |
-| LMR, LMCache retain | 0.18 / 0.17 | 7.6 / 7.5 | 16.3 / 14.6 |
+| C0, no disk | 0.12 / 0.12 / 0.12 | 5.7 / 7.8 / 5.6 | 10.4 / 15.3 / 10.9 |
+| T, write-through | 0.13 / 0.12 / 0.12 | 8.9 / 13.4 / 8.1 | 91 / 165 / 143 |
+| K, Layby | 0.13 / 0.12 / 0.12 | 3.5 / 3.8 / 3.6 | 6.7 / 10.6 / 6.8 |
+| K before the local-hit fix | 0.15 / 0.14 | 5.6 / 5.2 | 9.8 / 12.3 |
+| LM, LMCache defaults | 12.3 / 15.3 / 13.6 | 51 / 63 / 55 | 63 / 83 / 69 |
+| LMR, LMCache retain | 0.18 / 0.17 / 0.18 | 7.6 / 7.5 / 6.6 | 16.3 / 14.6 / 15.0 |
 
-| pair | p95 ratio [95% CI] |
-|---|---|
-| K vs C0 | 0.83 [0.67, 0.99] |
-| T vs C0 | 1.60 [1.12, 2.55] |
-| LMR vs C0 | 1.17 [0.96, 1.45] |
-| K vs LMR | 0.71 [0.61, 0.80] |
-| K vs LM | 0.09 [0.08, 0.11] |
+| pair | p95 ratio [95% CI] | p50 ratio |
+|---|---|---|
+| K vs C0 | 0.59 [0.51, 0.68] | 1.01 |
+| K vs T | 0.37 [0.28, 0.56] | 1.01 |
+| T vs C0 | 1.61 [1.08, 2.09] | 1.00 |
+| LMR vs C0 | 1.21 [1.08, 1.36] | 1.46 |
+| K vs LMR | 0.49 [0.44, 0.57] | 0.70 |
+| K vs LM | 0.07 [0.06, 0.07] | 0.01 |
+| K vs K before the fix (two repeats) | 0.68 [0.61, 0.75] | 0.88 |
 
 LMCache's default prefetch policy deletes a chunk from its CPU tier once the request that restored it from disk ends,
 so a returning session reads the disk again; its counters showed more than half of its hits served from disk while
@@ -165,9 +188,9 @@ stored nothing for that model, and at equal GPU KV the engine ran out of memory 
 - **GLM 5.3 Flash needs TP4 or less on RTX PRO 6000.** The sm_120 sparse MLA decode kernel has no build for 8 heads
   per GPU, so TP8 does not start.
 
-## Three adapter lessons
+## Adapter lessons
 
-Each one cost real-engine runs before it was found. All four are fixed, and each has a test that fails on the old
+Each one cost real-engine runs before it was found. All five are fixed, and each has a test that fails on the old
 code.
 
 1. **Do not rewrite what is already on disk.** vLLM sends a request-level tier every chunk of the request again on
@@ -183,13 +206,22 @@ code.
    the rest of the session: with the rule off it recomputed 2.02M tokens against 1.10M for stock vLLM. It now walks
    keys last first and copies the running vLLM's own LRU order (`tests/test_policy_prefix.py`,
    `tests/test_policy_lru_parity.py`).
-4. **Bound a deferral at what giving up costs.** vLLM holds a request for whole scheduler steps while the disk tier
+4. **Read the local hit where vLLM reports it.** vLLM 0.30 and 0.31 call `update_state_after_alloc` before they set
+   `num_computed_tokens`, so the adapter saw a local hit of 0 on every new request and booked GPU-served prefixes as
+   GPU misses and their once-evicted CPU chunks as CPU misses. The inflated miss loss raised the holding price of a
+   CPU copy and the rule dropped sessions about to return: 436 of about 880 decisions on the Qwen3-8B slow-disk round,
+   85 after the fix. The adapter now records the block-aligned local hit vLLM passes to
+   `get_num_new_matched_tokens` and uses it at admission. The fix took Layby's p50 from 1.19 to 1.01 of C0 and its
+   p95 from 0.83 to 0.59 (`tests/test_local_hit.py`).
+5. **Bound a deferral at what giving up costs.** vLLM holds a request for whole scheduler steps while the disk tier
    promotes its prefix to RAM. With two engines on one 0.55 GB/s disk, 33 of 1,908 resumed turns waited 30 to 42
-   minutes for their first token (p99 1,918 s against 286 s with no disk tier). Predicting the disk cost before the
+   minutes for their first token (p99 1,919 s against 286 s with no disk tier). Predicting the disk cost before the
    first lookup and recomputing instead cut the p99 but recomputed four of five disk returns and raised p50 and p95.
    The adapter now lets the promotion run and gives up only once the wait exceeds the recompute of the tokens it
    waits on, at the measured prefill speed: the request is admitted with the prefix RAM can load now and recomputes
-   the rest; the promotion lands in RAM when the disk delivers it (`tests/test_defer_cap.py`).
+   the rest; the promotion lands in RAM when the disk delivers it (`tests/test_defer_cap.py`). On the GLM heavy load
+   that took p99 to 283 and 290 s (C0: 286) and cost 1.34x at p95 and 1.47x at p50 against the uncapped adapter. The
+   cap is the default; the uncapped adapter is the other operating point.
 
 ## Names
 
