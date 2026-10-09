@@ -221,7 +221,12 @@ code.
    waits on, at the measured prefill speed: the request is admitted with the prefix RAM can load now and recomputes
    the rest; the promotion lands in RAM when the disk delivers it (`tests/test_defer_cap.py`). On the GLM heavy load
    that took p99 to 283 and 290 s (C0: 286) and cost 1.34x at p95 and 1.47x at p50 against the uncapped adapter. The
-   cap is the default; the uncapped adapter is the other operating point.
+   cap is the default; the uncapped adapter is the other operating point. A forward-looking cap, which gives up when
+   the expected remaining wait (bytes queued ahead over the load queue's measured drain rate) exceeds the recompute
+   cost, estimated the wait well (measured wait 1.2 to 1.4 times the estimate at the median) and gave up after about
+   7 s instead of 125 s, but did not beat the elapsed cap: p95 0.82 of no disk on its node against 0.79, p50 0.26
+   against 0.32, p99 1.3 times no disk's. A give-up costs a full long-prompt recompute either way. It is not in this
+   release.
 
 ## Names
 
