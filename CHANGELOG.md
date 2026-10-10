@@ -3,9 +3,9 @@
 Newest first. Paper versions map to tags: arXiv v1 will be `v1.0.0`, tagged on the commit the arXiv v1 submission
 was built from. The archive DOI is copied here, into `CITATION.cff` and into the README once the tag is archived.
 
-## Unreleased
+## 1.0.0 (2026-10-10)
 
-What the repository holds today:
+The release the paper describes:
 
 - The cost rule (`layby/rule.py`), live estimators and the in-process profiler (`layby/live.py`, `layby/prof.py`).
 - Engine adapters: vLLM 0.30 and 0.31 (`layby/vllm/`: `ParkConnector`, `ParkCachePolicy`, `ParkFsTier`, the hint

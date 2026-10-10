@@ -1,6 +1,6 @@
 [project]
 name = "layby"
-version = "0.1.0"
+version = "1.0.0"
 description = "Layby: KV cache placement for sessions that come back (cost rule, Layby-Dwell, vLLM and SGLang adapters, ReturnBench)"
 requires-python = ">=3.10"
 license = "Apache-2.0"

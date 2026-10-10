@@ -5,6 +5,15 @@ abstract: "KV cache placement for idle LLM sessions by when they come back: the 
 repository-code: "https://github.com/avifenesh/layby"
 url: "https://github.com/avifenesh/layby"
 license: Apache-2.0
+version: "1.0.0"
+date-released: "2026-10-10"
+keywords:
+  - LLM serving
+  - KV cache
+  - KV cache offloading
+  - vLLM
+  - SGLang
+  - benchmark
 authors:
   - family-names: "Fenesh"
     given-names: "Avi"
@@ -15,4 +24,4 @@ preferred-citation:
     - family-names: "Fenesh"
       given-names: "Avi"
   year: 2026
-  notes: "arXiv id to be added when the paper is posted; the version and doi fields of this file follow with the v1.0.0 tag and its archive."
+  notes: "arXiv id to be added when the paper is posted."
