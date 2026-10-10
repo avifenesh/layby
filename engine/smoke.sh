@@ -18,6 +18,8 @@ export REPLAY_TIMEOUT=3000 VOCAB=${VOCAB:-150000}
 export SERVE_ARGS="--tensor-parallel-size ${TP:-4} --enforce-eager --kv-cache-dtype fp8 --prefix-match-unit 256 --revision ${REV:-eb9eb208} --max-num-seqs 32"
 export OFF_EXTRA=${OFF_EXTRA:-',"blocks_per_chunk":1,"park_write":"through"'}
 export SMOKE_ARGS="--prompt ${PROMPT:-120000} --gpu-tokens ${GPU_TOKENS:-560000} --cpu-tokens ${CPU_TOKENS:-1100000} --filler 30000"
+# pre-Phase R runs: LM's former 340 GiB L2 cap as the disk-tier capacity, arm K on the precomputed curves
+export DISK_BYTES=${DISK_BYTES:-365072220160} LIVE_SCORING=${LIVE_SCORING:-off}
 mkdir -p $OUT $KV_DIR
 $ENGINE_DIR/run_arms.sh $REPLAY $OUT ${KV_BYTES:-4294967296} ${CPU_BYTES:-68719476736} $KV_DIR SM \
   >> $OUT/runner.log 2>&1

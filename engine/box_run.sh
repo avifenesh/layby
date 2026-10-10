@@ -16,6 +16,8 @@ export VENV ENGINE_DIR=$LAYBY_ROOT/engine REPO=$LAYBY_ROOT PORT=8000 PARK_PORT=2
 export HF_HUB_ENABLE_HF_TRANSFER=0
 python3 $LAYBY_ROOT/scripts/verify_manifest.py $LAYBY_ROOT/engine/workloads/MANIFEST.json >> $OUT/runner.log 2>&1 || echo "workload manifest check FAILED" >> $OUT/runner.log
 python3 -c "from huggingface_hub import snapshot_download as s; print(s('Qwen/Qwen3-8B'))" > $OUT/model.log 2>&1
+# pre-Phase R runs: LM's former 340 GiB L2 cap as the disk-tier capacity, arm K on the precomputed curves
+export DISK_BYTES=${DISK_BYTES:-365072220160} LIVE_SCORING=${LIVE_SCORING:-off}
 for arm in "$@"; do
   $LAYBY_ROOT/engine/run_arms.sh $REPLAY $OUT 17179869184 30064771072 $KV_DIR "$arm$R" >> $OUT/runner.log 2>&1
 done

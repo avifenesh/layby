@@ -79,7 +79,7 @@ Image `lmsysorg/sglang:v0.5.21`. Install this repo into the image's own environm
 entry point `park`), then:
 
     pip install aiohttp -e .                                  # from a checkout of this repo
-    VENV=$(dirname $(dirname $(command -v sglang))) WINDOW=0 \
+    VENV=$(dirname $(dirname $(command -v sglang))) WINDOW=0 DISK_BYTES=365072220160 LIVE_SCORING=off \
       bash engine/run_arms_sglang.sh $HOME/replay.json $HOME/out 17179869184 30064771072 $HOME/kvdisk K T C0
 
 `run_arms_sglang.sh` runs every arm on SGLang's Python radix tree core (the Layby backend needs it, so the baselines use

@@ -15,6 +15,8 @@ export HARD_CAP=${HARD_CAP:-4500} REPLAY_TIMEOUT=${REPLAY_TIMEOUT:-5700}
 export SERVE_ARGS="--tensor-parallel-size 4 --enforce-eager --kv-cache-dtype fp8 --prefix-match-unit 256 --revision eb9eb208 --max-num-seqs 32"
 export OFF_EXTRA=',"blocks_per_chunk":1'
 O=$OUT/$N; mkdir -p $O
+# pre-Phase R runs: LM's former 340 GiB L2 cap as the disk-tier capacity, arm K on the precomputed curves
+export DISK_BYTES=${DISK_BYTES:-365072220160} LIVE_SCORING=${LIVE_SCORING:-off}
 for arm in "$@"; do
   $LAYBY_ROOT/engine/run_arms.sh $REPLAY $O ${KV_BYTES:-4294967296} ${CPU_BYTES:-30064771072} $KV_DIR $arm >> $O/runner.log 2>&1
 done
