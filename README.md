@@ -101,6 +101,16 @@ writing every chunk through to a disk tier. Qwen3-8B on one A100, 16 GiB GPU KV,
 | SGLang 0.5.21, private agent replay | 0.93 | 0.92 | 1.01 |
 | SGLang 0.5.21, ReturnBench mix36 | 0.34 | 0.15 | 2.28 |
 
+These rows ran an adapter with two bugs since fixed (local hit, hint heap) and no wait cap. A rerun of the
+private replay with the fixed adapter on vLLM 0.31.0, one repeat per arm on each of three A100 boxes:
+
+| box | K vs C0 | T vs C0 | K vs T | p95 C0 / T / K (s) |
+|---|---|---|---|---|
+| two SXM4 80GB boxes, disk 3.5 and 5.5 GB/s (pooled) | 0.64 [0.58, 0.74] | 0.71 [0.64, 0.79] | 0.89 [0.84, 1.04] | 4.29 / 2.96 / 2.85 and 4.92 / 3.55 / 2.93 |
+| PCIe 40GB box, disk 0.54 GB/s | | | | 8.02 / 4.52 / 13.49 |
+
+On fast disks the gap to write-through is gone. On the slower box Layby lost: see Limits.
+
 In the simulator, over 33 cells of ReturnBench (11 pool and load settings, disks at 0.5, 1.5 and 3 GB/s), the cost rule's p95 is 0.66 of C0 against 0.68 for write-through and 0.60 for an oracle that knows each
 return time. Write-through is best on fast disks (0.54 at 3 GB/s against 0.57) and worst on slow ones: up to 1.46 of C0
 at 0.5 GB/s, where it floods the disk. The cost rule is never worse than 1.04 of C0 in any cell.
@@ -177,6 +187,11 @@ stored nothing for that model, and at equal GPU KV the engine ran out of memory 
   overlay filesystems of those boxes, so recent writes were read back from the OS page cache (about 125 GB of host
   RAM); the cold disk read at about 60 MB/s. Write-through (T) there acts as a larger RAM tier, which is why it wins.
   On a real slow disk (the GLM round) the order flips: T is worse than no disk and Layby is best.
+- **A slow disk under CPU-tier pressure can beat the rule.** On a PCIe A100 whose disk ran at 0.54 GB/s, the
+  fixed adapter recomputed 1.52M prompt tokens against 0.95M for write-through, p95 13.5 s against 4.5 s. Most of
+  it came from sessions the rule left in the CPU tier to spill at eviction: the slower GPU kept more sessions in
+  flight, and the eviction-time writes fell behind. The rule prices a spill as a delay to others, not the chance
+  it is not done when the session returns. Pricing that would move those sessions to an early write; not tested.
 - **Write-back on eviction (KD) is a negative result on vLLM 0.30.** vLLM frees an evicted CPU slot at once, so the
   adapter writes chunks ahead of eviction, and the write pins them. Bursts of pinned chunks starve the CPU tier, and
   the arm recomputes about as much as having no disk (p95 1.67x T). A clean version needs write-on-evict inside vLLM's
