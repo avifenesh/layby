@@ -15,6 +15,8 @@
    "longest_request_bytes": 8743878656,
    "state_block_tokens": 784,
    "state_block_source": "vLLM 0.31.0 boot log, compat check 2026-10-11 (attention block set to 784 tokens so its page equals the mamba page)",
+   "gpu_request_bytes": 8942670758,
+   "gpu_request_source": "vLLM 0.31.0 compat boot, 56.72 GiB KV pool x 131,072 / 892,645 tokens (max concurrency 6.81x)",
    "arch": {
     "full_layers": 16,
     "kv_heads": 4,
@@ -60,10 +62,10 @@
  },
  {
   "name": "gemma4_31b",
-  "hf": "RedHatAI/gemma-4-31B-it-FP8-block@d7242548c457ab4b45bd3adb8937f2659af4739d",
-  "config_sha256": "f83680dca1680f7dcc507bc801549a99f5b4346aa3fdf2a48b549b782a8ca999",
+  "hf": "google/gemma-4-31B-it@842da3794eaa0b77d5f08bae87a17459d91ff475 (vLLM online fp8)",
+  "config_sha256": "e967dd38bc5cfd38bd09a995a7bf4a754075df2b46aba68f7fbb5a791e6d8dd1",
   "cap": 131072,
-  "cap_source": "default 131,072 (compat check not in yet)",
+  "cap_source": "compat check boot_maxlen",
   "kv": {
    "dtype": "bf16",
    "grow_bytes_per_token": 81920,
@@ -74,6 +76,8 @@
    "longest_request_bytes": 11576279040,
    "state_block_tokens": null,
    "state_block_source": null,
+   "gpu_request_bytes": 25011233508,
+   "gpu_request_source": "vLLM 0.31.0 compat boot, 53.65 GiB KV pool x 131,072 / 301,887 tokens (max concurrency 2.30x; sliding groups reserve window + batch tokens)",
    "arch": {
     "global_layers": 10,
     "global_kv_heads": 4,
@@ -87,13 +91,15 @@
     "max_position_embeddings": 262144
    }
   },
-  "c0": 1.7801,
+  "c0": 2.4786,
   "tpot": 0.03421,
-  "b": 0.07296,
+  "b": 0.10159,
   "inflight": 1.4317,
   "service_assumption": {
-   "status": "ESTIMATE (replace with the pilot's microbenchmarks): TPOT, C0, B",
-   "measured": [],
+   "status": "measured: prefill (C0, B); ESTIMATE (replace with the pilot's microbenchmarks): TPOT",
+   "measured": [
+    "prefill (C0, B)"
+   ],
    "ref_model": "Qwen3-8B BF16 (Qwen/Qwen3-8B config sha256 f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30)",
    "ref_fit": {
     "c0": 0.649,
@@ -102,8 +108,8 @@
     "source": "least squares on the C0 arms of the 2026-10 Qwen3-8B heavy rounds (nebius_q8 p1, p2, p4: 2,748 turns; BF16, vLLM, 1x RTX PRO 6000 Nebius); work/svc_fit2.py"
    },
    "c_ref_tokens": 23015,
-   "prefill_ratio": 2.7428,
-   "prefill_ratio_source": "ESTIMATE: FLOP ratio at C_REF (no measured run)",
+   "prefill_ratio": 3.8192,
+   "prefill_ratio_source": "MEASURED: 16983 / b1 prefill 4447 tok/s at 23015 tokens (compat prefill.json sha256 b7397939e439299aeb0a96a3e2a521431754f52f0d11d4edc3fca19694798bb1)",
    "decode_ratio": 1.8007,
    "ref_prefill_flops_per_token": 27466334208.0,
    "prefill_flops_per_token": 75334287360.0,
@@ -113,7 +119,7 @@
    "lm_head_params_bf16": 1409286144.0,
    "fp8_compute_credit": false,
    "ref_prefill_tok_s": 16983.0,
-   "prefill_tok_s_at_c_ref": 6192.0,
+   "prefill_tok_s_at_c_ref": 4447.0,
    "flop_ratio": 2.7428
   }
  }

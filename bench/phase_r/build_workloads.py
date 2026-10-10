@@ -28,8 +28,10 @@ the summed session time reaches LIVE x duration, LIVE the mean number of live se
 in [0, duration - its length], so the run to completion is estimated at --duration seconds. Tuning also gets the
 shorter stages of section 8 (--stages, nested prefixes of the tuning order).
 With --size-by-kv F (KV pressure, the Phase R v2 rule): tuning, pilot, measured and heldout_cc take sessions until
-their peak live KV bytes reach F x the model's longest request (F = 1.1 / 0.15: the GPU KV floor is 0.15 P), and every
-session runs to completion (no cut; starts uniform over --duration, the estimated makespan is reported); the tuning
+their peak live KV bytes reach F x the GPU KV one max-length request needs (kv.gpu_request_bytes, the engine's start
+check; F = 1.1 / 0.15: the GPU KV floor is 0.15 P), and every
+session runs to completion (starts uniform over --duration; --session-cap cuts each session at its last turn that
+ends within that many seconds of its start; the estimated makespan is reported); the tuning
 stages take the same P target, cut at their lengths; extras with a p factor are multiples of the measured P.
 
 KV (kv in the model spec): a session at context c holds grow x c + state + min(c, window) x window_bytes bytes (the
@@ -98,6 +100,8 @@ ap.add_argument("--size-by-kv", type=float, help="F: size tuning, pilot, measure
                 "sessions are added until peak live KV bytes reach F x the model's longest request (F = 1.1 / 0.15 puts "
                 "the GPU KV floor at 0.15 P), each runs to completion (no cut), starts uniform over --duration; the "
                 "tuning stages take the same P target and are cut at their --stages lengths")
+ap.add_argument("--session-cap", type=float, help="with --size-by-kv: cut each session at its last turn that ends "
+                "within this many seconds of its start (default: no cut); starts are uniform over --duration")
 ap.add_argument("--stages", type=float, nargs="*", default=[1200.0, 2400.0])
 ap.add_argument("--split", type=float, nargs=2, default=[0.25, 0.15], help="tuning and pilot fractions")
 ap.add_argument("--retain", type=float, default=0.16)
@@ -304,7 +308,7 @@ def assemble(M, name, items, duration, build_turns, src_of, live=1.0, skip=froze
         if len(T) < 3:
             continue
         sid = f"{TAG[src]}{len(sessions):04d}"
-        start = float(rng.uniform(0, max(0.0, duration - L)))
+        start = float(rng.uniform(0, duration if limit is not None else max(0.0, duration - L)))
         turns = []
         why = [t["_why"] for t in T]
         for i, t in enumerate(T):
@@ -314,7 +318,7 @@ def assemble(M, name, items, duration, build_turns, src_of, live=1.0, skip=froze
                              _src_session=sess, _unit=unit, _len=L, _cut=was_cut, _turns_src=len(full), _why=why))
         total += sum(t["_e2e"] for t in T) if by_turns else L
         if peak is not None:
-            if load(sessions, M, duration, limit == float("inf"))["peak_live_kv_bytes" if M["kv"] else "peak_live_kv_tokens"] >= peak:
+            if load(sessions, M, duration, limit is not None)["peak_live_kv_bytes" if M["kv"] else "peak_live_kv_tokens"] >= peak:
                 break
         elif total >= target:
             break
@@ -409,7 +413,10 @@ def write(M, name, sessions, refs, extra):
                                           **{k: M[k] for k in ("inflight", "live", "service_assumption") if k in M}),
                kv=M["kv"], hf=M.get("hf"), ctx_cap_source=M.get("cap_source"),
                sizing=dict(by="peak live KV bytes", heavy_P_target_bytes=int(P_heavy), factor_of_longest_request=a.size_by_kv,
-                           run_to_completion=extra.get("to_completion", False)) if P_heavy else
+                           run_to_completion=extra.get("to_completion", False), session_cap_s=a.session_cap,
+                           start_window_s=a.duration if extra.get("to_completion") else None,
+                           turns_cut_share=round(1 - sum(len(x["turns"]) for x in sessions) /
+                                                 sum(x["_turns_src"] for x in sessions), 4)) if P_heavy else
                dict(by="inflight" if "inflight" in M else "live"),
                sessions=[dict(id=s["id"], source=s["pool"], source_session=s["_src_session"], turns=len(s["turns"]),
                               turns_in_source=s["_turns_src"], cut_at_duration=s["_cut"]) for s in sessions])
@@ -448,8 +455,8 @@ if not a.models:
 models = [spec(m) for m in json.load(open(a.models))]
 built = {}
 for M in models:
-    P_heavy = a.size_by_kv * M["kv"]["longest_request_bytes"] if a.size_by_kv else None
-    LIM = float("inf") if P_heavy else None
+    P_heavy = a.size_by_kv * M["kv"].get("gpu_request_bytes", M["kv"]["longest_request_bytes"]) if a.size_by_kv else None
+    LIM = (a.session_cap or float("inf")) if P_heavy else None
     if P_heavy:
         print(M["name"], f"heavy P target {P_heavy / 1e9:.2f} GB", flush=True)
     for p in PARTS:

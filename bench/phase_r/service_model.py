@@ -123,8 +123,12 @@ ap.add_argument("--inflight-ref", type=float, required=True)
 ap.add_argument("--prefill", action="append", default=[], help="NAME=prefill.json")
 ap.add_argument("--max-len", action="append", default=[], help="NAME=FILE holding the booted max-model-len")
 ap.add_argument("--state-block", action="append", default=[], help="NAME=TOKENS:SOURCE")
+ap.add_argument("--gpu-request", action="append", default=[],
+                help="NAME=BYTES:SOURCE, the GPU KV the engine needs for one max-length request (vLLM's start check: "
+                     "its KV pool / its maximum concurrency at max-model-len, from the compatibility boot)")
 a = ap.parse_args()
 blocks = {x.split("=", 1)[0]: x.split("=", 1)[1].split(":", 1) for x in a.state_block}
+gpureq = {x.split("=", 1)[0]: x.split("=", 1)[1].split(":", 1) for x in a.gpu_request}
 
 rc = json.load(open(a.ref_config))
 R = ref_arch(rc)
@@ -171,6 +175,8 @@ for spec in a.config:
                 window_bytes_per_session_max=A["window_bytes"] * A["window"], longest_request_bytes=longest,
                 state_block_tokens=int(blocks[name][0]) if name in blocks else None,
                 state_block_source=blocks[name][1] if name in blocks else None,
+                gpu_request_bytes=int(float(gpureq[name][0])) if name in gpureq else longest,
+                gpu_request_source=gpureq[name][1] if name in gpureq else "longest_request_bytes (session KV at the cap)",
                 arch=A["detail"]),
         c0=round(FIT["c0"] * rp, 4), tpot=round(FIT["tpot"] * rd, 5), b=round(FIT["b"] * rp, 5),
         inflight=a.inflight_ref,
