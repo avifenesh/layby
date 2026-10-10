@@ -18,6 +18,12 @@ sys.path.insert(0, PR)
 import orchestrate  # noqa: E402
 from common import load_json  # noqa: E402
 
+
+def example_size(name, key):
+    """A size from an example cell (capacities, or a top-level key such as ram_tier_bytes), in bytes."""
+    c = load_json(os.path.join(EX, name))
+    return orchestrate.parse_size(c["capacities"][key] if key in c["capacities"] else c[key])
+
 EX = os.path.join(PR, "examples")
 SCRATCH = os.environ.get("LAYBY_TEST_DIR", os.path.expanduser("~/.cache/layby-phase-r-test"))
 
@@ -74,7 +80,8 @@ class DryRun(unittest.TestCase):
         self.assertTrue(any("SERVER_WRAP=/root/layby/engine/phase_r/cg_exec.sh /sys/fs/cgroup/layby/" in ln for ln in lines))
         cmd = {ln.split(" > ")[0].split()[-1]: ln for ln in lines if "bash /root/layby/engine/run_arms.sh" in ln}
         self.assertEqual(sorted(cmd), sorted(arms))
-        self.assertIn("CT_ETA=0.83", cmd["CT"])
+        ct = next(a for a in load_json(os.path.join(EX, "cell_main_vllm_slow_heavy.json"))["arms"] if a["label"] == "CT")
+        self.assertIn(f"CT_ETA={ct['env']['CT_ETA']}", cmd["CT"])
         self.assertIn("T2_MIN_HITS=2", cmd["T2"])
         self.assertTrue(all("HARD_CAP=9000" in ln and "REPLAY_TIMEOUT=10800" in ln for ln in cmd.values()))
         # the order is the seeded one, and positions are logged
@@ -99,7 +106,7 @@ class DryRun(unittest.TestCase):
                 w = ln.split()
                 got[ln.rsplit("/", 2)[-2].rsplit(".", 1)[-1]] = int(w[w.index("echo") + 1])
         G, M = 1 << 30, 1 << 20
-        pinned, slack = 28 * G, 256 * M
+        pinned, slack = example_size("cell_main_vllm_slow_heavy.json", "cpu_bytes"), 256 * M
         self.assertEqual(got, {"C0": pinned + 12 * G + slack, "T": pinned + 12 * G + 512 * M + slack,
                                "T2": pinned + 12 * G + 512 * M + slack, "CT": pinned + 12 * G + slack,
                                "LM": pinned + (11 + 3) * G + slack,       # vLLM engine plus its LMCache server
@@ -130,7 +137,8 @@ class DryRun(unittest.TestCase):
         # an A/A block runs only C0's two copies, which use C0's entry
         rc, out = run(["run", "--cell", p, "--aa", "C0", "--host", "h1", "--out", self.out, "--dry-run"])
         self.assertEqual(rc, orchestrate.EXIT_OK)
-        self.assertIn(f"echo {28 * (1 << 30) + 12 * (1 << 30) + (256 << 20)} > /sys/fs/cgroup/layby/"
+        cpu = example_size("cell_main_vllm_slow_heavy.json", "cpu_bytes")
+        self.assertIn(f"echo {cpu + 12 * (1 << 30) + (256 << 20)} > /sys/fs/cgroup/layby/"
                       "main-vllm-slow-heavy-AA.r1a1.A.C0_aa1/memory.max", out)
 
     def test_regime_mismatch_stops_before_any_arm(self):
@@ -196,15 +204,19 @@ class DryRun(unittest.TestCase):
         self.assertIn("cpuset.mems", out)
 
     def test_ram_tier_sglang_cell(self):
-        rc, out = run(["run", "--cell", self.cell("cell_main_sglang_fast_heavy.json"), "--host", "h1", "--out",
-                       self.out, "--dry-run"])
+        # a 64 GiB disk and RAM tier, so the budget fits the dry run's fake host (MemAvailable about 186 GiB)
+        caps = dict(load_json(os.path.join(EX, "cell_main_sglang_fast_heavy.json"))["capacities"], disk_bytes="64G")
+        rc, out = run(["run", "--cell", self.cell("cell_main_sglang_fast_heavy.json", capacities=caps,
+                                                  ram_tier_bytes="64G"), "--host", "h1", "--out", self.out, "--dry-run"])
         self.assertEqual(rc, orchestrate.EXIT_OK, out[-1500:])
-        self.assertIn("mount -t tmpfs -o size=68719476736,mode=0755 layby_ram_tier /mnt/layby/ram", out)
+        ram = 64 << 30
+        cpu = example_size("cell_main_sglang_fast_heavy.json", "cpu_bytes")
+        self.assertIn(f"mount -t tmpfs -o size={ram},mode=0755 layby_ram_tier /mnt/layby/ram", out)
         self.assertNotIn("/io.max", out)
         self.assertIn("apply_patch.sh /root/.venv-sglang/bin/python check fdatasync", out)
         self.assertIn("WRITE_POLICY=write_through_selective", out)
-        # memory.max carries the RAM tier: 28 GiB pinned + 12 GiB RSS + 256 MiB + 64 GiB
-        self.assertIn(f"echo {(28 + 12 + 64) * (1 << 30) + (256 << 20)} > /sys/fs/cgroup/layby/", out)
+        # memory.max carries the RAM tier: the pinned CPU tier + 12 GiB RSS + 256 MiB + the RAM tier
+        self.assertIn(f"echo {cpu + 12 * (1 << 30) + (256 << 20) + ram} > /sys/fs/cgroup/layby/", out)
 
     def test_k_scores_live_and_needs_its_inputs(self):
         rc, out = run(["run", "--cell", self.cell("cell_main_vllm_slow_heavy.json"), "--host", "h1", "--out", self.out,
@@ -216,7 +228,8 @@ class DryRun(unittest.TestCase):
         self.assertIn("SIDECAR_PORT=28766", cmd["K"])                       # park_port + 1
         for arm in ("K_ewma", "K_km", "C0"):
             self.assertNotIn("SIDE_FILE=", cmd[arm])
-        self.assertTrue(all(f"DISK_BYTES={140 << 30}" in ln for ln in cmd.values()))
+        disk = example_size("cell_main_vllm_slow_heavy.json", "disk_bytes")
+        self.assertTrue(all(f"DISK_BYTES={disk}" in ln for ln in cmd.values()))
         # no live_scoring in the cell: refused before anything runs (exit 4)
         out2 = tempfile.mkdtemp(dir=self.tmp)
         p = self.cell("cell_main_vllm_slow_heavy.json", live_scoring=None)
@@ -264,7 +277,7 @@ class DryRun(unittest.TestCase):
         self.assertEqual(run(["plan", "--cell", p])[0], orchestrate.EXIT_CONFIG)
         p = self.cell("cell_main_vllm_slow_heavy.json", kv_chunk_bytes=None)
         self.assertEqual(run(["plan", "--cell", p])[0], orchestrate.EXIT_CONFIG)
-        p = self.cell("cell_main_sglang_fast_heavy.json", ram_tier_bytes="32G")   # smaller than disk_bytes 64G
+        p = self.cell("cell_main_sglang_fast_heavy.json", ram_tier_bytes="32G")   # smaller than disk_bytes
         self.assertEqual(run(["plan", "--cell", p])[0], orchestrate.EXIT_CONFIG)
 
     def test_regime_read_rate_is_the_slower_of_seq_and_chunk_reads(self):

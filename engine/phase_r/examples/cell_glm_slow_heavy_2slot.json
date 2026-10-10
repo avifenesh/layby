@@ -1,5 +1,5 @@
 {
- "_comment": "GLM 5.3 Flash on an 8x RTX PRO 6000 node: two TP4 engines, one per NUMA half, each with its own disk, cgroup and io.max; arms split across halves by order.assign_slots and run in lockstep rounds. PLACEHOLDER values. Arm set (plan section 6): C0, T, the better of T2 and CT on the tuning workload (T2 here until tuning picks), K, K_ewma. With 5 arms over 2 slots the last round's empty slot runs an unscored C0 filler.",
+ "_comment": "GLM 5.3 Flash on an 8x RTX PRO 6000 node: two TP4 engines, one per NUMA half, each with its own disk, cgroup and io.max; arms split across halves by order.assign_slots and run in lockstep rounds. Capacities from capacities.json (glm53_flash_heavy.measured: gpu_kv_bytes per rank, cpu_bytes over all four ranks). PLACEHOLDER values: the rest. Arm set (plan section 6): C0, T, the better of T2 and CT on the tuning workload (T2 here until tuning picks), K, K_ewma. With 5 arms over 2 slots the last round's empty slot runs an unscored C0 filler.",
  "cell": "large-glm-slow-heavy",
  "plan": "BENCH_PLAN draft 4 (freeze commit to fill)",
  "seed": 20261010,
@@ -10,13 +10,13 @@
  "pilot": "pilot_qwen3_8b_vllm.json",
  "workload": {
   "path": "/data/phase_r/glm_measured.json",
-  "sessions": 150,
-  "turns": 7858
+  "sessions": 80,
+  "turns": 1016
  },
  "capacities": {
-  "gpu_kv_bytes": "4G",
-  "cpu_bytes": "28G",
-  "disk_bytes": "140G"
+  "gpu_kv_bytes": "3475860867",
+  "cpu_bytes": "34271042222",
+  "disk_bytes": "114480725428"
  },
  "hard_cap_s": 13500,
  "kv_chunk_bytes": 2097152,
