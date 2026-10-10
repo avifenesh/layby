@@ -230,6 +230,69 @@ def test_live_fallback_over_one_percent_invalidates_the_run():
     assert res["runs"]["cell__K__h1"]["live"]["valid"] and "cell__K__h0" not in res["runs"]
 
 
+def test_live_arm_without_live_rows_is_invalid(tmp_path):
+    # a K run whose replay ran without --side-file has no live-check rows at all: with K in live_arms it is
+    # invalid and reported (before: no rows meant nothing to check, so it counted as valid)
+    rng = np.random.default_rng(6)
+    runs = synth(0.7, 3, rng)
+    with_curves(runs["cell"]["h1"]["K"], 100, 0)
+    with_curves(runs["cell"]["h2"]["K"], 100, 0)                 # h0's K has no curve rows
+    res = A.analyze(runs, ["K:C0"], {}, 0.05, 0, 0, live_arms=["K"])
+    assert list(res["invalid_runs"]) == ["cell__K__h0"]
+    assert "no live-check rows" in res["invalid_runs"]["cell__K__h0"]["reason"]
+    assert res["pairs"]["cell"]["K:C0"]["hosts"] == ["h1", "h2"]
+    # through the spec key, end to end, with the reason printed
+    for h, arms in runs["cell"].items():
+        for arm, run in arms.items():
+            rows = [row(s, t, v["ttft"]) for (s, t), v in run["turns"].items()] + list(run["curves"])
+            write(tmp_path / f"cell__{arm}__{h}.jsonl", rows)
+    (tmp_path / "spec.json").write_text(json.dumps(dict(live_arms=["K"])))
+    res = A.main([str(tmp_path), "--spec", str(tmp_path / "spec.json"), "--pair", "K:C0", "--boot", "0"])
+    assert list(res["invalid_runs"]) == ["cell__K__h0"] and res["live_arms"] == ["K"]
+    assert res["pairs"]["cell"]["K:C0"]["hosts"] == ["h1", "h2"]
+
+
+def test_censored_comparator_is_reported_not_a_zero_ratio(tmp_path, capsys):
+    base = {(f"s{s}", t): 1.0 + s * 0.01 for s in range(20) for t in range(1, 6)}
+    cens = dict(base)
+    for s in range(6):
+        for t in range(1, 6):
+            cens[(f"s{s}", t)] = INF
+    runs = {"c": {h: {"K": run_of(base), "C0": run_of(cens)} for h in ("h1", "h2", "h3")}}
+    res = A.analyze(runs, ["K:C0"], {}, 0.05, 0, 0)
+    r = res["pairs"]["c"]["K:C0"]["p95"]
+    assert all(math.isnan(v) for v in r["per_host"].values()) and r["t"] is None   # not 0 (x / inf)
+    assert r["censored"] == dict(arm=[], comparator=["h1", "h2", "h3"])
+    for h, arms in runs["c"].items():
+        for arm, run in arms.items():
+            write(tmp_path / f"c__{arm}__{h}.jsonl",
+                  [row(s, t, v["ttft"]) if math.isfinite(v["ttft"]) else row(s, t, status="censored")
+                   for (s, t), v in run["turns"].items()])
+    A.main([str(tmp_path), "--pair", "K:C0", "--boot", "0"])
+    out = capsys.readouterr().out
+    assert "comparator censored at p95 on h1,h2,h3" in out and "no interval" not in out
+
+
+def test_throughput_tost_uses_the_wider_of_bootstrap_and_t_bounds(tmp_path):
+    # three hosts: the host bootstrap is narrow (about +-1.3%), the t interval (df 2) about +-3.4%; at margin 0.02
+    # the bootstrap alone would pass and the t interval does not, so the rule must not hold
+    f = {"h1": 1.02, "h2": 0.98, "h3": 1.0}
+    for h, fh in f.items():
+        for arm, scale in (("C0", 1.0), ("K", fh)):
+            for r in (1, 2, 3, 4, 5):
+                write(tmp_path / f"tp__{arm}__{h}__rate{r}.jsonl", [row(f"q{i}", 0, 0.2 * r * scale) for i in range(100)])
+    spec = dict(slo={"tp": 0.7}, tests=[dict(name="H5b", rule="throughput_tost", pair="K:C0", margin=0.02)])
+    (tmp_path / "spec.json").write_text(json.dumps(spec))
+    res = A.main([str(tmp_path), "--spec", str(tmp_path / "spec.json"), "--boot", "2000"])
+    pr = res["throughput"]["pairs"]["tp"]["K:C0"]
+    b, t = pr["bootstrap"], pr["t"]
+    assert 0.98 < b["lower"] and b["upper"] < 1.02                   # the bootstrap alone passes
+    assert t["lower"] < 0.98 and t["upper"] > 1.02
+    part = res["tests"]["H5b"]["parts"][0]
+    assert (part["lower"], part["upper"]) == (min(b["lower"], t["lower"]), max(b["upper"], t["upper"]))
+    assert not res["tests"]["H5b"]["holds"]
+
+
 # --- H5 throughput half ---------------------------------------------------------------------------------
 def pts(p95s, bad=None):
     return {r: dict(n=100, p95=v, bad_frac=(bad or {}).get(r, 0.0)) for r, v in p95s.items()}

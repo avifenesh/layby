@@ -33,19 +33,27 @@ Decision rules (spec file, --spec): tests run in order:
                           the geometric mean over the cells of the per-cell estimands (equal cell weights),
                           Welch-Satterthwaite df; holds if its upper bound is below the threshold
   {"name": "H5b", "rule": "throughput_tost", "cells": "all", "pair": "K:C0", "margin": 0.10}
-                          open-loop sweeps (below): holds if in every cell the host-bootstrap bounds of the peak
-                          sustainable rate ratio lie inside (1 - margin, 1 + margin)
+                          open-loop sweeps (below): holds if in every cell the bounds of the peak sustainable rate
+                          ratio lie inside (1 - margin, 1 + margin); the bounds are the wider of the host bootstrap's
+                          and the host-level t interval's (lower = the smaller lower, upper = the larger upper)
   {"name": "H6", "rule": "kendall", "sim": {cell: {arm: predicted p95 ratio}} or a JSON path, "reference": "C0",
    "threshold": 0.6}      per cell, Kendall tau-b between the simulator's ratios and the engine's p95 ratios to the
                           reference, engine arms whose host-level bounds overlap counted as ties (the reference is
                           1 with no width); holds if the mean over cells reaches the threshold (an undefined tau,
                           one side all ties, counts as 0)
 and "holm": [["H4a", "H4b"], ...] adjusts one-sided p-values (H0: ratio >= threshold; an IUT's p-value is the
-largest of its parts) within each group by Holm at alpha. Spec keys "best" ({cell: arm}) and "alpha" are optional.
+largest of its parts) within each group by Holm at alpha. Spec keys "best" ({cell: arm}), "alpha" and "live_arms"
+are optional.
 
 Live scoring validity: a run whose hinted turns fell back to the precomputed curve (no side-file row, a failed or
-late scoring call) on more than 1% of turns is invalid (plan section 1): it is left out of the common set and
-every pair, and listed under invalid_runs.
+late scoring call) on more than 1% of turns is invalid (plan section 1). A run of an arm listed in the spec's
+"live_arms" (the arms that must score live, K) with no live-check rows at all is invalid too: its replay ran without
+--side-file, so nothing shows the live curves were used. Invalid runs are left out of the common set and every pair,
+and listed under invalid_runs with the reason.
+
+Censored percentiles: a run whose statistic is +inf (enough failed or censored turns to reach that quantile) has no
+finite ratio. When the comparator (Y) is the censored one the ratio is nan, not 0, and the pair is reported as
+"comparator censored at p95" with its hosts (and "arm censored at p95" when X is), instead of "no interval".
 
 Open-loop sweeps (H5 throughput half): runs named CELL__ARM__HOST__rate<R>.jsonl. Per (cell, arm, host): every
 request's TTFT; a rate is sustainable when the served p95 is under the cell's SLO (spec "slo": {cell: seconds})
@@ -364,23 +372,29 @@ def resolve(arm, cell, best):
     return arm
 
 
-def drop_invalid(runs):
-    """Runs whose live scoring fell back on more than 1% of turns are invalid (plan section 1): they leave the
-    analysis (common set and pairs) and are listed; the protocol reruns the host's block."""
+def drop_invalid(runs, live_arms=()):
+    """Runs whose live scoring fell back on more than 1% of turns are invalid (plan section 1), and so are runs of a
+    live arm (live_arms) with no live-check rows: they leave the analysis (common set and pairs) and are listed with
+    the reason; the protocol reruns the host's block."""
     kept, invalid = {}, {}
     for cell, hosts in runs.items():
         for host, arms in hosts.items():
             for arm, run in arms.items():
                 lc = live_check(run["curves"]) if run["curves"] else None
                 if lc is not None and not lc["valid"]:
-                    invalid[f"{cell}__{arm}__{host}"] = lc
+                    invalid[f"{cell}__{arm}__{host}"] = dict(lc, reason=f"live scoring fell back on "
+                                                             f"{lc['flagged_frac']:.1%} of hinted turns (over "
+                                                             f"{LIVE_FLAG_MAX:.0%})")
+                elif lc is None and arm in live_arms:
+                    invalid[f"{cell}__{arm}__{host}"] = dict(hinted=0, valid=False, reason="live arm with no live-check "
+                                                             "rows (replay ran without --side-file)")
                 else:
                     kept.setdefault(cell, {}).setdefault(host, {})[arm] = run
     return kept, invalid
 
 
-def analyze(runs, pairs, best, alpha, boot, seed):
-    runs, invalid = drop_invalid(runs)
+def analyze(runs, pairs, best, alpha, boot, seed, live_arms=()):
+    runs, invalid = drop_invalid(runs, live_arms)
     out = dict(runs={}, pairs={}, invalid_runs=invalid)
     per = {}                       # (cell, host, arm) -> metrics
     common = {}
@@ -404,12 +418,22 @@ def analyze(runs, pairs, best, alpha, boot, seed):
                 continue
             res = dict(x=X, y=Y, hosts=hs)
             for met in RATIO_METRICS:
-                r = [per[(cell, h, X)][met] / per[(cell, h, Y)][met] if per[(cell, h, Y)][met] else float("nan")
-                     for h in hs]
+                r, cens = [], dict(arm=[], comparator=[])
+                for h in hs:
+                    xv, yv = per[(cell, h, X)][met], per[(cell, h, Y)][met]
+                    if yv == INF:                         # comparator censored: no finite ratio (x / inf is not 0)
+                        cens["comparator"].append(h)
+                        if xv == INF:
+                            cens["arm"].append(h)
+                        r.append(float("nan"))
+                        continue
+                    if xv == INF:
+                        cens["arm"].append(h)
+                    r.append(xv / yv if yv else float("nan"))
                 with np.errstate(divide="ignore", invalid="ignore"):
                     logs = np.log(np.array(r, float))
                 res[met] = dict(per_host=dict(zip(hs, r)), t=t_bounds(logs, alpha),
-                                two_sided_contains_1=None)
+                                two_sided_contains_1=None, censored=cens)
                 tb = res[met]["t"]
                 if tb:
                     tb["p_below_1"] = p_below(tb, 1.0)
@@ -512,8 +536,14 @@ def run_tests(spec, res, alpha):
             cells = sorted(tp) if t.get("cells", "all") == "all" else t["cells"]
             parts = []
             for c in cells:
-                b = (tp.get(c, {}).get(t["pair"]) or {}).get("bootstrap")
-                parts.append(dict(cell=c, lower=b and b["lower"], upper=b and b["upper"], gm=b and b["gm"]))
+                pr = tp.get(c, {}).get(t["pair"]) or {}
+                b, tb = pr.get("bootstrap"), pr.get("t")
+                have = [x for x in (b, tb) if x]
+                # the wider of the two: the host bootstrap is narrow with few hosts, the t interval is the decision
+                # interval of every other rule; TOST must hold under both
+                parts.append(dict(cell=c, lower=min((x["lower"] for x in have), default=None),
+                                  upper=max((x["upper"] for x in have), default=None), gm=pr.get("gm"),
+                                  boot=b and [b["lower"], b["upper"]], t=tb and [tb["lower"], tb["upper"]]))
             tests[t["name"]] = dict(rule="throughput_tost", pair=t["pair"], margin=t["margin"], parts=parts,
                                     holds=bool(parts) and all(tost(x["lower"], x["upper"], t["margin"]) for x in parts))
     for group in spec.get("holm", []):
@@ -685,6 +715,8 @@ def main(argv=None):
     ap.add_argument("--boot", type=int, default=10000)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--order", help="JSON {host: [\"cell/arm\", ...]} in run order: adds the position sensitivity")
+    ap.add_argument("--live-arm", action="append", default=[], help="an arm that must score live (adds to the spec's "
+                    "live_arms): a run of it with no live-check rows is invalid")
     ap.add_argument("--out")
     a = ap.parse_args(argv)
     spec = json.load(open(a.spec)) if a.spec else {}
@@ -699,25 +731,29 @@ def main(argv=None):
             pairs += [f"{arm}:{t.get('reference', 'C0')}" for c in sim for arm in sim[c] if arm != t.get("reference", "C0")]
     pairs = list(dict.fromkeys(a.pair + pairs))
     tp_pairs = list(dict.fromkeys(t["pair"] for t in tests if t["rule"] == "throughput_tost"))
+    live_arms = list(dict.fromkeys(spec.get("live_arms", []) + a.live_arm))
     runs, skipped = load_dir(a.d)
     if skipped:
         print("ignored (not CELL__ARM__HOST.jsonl):", ", ".join(skipped), file=sys.stderr)
-    res = analyze(runs, pairs, best, alpha, a.boot, a.seed)
-    res.update(alpha=alpha, best=best, ignored=skipped)
+    res = analyze(runs, pairs, best, alpha, a.boot, a.seed, live_arms)
+    res.update(alpha=alpha, best=best, ignored=skipped, live_arms=live_arms)
     sweeps = load_sweeps(a.d)
     if sweeps:
         res["throughput"] = throughput(sweeps, tp_pairs, spec.get("slo", {}), alpha, a.boot, a.seed)
     if a.order:
         res["order_sensitivity"] = order_sensitivity(res, json.load(open(a.order)), alpha)
-    for name in res["invalid_runs"]:
-        print(f"INVALID (live scoring fell back on over {LIVE_FLAG_MAX:.0%} of turns): {name}", file=sys.stderr)
+    for name, why in res["invalid_runs"].items():
+        print(f"INVALID ({why['reason']}): {name}", file=sys.stderr)
     if spec.get("tests"):
         res["tests"] = run_tests(spec, res, alpha)
     for cell, ps in sorted(res["pairs"].items()):
         for name, r in ps.items():
             t = r["p95"]["t"]
             hosts = " ".join(f"{h}={v:.3f}" for h, v in r["p95"]["per_host"].items())
-            iv = f"gm {t['gm']:.3f} [{t['lower']:.3f}, {t['upper']:.3f}]" if t else "no interval"
+            cens = r["p95"]["censored"]
+            why = [f"{who} censored at p95 on {','.join(cens[k])}" for who, k in (("comparator", "comparator"),
+                                                                                    ("arm", "arm")) if cens[k]]
+            iv = f"gm {t['gm']:.3f} [{t['lower']:.3f}, {t['upper']:.3f}]" if t else "; ".join(why) or "no interval"
             bs = r["p95"].get("crossed_bootstrap")
             bss = f" | boot [{bs['lower']:.3f}, {bs['upper']:.3f}]" if bs and bs.get("finite") else ""
             print(f"{cell} {name} ({r['x']}:{r['y']}) p95 {iv}{bss} | {hosts}")
