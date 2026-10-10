@@ -3,7 +3,9 @@
 server (native /generate, --engine sglang).
 
 Each session sends its turns in order. Turn i's prompt is the full token history: earlier prompts,
-the model's own outputs (returned token ids), and the new tokens of this turn. The next turn is sent
+the model's own outputs (returned token ids), and the new tokens of this turn. A turn with `keep` set first cuts
+the history to its first `keep` tokens (0 when the oldest history is truncated under a context cap, the prefix
+length when a client compacts or edits its context), so only that prefix stays reusable. The next turn is sent
 `gap_after` seconds after this turn finishes, so waits caused by the server delay the session the
 way they would a real agent. Output length is fixed per turn (ignore_eos). The move/stay hint for
 the idle period after a turn rides on that turn's request as vllm_xargs.park_hint.
@@ -197,6 +199,8 @@ async def run_session(http, s):
     for i, t in enumerate(s["turns"]):
         if past_window():
             return truncate(s, i)
+        if t.get("keep") is not None:  # the context was cut: keep only this many leading history tokens
+            history = history[: t["keep"]]
         history = history + toks(rng, t["new_tokens"])
         hint = "none" if a.hint == "none" else t[f"hint_{a.hint}"]
         try:
