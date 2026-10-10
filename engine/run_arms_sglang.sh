@@ -16,6 +16,11 @@
 #      TREE_CORE (default python for every arm: the park backend needs the Python TreeCore, so the
 #      baselines use it too), SERVE_ARGS (extra sglang serve args), PORT (default 30000),
 #      PARK_PORT (default 8765), HARD_CAP (replay --hard-cap seconds; unset: no cap).
+#      Phase R (engine/phase_r/orchestrate.py): SERVER_WRAP (a command prefix for the server, e.g.
+#      "phase_r/cg_exec.sh CGROUP"), ARM_HOOK (called as "ARM_HOOK EVENT ARM OUTDIR" with replay_start once the server
+#      is healthy and replay_end after the replay), PARK_HINTS (the curve arm K posts, default v6), WRITE_POLICY
+#      (--hicache-write-policy, default write_through; write_through_selective for HC-sel). Every arm needs the
+#      HiCacheFile fadvise patch (phase_r/sglang/apply_patch.sh); the orchestrator checks it before each arm.
 # The plugin loads only in arm K (SGLANG_PLUGINS=park; other arms SGLANG_PLUGINS=none).
 # The server runs in its own session (setsid); cleanup kills only that process group.
 set -u
@@ -37,22 +42,24 @@ for arm in "$@"; do
     T) storage="--hicache-storage-backend file" ;;
     K) storage="--hicache-storage-backend file"; plugins=park
        park="--radix-cache-backend park --radix-eviction-policy park --radix-eviction-policy-config {\"port\":$PARK_PORT}"
-       client="--park-hints v6 --park-port $PARK_PORT" ;;
+       client="--park-hints ${PARK_HINTS:-v6} --park-port $PARK_PORT" ;;
     *) echo "unknown arm $arm"; continue ;;
   esac
   rm -rf $DISK; mkdir -p $DISK
   echo "=== arm $arm $(date -u +%H:%M:%S)"
-  SGLANG_PLUGINS=$plugins SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=$DISK setsid $VENV/bin/sglang serve \
+  SGLANG_PLUGINS=$plugins SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=$DISK setsid ${SERVER_WRAP:-} $VENV/bin/sglang serve \
     --model-path $MODEL --port $PORT --context-length 40960 --max-running-requests 64 \
     --page-size $PAGE --max-total-tokens $TOKENS --enable-metrics \
-    --enable-hierarchical-cache --hicache-ratio $RATIO --hicache-write-policy write_through \
+    --enable-hierarchical-cache --hicache-ratio $RATIO --hicache-write-policy ${WRITE_POLICY:-write_through} \
     $storage $park ${SERVE_ARGS:-} > $O/$arm.server.log 2>&1 &
   SP=$!
   for i in $(seq 1 180); do curl -sf localhost:$PORT/health >/dev/null && break; kill -0 $SP 2>/dev/null || break; sleep 5; done
   curl -sf localhost:$PORT/health >/dev/null || { echo "server failed"; tail -30 $O/$arm.server.log; kill -9 -- -$SP 2>/dev/null; wait $SP 2>/dev/null; continue; }
+  [ -n "${ARM_HOOK:-}" ] && $ARM_HOOK replay_start "$arm" "$O"
   timeout 5400 $VENV/bin/python $ENGINE_DIR/replay.py $W $O/$arm.jsonl --engine sglang --url http://127.0.0.1:$PORT \
     --model $MODEL $client $WIN > $O/$arm.client.log 2>&1
   rc=$?
+  [ -n "${ARM_HOOK:-}" ] && $ARM_HOOK replay_end "$arm" "$O"
   [ -n "$client" ] && curl -sf localhost:$PARK_PORT/live > $O/$arm.park_live.json
   echo "arm $arm rc=$rc $(grep -c ttft $O/$arm.jsonl) turns"
   kill $SP; sleep 10

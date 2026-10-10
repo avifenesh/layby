@@ -5,7 +5,9 @@
 # ends with PREP_DONE or PREP_FAILED. The workloads already carry their Layby-Dwell curves, so no scoring is needed here.
 # Env, all optional: LAYBY_ROOT (this repo; default the checkout this script lives in; keep it under $HOME or $DATA so
 # the container sees it at the same path), DATA (the VM's data mount, default /data), HF_HOME (model cache, default
-# $DATA/hf), OUT (default $DATA/out), VLLM_TAG, MODEL, REV.
+# $DATA/hf), OUT (default $DATA/out), VLLM_TAG, MODEL, REV, DOCKER_EXTRA (extra docker run arguments; Phase R needs
+# "--privileged --cgroupns=host" so the arm cgroups and io.max can be set from inside the container, plus a bind of the
+# disk tier mounts with bind-propagation=rshared, see engine/phase_r/orchestrate.py).
 set -u
 VLLM_TAG=${VLLM_TAG:-v0.31.0}
 MODEL=${MODEL:-zai-org/GLM-5.3-Flash}
@@ -18,7 +20,8 @@ mkdir -p $HF_HOME $OUT
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -2
 docker pull vllm/vllm-openai:$VLLM_TAG || { echo PREP_FAILED pull; exit 1; }
 docker rm -f park >/dev/null 2>&1
-docker run -d --name park --gpus all --ipc host --network host --shm-size 64g \
+# shellcheck disable=SC2086  # DOCKER_EXTRA is a list of arguments
+docker run -d --name park --gpus all --ipc host --network host --shm-size 64g ${DOCKER_EXTRA:-} \
   -e HF_HOME=$HF_HOME -e PYTHONHASHSEED=0 -v $DATA:$DATA -v $HOME:$HOME --entrypoint sleep \
   vllm/vllm-openai:$VLLM_TAG infinity || { echo PREP_FAILED run; exit 1; }
 docker exec park bash -lc "pip install -q aiohttp numpy && mkdir -p $HOME/venv/bin && ln -sf \$(command -v vllm) $HOME/venv/bin/vllm && ln -sf \$(command -v python3) $HOME/venv/bin/python && cp $LAYBY_ROOT/engine/workloads/mix150_real.json $HOME/replay.json" \
