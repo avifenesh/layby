@@ -163,10 +163,12 @@ for arm in "$@"; do
       --engine vllm --hint-url http://127.0.0.1:$PARK_PORT/hint --ckpt "$SIDECAR_CKPT" --calib "$SIDECAR_CALIB" \
       ${SIDECAR_DEVICE:+--device $SIDECAR_DEVICE} > $O/$arm.sidecar.log 2>&1 &
     SCP=$!
+    # shellcheck disable=SC2064  # the trap takes this arm's process groups now
     trap "kill -9 -- -$SP ${LMP:+-$LMP} -$SCP 2>/dev/null" EXIT INT TERM
     for _ in $(seq 1 ${SIDECAR_WAIT:-60}); do curl -sf localhost:$SCPORT/park/stats >/dev/null && break; kill -0 $SCP 2>/dev/null || break; sleep 5; done
     curl -sf localhost:$SCPORT/park/stats >/dev/null || { echo "server failed: sidecar did not start"; tail -30 $O/$arm.sidecar.log
       kill -9 -- -$SP ${LMP:+-$LMP} -$SCP 2>/dev/null; wait $SP 2>/dev/null
+      # shellcheck disable=SC2010  # the same /dev/shm cleanup as below
       comm -13 <(echo "$SHM0") <(ls /dev/shm | grep '^vllm_offload_' | sort) | sed 's|^|/dev/shm/|' | xargs -r rm -f; continue; }
     client="$client --side-file $SIDE_FILE --sidecar http://127.0.0.1:$SCPORT"
   fi

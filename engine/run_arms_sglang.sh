@@ -93,6 +93,7 @@ for arm in "$@"; do
   SP=$!
   for i in $(seq 1 ${BOOT_WAIT:-180}); do curl -sf localhost:$PORT/health >/dev/null && break; kill -0 $SP 2>/dev/null || break; sleep 5; done
   curl -sf localhost:$PORT/health >/dev/null || { echo "server failed"; tail -30 $O/$arm.server.log; kill -9 -- -$SP 2>/dev/null; wait $SP 2>/dev/null; continue; }
+  # shellcheck disable=SC2064  # the trap takes this arm's process groups now
   trap "kill -9 -- -$SP 2>/dev/null" EXIT INT TERM   # a killed runner takes its server group with it
   if [ ${arm%%.*} = K ] && [ "$LIVE" != off ]; then   # live scoring: the sidecar, in the arm's cgroup, on its GPU
     SCPORT=${SIDECAR_PORT:-$((PARK_PORT + 1))}
@@ -100,6 +101,7 @@ for arm in "$@"; do
       --upstream http://127.0.0.1:$PORT --listen $SCPORT --engine sglang --hint-url http://127.0.0.1:$PARK_PORT/hint \
       --ckpt "$SIDECAR_CKPT" --calib "$SIDECAR_CALIB" ${SIDECAR_DEVICE:+--device $SIDECAR_DEVICE} > $O/$arm.sidecar.log 2>&1 &
     SCP=$!
+    # shellcheck disable=SC2064  # the trap takes this arm's process groups now
     trap "kill -9 -- -$SP -$SCP 2>/dev/null" EXIT INT TERM
     for _ in $(seq 1 ${SIDECAR_WAIT:-60}); do curl -sf localhost:$SCPORT/park/stats >/dev/null && break; kill -0 $SCP 2>/dev/null || break; sleep 5; done
     curl -sf localhost:$SCPORT/park/stats >/dev/null || { echo "server failed: sidecar did not start"; tail -30 $O/$arm.sidecar.log
