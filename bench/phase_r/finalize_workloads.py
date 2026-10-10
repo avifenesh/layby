@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""After build_workloads.py: K_km and K_ewma curves, CT_ETA, KV capacities, per model of MODELS.json.
+
+For every workload NAME.json in DIR whose name starts with a model's name:
+  curves   layby.curves annotate (surv_km from --km, surv_ewma at --alpha); surv_v6 stays null (score_side_files.py
+           fills it on a GPU)
+  ct_eta   layby.continuum.memoryfulness of the workload's sessions (Continuum's eta; CT needs it per workload)
+  kv       the builder's accounting (manifest load): P = peak live KV bytes, unique KV bytes, the disk tier
+Capacities per model, from its measured workload's P (BENCH_PLAN section 5): GPU KV max(0.15 P, 1.1 x the longest
+request the model admits at its context cap, so the engine can start), CPU tier 0.4 P. Per workload: disk tier
+1.2 x unique KV. Where the model has a sliding window, the disk tier counts the sliding layers' KV of every token
+(unique_kv_bytes_all_window_blocks: what a tier that stores every computed block holds) until the compatibility check
+shows the engines store only the window; disk_bytes_turn_end_windows is the smaller figure (windows at turn ends).
+
+Writes NAME.json (annotated), NAME.manifest.json (curves, ct_eta, capacities, new bytes and sha256) and
+DIR/capacities.json, each through a hidden temporary name and a rename.
+
+Usage: finalize_workloads.py DIR --models models.json --km km_public_train.json [--alpha 0.8]
+"""
+import argparse
+import glob
+import hashlib
+import json
+import os
+
+from layby.continuum import memoryfulness
+from layby.curves import annotate
+
+ap = argparse.ArgumentParser()
+ap.add_argument("dir")
+ap.add_argument("--models", required=True)
+ap.add_argument("--km", required=True)
+ap.add_argument("--alpha", type=float, default=0.8)
+a = ap.parse_args()
+
+
+def put_json(path, obj, **kw):
+    d, b = os.path.split(path)
+    tmp = os.path.join(d, f".{b}.tmp")
+    with open(tmp, "w") as f:
+        json.dump(obj, f, **kw)
+    os.replace(tmp, path)
+
+
+def sha(p):
+    return hashlib.sha256(open(p, "rb").read()).hexdigest()
+
+
+KM = json.load(open(a.km))
+km_sha = sha(a.km)
+models = json.load(open(a.models))
+caps = dict(_note=(
+    "Phase R capacities (BENCH_PLAN section 5), bytes. P: the workload builder's peak live KV (largest summed KV "
+    "of started, unfinished sessions on the builder's service-time model: grow x context + recurrent state + "
+    "min(context, window) x window bytes), not a C0 replay. Per model, from its measured workload: GPU KV "
+    "max(0.15 P, 1.1 x longest_request_bytes at max_model_len), CPU tier 0.4 P. Per workload: disk_bytes = 1.2 x "
+    "unique KV (sliding layers counted for every token where the model has a window; disk_bytes_turn_end_windows "
+    "the smaller figure), ct_eta = layby.continuum.memoryfulness. KV constants from the Hugging Face config.json "
+    "(bench/phase_r/service_model.py); service times are ESTIMATES scaled from the Qwen3-8B fit, to be replaced by "
+    "the pilot's microbenchmarks."), models={}, workloads={})
+for M in models:
+    k = M["kv"]
+    names = sorted(os.path.basename(p)[: -len(".json")] for p in glob.glob(os.path.join(a.dir, f"{M['name']}.*.json"))
+                   if not p.endswith((".manifest.json",)))
+    mans = {n: json.load(open(os.path.join(a.dir, f"{n}.manifest.json"))) for n in names}
+    meas = mans[f"{M['name']}.measured"]["load"]
+    P = meas["peak_live_kv_bytes"]
+    floor = int(1.1 * k["longest_request_bytes"])
+    gpu = max(int(0.15 * P), floor)
+    mc = dict(measured_workload=f"{M['name']}.measured", hf=M["hf"], max_model_len=M["cap"], ctx_cap_source=M["cap_source"],
+              kv_dtype=k["dtype"], grow_bytes_per_token=k["grow_bytes_per_token"],
+              state_bytes_per_session=k["state_bytes_per_session"], window_tokens=k["window_tokens"],
+              window_bytes_per_token=k["window_bytes_per_token"], window_bytes_per_session_max=k["window_bytes_per_session_max"],
+              longest_request_bytes=k["longest_request_bytes"], P_bytes=P, P_grow_tokens=meas["peak_live_kv_tokens"],
+              gpu_kv_bytes_plan=int(0.15 * P), gpu_kv_floor_bytes=floor, gpu_kv_bytes=gpu, gpu_kv_floored=gpu == floor,
+              cpu_bytes=int(0.4 * P), service_model=dict(c0=M["c0"], tpot=M["tpot"], b_per_1k_prompt=M["b"],
+                                                          inflight=M["inflight"], status=M["service_assumption"]["status"]))
+    caps["models"][M["name"]] = mc
+    for n in names:
+        p = os.path.join(a.dir, f"{n}.json")
+        W = json.load(open(p))
+        r = annotate(W, KM, a.alpha)
+        eta = round(memoryfulness(W["sessions"]), 4)
+        L = mans[n]["load"]
+        ub = L["unique_kv_bytes_all_window_blocks"] if k["window_tokens"] else L["unique_kv_bytes"]
+        wc = dict(model=M["name"], sessions=L["sessions"], turns=L["turns"], peak_live_kv_bytes=L["peak_live_kv_bytes"],
+                  peak_live_kv_grow_tokens=L["peak_live_kv_tokens"], peak_over_model_P=round(L["peak_live_kv_bytes"] / P, 3),
+                  unique_kv_grow_tokens=L["unique_kv_tokens"], unique_kv_bytes=ub, disk_bytes=int(1.2 * ub),
+                  ct_eta=eta, est_mean_inflight=L["est_mean_inflight"])
+        if k["window_tokens"]:
+            wc.update(unique_kv_bytes_turn_end_windows=L["unique_kv_bytes"],
+                      disk_bytes_turn_end_windows=int(1.2 * L["unique_kv_bytes"]))
+        if k["state_bytes_per_session"]:
+            wc.update(state_snapshots=L["state_snapshots"])
+        caps["workloads"][n] = wc
+        put_json(p, W)
+        man = mans[n]
+        man["bytes"], man["sha256"] = os.path.getsize(p), sha(p)
+        man["curves"] = dict(surv_km=f"layby.curves annotate, bench/phase_r/km_public_train.json sha256 {km_sha}",
+                             surv_ewma=f"alpha {a.alpha} (chosen in the simulator on the tuning workloads, 2026-10-10)",
+                             turns_with_curves=r["turns"], ewma_from_own_waits=r["ewma_own"],
+                             surv_v6="null until scored from the side file (GPU)")
+        man["ct_eta"] = eta
+        man["capacities"] = dict(model=mc, workload=wc)
+        put_json(os.path.join(a.dir, f"{n}.manifest.json"), man, indent=1)
+        print(n, json.dumps(wc), flush=True)
+    print(M["name"], json.dumps({x: mc[x] for x in ("P_bytes", "gpu_kv_bytes", "gpu_kv_floored", "cpu_bytes")}), flush=True)
+put_json(os.path.join(a.dir, "capacities.json"), caps, indent=1)

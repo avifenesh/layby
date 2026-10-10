@@ -66,3 +66,26 @@ simulator C0 replay. Disk tier = 1.2 x unique KV (new plus output tokens, a keep
 
 The workload is prefill-bound in the simulator (19.9M unique tokens, mostly compaction restarts; C0 p50 167 s and
 69 s), so no placement moves it by more than 9%.
+
+## Workloads v2: Qwen3.8-27B and Gemma 4 31B (2026-10-11)
+
+The owner replaced Qwen3-8B and GLM 5.3 Flash with Qwen3.8-27B and Gemma 4 31B (FP8 weights, one RTX PRO 6000 per
+engine, Nebius). The v1 outputs are in `workloads/archive_v1/`. Same partitions, seen set (`used.parquet`, no input
+changed since it was built) and checks; context cap 131,072 (default until the compatibility check reports
+max-model-len), the same restart rule.
+
+Steps: `service_model.py` (constants, `models_phase_r.json`), `build_workloads.py --models`, `side_files.py`,
+`finalize_workloads.py` (surv_km, surv_ewma at alpha 0.8, CT_ETA, `capacities.json`), `km_train_waits.py` (re-check:
+0 sessions and 0 refs of the new workloads in the K_km fitting pool).
+
+KV per model (BF16 KV, from config.json; Qwen/Qwen3.8-27B-FP8@017b9c7, RedHatAI/gemma-4-31B-it-FP8-block@d724254):
+
+| model | growing KV per token | fixed per session |
+|---|---|---|
+| Qwen3.8-27B | 64 KiB (16 full-attention layers x 4 KV heads x 256) | 153,944,064 B recurrent state (48 Gated DeltaNet layers: fp32 SSM 48 x 128 x 128 + conv) |
+| Gemma 4 31B | 80 KiB (10 global layers x 4 KV heads x 512, K = V cached in both slots) | min(c, 1,024) x 800 KiB (50 sliding layers x 16 KV heads x 256), 800 MiB at most |
+
+Service time: ESTIMATES. The Qwen3-8B fit (C0 0.649, TPOT 0.0190, B 0.0266 per 1k prompt) scaled by prefill FLOPs per
+token (C0, B) and decode bytes per sequence step (TPOT) at the fit's mean prompt (23,015 tokens), no FP8 compute
+credit: Qwen3.8-27B x2.13 / x1.49, Gemma 4 31B x2.74 / x1.80. Heavy load = mean requests in flight 1.43, that of the
+v1 Qwen3-8B measured workload under its fit. Replace with the pilot's microbenchmarks.

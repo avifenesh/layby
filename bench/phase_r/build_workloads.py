@@ -13,25 +13,35 @@ Partition: a stable hash of (source, user) on sources with users and of (source,
 to tuning, pilot or measured (--split fractions). Within a partition sessions are taken in hash order, round robin
 over the sources (an even share per source).
 
-Per model (--model NAME,CAP,LIVE,C0,TPOT,B): turns follow build_replay_pop.py (output 384 tokens after a human
-wait, 128 otherwise; new tokens from the real context curve). When a turn would exceed the context CAP, the
-oldest history is truncated: the turn's prompt starts over (keep = 0) with the newest --retain x CAP tokens of the
-history plus the turn's new tokens, so prefix reuse resumes after the cut, as after a client-side compaction.
-The scored state keeps the real, unscaled context. Gaps are capped at --gap-cap (gap_uncapped keeps the real one).
+Per model (--models MODELS.json, service_model.py: name, cap, c0, tpot, b, inflight or live, kv): turns follow
+build_replay_pop.py (output 384 tokens after a human wait, 128 otherwise; new tokens from the real context curve). When
+a turn would exceed the context CAP, the oldest history is truncated: the turn's prompt starts over (keep = 0) with the
+newest --retain x CAP tokens of the history plus the turn's new tokens, so prefix reuse resumes after the cut, as
+after a client-side compaction. The scored state keeps the real, unscaled context. Gaps are capped at --gap-cap
+(gap_uncapped keeps the real one).
 
 Sizing: a turn's end-to-end time at the heavy load is estimated as C0 + TPOT x out_len + B x prompt/1000 seconds
-(least squares on the C0 arms of the 2026-10 heavy rounds); a session lasts the sum of its turn times and capped
-gaps. A session longer than --duration is cut at its last turn that ends within it. Sessions are added until the
-summed session time reaches LIVE x duration (LIVE: the mean number of live sessions measured in those rounds), and
-each starts uniformly in [0, duration - its length], so the run to completion is estimated at --duration seconds.
-Tuning also gets the shorter stages of section 8 (--stages, nested prefixes of the tuning order).
+(service_model.py: a fit on measured C0 arms, or scaled from one); a session lasts the sum of its turn times and
+capped gaps. A session longer than --duration is cut at its last turn that ends within it. Sessions are added until
+the summed turn times reach INFLIGHT x duration (the mean number of requests in flight; with "live" instead, until
+the summed session time reaches LIVE x duration, LIVE the mean number of live sessions), and each starts uniformly
+in [0, duration - its length], so the run to completion is estimated at --duration seconds. Tuning also gets the
+shorter stages of section 8 (--stages, nested prefixes of the tuning order).
+
+KV (kv in the model spec): a session at context c holds grow x c + state + min(c, window) x window_bytes bytes (the
+growing full-attention KV, a fixed recurrent state, a sliding window). Peak live KV (P) is the largest sum over
+started, unfinished sessions at their current context on the sizing model. Unique KV, what a disk tier that never
+evicts ends up holding: grow x (new + output tokens of every turn, a keep cut counted as new) + one recurrent state
+per turn end (each turn end is a different prefix state) + the window tokens new at each turn end
+(min(new + output, window), the window's blocks at turn ends without duplicates); unique_kv_bytes_all_window_blocks
+is the bound if an engine stores the sliding layers' blocks for every token.
 
 Outputs in OUT: NAME.json (engine/replay.py format, content-free, surv_v6 null until the frozen model scores the
 side file), NAME.refs.parquet (key, session, turn, src, source_session, feat_ref: which source boundary each turn
 is; the side-file builder joins text to it), NAME.manifest.json, and pool.json (counts and checks).
 
 Usage: build_workloads.py OUT --feat feat5.parquet --used used.parquet --cc cc_requests.parquet \
-       --model qwen3_8b,32768,8.5,0.649,0.0190,0.0266 --model glm53_flash,262144,63,18.6,0.443,1.185
+       --models models.json [--extra qwen38_27b:light:0.5 --extra qwen38_27b:sweep_2x:2p ...]
 """
 import argparse
 import hashlib
@@ -74,7 +84,7 @@ ap.add_argument("out")
 ap.add_argument("--feat", required=True)
 ap.add_argument("--used", required=True)
 ap.add_argument("--cc")
-ap.add_argument("--model", action="append", required=True)
+ap.add_argument("--models", required=True, help="service_model.py output (a JSON list of model specs)")
 ap.add_argument("--duration", type=float, default=2700.0)
 ap.add_argument("--stages", type=float, nargs="*", default=[1200.0, 2400.0])
 ap.add_argument("--split", type=float, nargs=2, default=[0.25, 0.15], help="tuning and pilot fractions")
@@ -85,7 +95,7 @@ ap.add_argument("--min-turns-chat", type=int, default=4)
 ap.add_argument("--seed", type=int, default=0)
 ap.add_argument("--extra", action="append", default=[],
                 help="MODEL:NAME:LIVE_FACTOR: another workload from the measured partition at LIVE_FACTOR x the "
-                     "model's live sessions (LIVE_FACTORp: until peak live KV reaches that multiple of the measured "
+                     "model's load (LIVE_FACTORp: until peak live KV bytes reach that multiple of the measured "
                      "workload's), disjoint from the measured workload and every earlier extra of that "
                      "model (they run as separate arms on one host), e.g. qwen3_8b:light:0.5")
 ap.add_argument("--used-report", help="used_sessions.py report (per use: refs, sessions) to copy into the manifests")
@@ -181,8 +191,19 @@ def interleave(lists):
 
 # ---------------------------------------------------------------- turns per model
 def spec(m):
-    n, cap, live, c0, tpot, b = m.split(",")
-    return dict(name=n, cap=int(cap), live=float(live), c0=float(c0), tpot=float(tpot), b=float(b))
+    M = dict(m)
+    M["cap"] = int(M["cap"])
+    assert ("inflight" in M) != ("live" in M), f"{M['name']}: give inflight or live"
+    M.setdefault("kv", None)
+    return M
+
+
+def kv_bytes(M, c):
+    """Bytes a session at context c holds (0 without kv constants: the token count is the measure)."""
+    k = M["kv"]
+    if not k:
+        return 0.0
+    return k["grow_bytes_per_token"] * c + k["state_bytes_per_session"] + k["window_bytes_per_token"] * min(c, k["window_tokens"])
 
 
 def est(M, prompt, out_len):
@@ -261,7 +282,8 @@ def cut(M, T, limit):
 
 def assemble(M, name, items, duration, build_turns, src_of, live=1.0, skip=frozenset(), peak=None):
     rng = np.random.default_rng(abs(hash_int(name)) % 2**32)
-    sessions, refs, target, total = [], [], M["live"] * live * duration, 0.0
+    by_turns = "inflight" in M
+    sessions, refs, target, total = [], [], M["inflight" if by_turns else "live"] * live * duration, 0.0
     for k, (src, sess, unit, g) in enumerate(items):
         if (src, sess) in skip:
             continue
@@ -278,13 +300,28 @@ def assemble(M, name, items, duration, build_turns, src_of, live=1.0, skip=froze
             turns.append({x: v for x, v in t.items() if not x.startswith("_")} | {"surv_v6": None})
         sessions.append(dict(id=sid, pool=src, seed=1000 + len(sessions), start=start, turns=turns,
                              _src_session=sess, _unit=unit, _len=L, _cut=was_cut, _turns_src=len(full), _why=why))
-        total += L
+        total += sum(t["_e2e"] for t in T) if by_turns else L
         if peak is not None:
-            if load(sessions, M, duration)["peak_live_kv_tokens"] >= peak:
+            if load(sessions, M, duration)["peak_live_kv_bytes" if M["kv"] else "peak_live_kv_tokens"] >= peak:
                 break
         elif total >= target:
             break
     return sessions, refs, total
+
+
+def put(path, write):
+    """Write through a temporary name and rename, so a reader never sees a partial file."""
+    d, b = os.path.split(path)
+    tmp = os.path.join(d, f".{b}.tmp")          # hidden: no NAME.* glob matches it
+    write(tmp)
+    os.replace(tmp, path)
+
+
+def put_json(path, obj, **kw):
+    def w(t):
+        with open(t, "w") as f:
+            json.dump(obj, f, **kw)
+    put(path, w)
 
 
 def hash_int(s):
@@ -292,15 +329,19 @@ def hash_int(s):
 
 
 def load(sessions, M, duration):
-    ev = []
+    ev, evb, busy = [], [], 0.0
     for s in sessions:
-        tm, cur = s["start"], 0
+        tm, cur, curb = s["start"], 0, 0.0
         for t in s["turns"]:
-            ev.append((tm, t["ctx"] - cur)); cur = t["ctx"]
-            tm += est(M, t["ctx"] - t["out_len"], t["out_len"]) + (t["gap_after"] or 0.0)
-        ev.append((tm, -cur))
-    ev.sort()
+            e = est(M, t["ctx"] - t["out_len"], t["out_len"])
+            b = kv_bytes(M, t["ctx"])
+            ev.append((tm, t["ctx"] - cur)); evb.append((tm, b - curb)); cur, curb = t["ctx"], b
+            tm += e + (t["gap_after"] or 0.0)
+            busy += e
+        ev.append((tm, -cur)); evb.append((tm, -curb))
+    ev.sort(); evb.sort()
     peak = float(np.max(np.cumsum([d for _, d in ev])))
+    peak_b = float(np.max(np.cumsum([d for _, d in evb])))
     ends = [s["start"] + s["_len"] for s in sessions]
     mx = np.array([max(t["ctx"] for t in s["turns"]) for s in sessions])
     T = [t for s in sessions for t in s["turns"]]
@@ -317,9 +358,23 @@ def load(sessions, M, duration):
                 token_turns_M=round(sum(t["ctx"] for t in T) / 1e6, 1),
                 prompt_tokens_M=round(sum(t["ctx"] - t["out_len"] for t in T) / 1e6, 1),
                 gaps_capped=int(sum(t["gap_uncapped"] is not None and t["gap_uncapped"] > a.gap_cap for t in T)),
-                peak_live_kv_tokens=int(peak),
+                peak_live_kv_tokens=int(peak), **kv_load(M, sessions, T, peak_b),
                 est_makespan_s=round(max(ends), 0), est_mean_live_sessions=round(sum(s["_len"] for s in sessions) / duration, 2),
-                est_duration_target_s=duration)
+                est_mean_inflight=round(busy / duration, 3), est_duration_target_s=duration)
+
+
+def kv_load(M, sessions, T, peak_b):
+    """Unique and peak KV in tokens of the growing part and in bytes (the module docstring's accounting)."""
+    uniq = int(sum(t["new_tokens"] + t["out_len"] for t in T))
+    out = dict(unique_kv_tokens=uniq)
+    k = M["kv"]
+    if not k:
+        return out
+    win = int(sum(min(t["new_tokens"] + t["out_len"], k["window_tokens"]) for t in T)) if k["window_tokens"] else 0
+    ub = k["grow_bytes_per_token"] * uniq + k["state_bytes_per_session"] * len(T) + k["window_bytes_per_token"] * win
+    return dict(out, peak_live_kv_bytes=int(peak_b), unique_kv_bytes=int(ub), unique_window_tokens=win,
+                unique_kv_bytes_all_window_blocks=int(ub + k["window_bytes_per_token"] * (uniq - win)),
+                state_snapshots=len(T) if k["state_bytes_per_session"] else 0)
 
 
 def write(M, name, sessions, refs, extra):
@@ -327,22 +382,24 @@ def write(M, name, sessions, refs, extra):
              src=f"Layby Phase R {name}", curve="surv_v6 (null until scored from the side file)",
              sessions=[{k: v for k, v in s.items() if not k.startswith("_")} for s in sessions])
     p = os.path.join(a.out, f"{name}.json")
-    json.dump(W, open(p, "w"))
+    put_json(p, W)
     R = pd.DataFrame(refs, columns=["key", "session", "turn", "src", "source_session", "feat_ref"])
-    R.to_parquet(os.path.join(a.out, f"{name}.refs.parquet"), index=False)
+    put(os.path.join(a.out, f"{name}.refs.parquet"), lambda t: R.to_parquet(t, index=False))
     L = load(sessions, M, extra["duration"])
     man = dict(workload=f"{name}.json", model=M["name"], ctx_cap=M["cap"], partition=extra["partition"],
                bytes=os.path.getsize(p), sha256=hashlib.sha256(open(p, "rb").read()).hexdigest(),
-               load=L, service_model=dict(c0=M["c0"], tpot=M["tpot"], b_per_1k_prompt=M["b"], live=M["live"]),
+               load=L, service_model=dict(c0=M["c0"], tpot=M["tpot"], b_per_1k_prompt=M["b"],
+                                          **{k: M[k] for k in ("inflight", "live", "service_assumption") if k in M}),
+               kv=M["kv"], hf=M.get("hf"), ctx_cap_source=M.get("cap_source"),
                sessions=[dict(id=s["id"], source=s["pool"], source_session=s["_src_session"], turns=len(s["turns"]),
                               turns_in_source=s["_turns_src"], cut_at_duration=s["_cut"]) for s in sessions])
-    json.dump(man, open(os.path.join(a.out, f"{name}.manifest.json"), "w"), indent=1)
+    put_json(os.path.join(a.out, f"{name}.manifest.json"), man, indent=1)
     print(name, json.dumps(L), flush=True)
     return man
 
 
 # ---------------------------------------------------------------- build
-models = [spec(m) for m in a.model]
+models = [spec(m) for m in json.load(open(a.models))]
 built = {}
 for M in models:
     for p in PARTS:
@@ -360,7 +417,7 @@ for M in models:
                 nm = f"{M['name']}.{suffix}"
                 pk = None
                 if f.endswith("p"):     # a multiple of the measured workload's peak live KV
-                    pk = float(f[:-1]) * built[name]["load"]["peak_live_kv_tokens"]
+                    pk = float(f[:-1]) * built[name]["load"]["peak_live_kv_bytes" if M["kv"] else "peak_live_kv_tokens"]
                 S2, R2, _ = assemble(M, nm, items, a.duration, turns_feat, None, live=1.0 if pk else float(f),
                                      skip=frozenset(taken), peak=pk)
                 man = write(M, nm, S2, R2, dict(duration=a.duration, partition=p))
@@ -399,8 +456,8 @@ for x in PARTS:
     for y in PARTS:
         if x < y:
             chk[f"overlap_users:{x}:{y}"] = len(units[x] & units[y])
-json.dump(dict(counts=counts, partitions={p: {s: len(order[p][s]) for s in SRC} for p in PARTS}, checks=chk,
-               args=vars(a)), open(os.path.join(a.out, "pool.json"), "w"), indent=1)
+put_json(os.path.join(a.out, "pool.json"), dict(counts=counts, partitions={p: {s: len(order[p][s]) for s in SRC} for p in PARTS},
+                                                checks=chk, args=vars(a)), indent=1)
 print(json.dumps(chk))
 rep = json.load(open(a.used_report)) if a.used_report else None
 for name, man in built.items():
@@ -413,6 +470,6 @@ for name, man in built.items():
              "session; tuning, pilot and measured partitioned by user (or by session where there are no users)",
         sessions_in_seen_set=len(mine & used), cross_partition=chk, seen_set_sizes=counts, seen_set_uses=rep,
         cc_traces_ids_in_feature_table=counts.get("cc_traces", {}).get("ids_in_feature_table") if "cc_traces" in srcs else None)
-    json.dump(man, open(os.path.join(a.out, f"{name}.manifest.json"), "w"), indent=1)
+    put_json(os.path.join(a.out, f"{name}.manifest.json"), man, indent=1)
 assert chk["overlap_with_seen_sessions"] == 0 and not chk["private_sources_present"]
 assert all(v == 0 for k, v in chk.items() if k.startswith("overlap_"))

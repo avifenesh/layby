@@ -1,0 +1,112 @@
+[
+ {
+  "name": "qwen38_27b",
+  "hf": "Qwen/Qwen3.8-27B-FP8@017b9c7af6b5689d5dd426a76e0bc077eb5ca20a",
+  "config_sha256": "74227dd615bf1ea975aa676bdf355a0379858c12f394b5365cd9dfa5fc2c70bc",
+  "cap": 131072,
+  "cap_source": "default 131,072 (compat check not in yet)",
+  "kv": {
+   "dtype": "bf16",
+   "grow_bytes_per_token": 65536,
+   "state_bytes_per_session": 153944064,
+   "window_tokens": 0,
+   "window_bytes_per_token": 0,
+   "window_bytes_per_session_max": 0,
+   "longest_request_bytes": 8743878656,
+   "arch": {
+    "full_layers": 16,
+    "kv_heads": 4,
+    "head_dim": 256,
+    "gdn_layers": 48,
+    "ssm_state_bytes_per_layer": 3145728,
+    "conv_state_bytes_per_layer": 61440,
+    "ssm_dtype": "float32",
+    "max_position_embeddings": 262144
+   }
+  },
+  "c0": 1.3846,
+  "tpot": 0.02836,
+  "b": 0.05675,
+  "inflight": 1.4317,
+  "service_assumption": {
+   "status": "ESTIMATE: replace with the pilot's microbenchmarks (prefill tok/s, TPOT at the heavy batch)",
+   "ref_model": "Qwen3-8B BF16 (Qwen/Qwen3-8B config sha256 f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30)",
+   "ref_fit": {
+    "c0": 0.649,
+    "tpot": 0.019,
+    "b": 0.0266,
+    "source": "least squares on the C0 arms of the 2026-10 Qwen3-8B heavy rounds (nebius_q8 p1, p2, p4: 2,748 turns; BF16, vLLM, 1x RTX PRO 6000 Nebius); work/svc_fit2.py"
+   },
+   "c_ref_tokens": 23015,
+   "prefill_ratio": 2.1335,
+   "prefill_ratio_source": "FLOP ratio at C_REF (no measured run)",
+   "decode_ratio": 1.4925,
+   "ref_prefill_flops_per_token": 27466334208.0,
+   "prefill_flops_per_token": 58599276544.0,
+   "ref_decode_bytes_per_seq_step": 13965882950.986938,
+   "decode_bytes_per_seq_step": 20843931570.039536,
+   "linear_params_fp8": 24699207680.0,
+   "lm_head_params_bf16": 1271398400.0,
+   "fp8_compute_credit": false,
+   "implied_prefill_tok_s_at_c_ref": 2495.0,
+   "implied_prefill_tok_s_at_0": 2523.0,
+   "heavy_load": "mean requests in flight = 1.4317 (the Qwen3-8B heavy measured workload under its fit)"
+  }
+ },
+ {
+  "name": "gemma4_31b",
+  "hf": "RedHatAI/gemma-4-31B-it-FP8-block@d7242548c457ab4b45bd3adb8937f2659af4739d",
+  "config_sha256": "f83680dca1680f7dcc507bc801549a99f5b4346aa3fdf2a48b549b782a8ca999",
+  "cap": 131072,
+  "cap_source": "default 131,072 (compat check not in yet)",
+  "kv": {
+   "dtype": "bf16",
+   "grow_bytes_per_token": 81920,
+   "state_bytes_per_session": 0,
+   "window_tokens": 1024,
+   "window_bytes_per_token": 819200,
+   "window_bytes_per_session_max": 838860800,
+   "longest_request_bytes": 11576279040,
+   "arch": {
+    "global_layers": 10,
+    "global_kv_heads": 4,
+    "global_head_dim": 512,
+    "k_eq_v": true,
+    "k_eq_v_cached_as": "K and V slots (the K weights load into both; vLLM gemma4.py)",
+    "sliding_layers": 50,
+    "sliding_kv_heads": 16,
+    "sliding_head_dim": 256,
+    "sliding_window": 1024,
+    "max_position_embeddings": 262144
+   }
+  },
+  "c0": 1.7801,
+  "tpot": 0.03421,
+  "b": 0.07296,
+  "inflight": 1.4317,
+  "service_assumption": {
+   "status": "ESTIMATE: replace with the pilot's microbenchmarks (prefill tok/s, TPOT at the heavy batch)",
+   "ref_model": "Qwen3-8B BF16 (Qwen/Qwen3-8B config sha256 f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30)",
+   "ref_fit": {
+    "c0": 0.649,
+    "tpot": 0.019,
+    "b": 0.0266,
+    "source": "least squares on the C0 arms of the 2026-10 Qwen3-8B heavy rounds (nebius_q8 p1, p2, p4: 2,748 turns; BF16, vLLM, 1x RTX PRO 6000 Nebius); work/svc_fit2.py"
+   },
+   "c_ref_tokens": 23015,
+   "prefill_ratio": 2.7428,
+   "prefill_ratio_source": "FLOP ratio at C_REF (no measured run)",
+   "decode_ratio": 1.8007,
+   "ref_prefill_flops_per_token": 27466334208.0,
+   "prefill_flops_per_token": 75334287360.0,
+   "ref_decode_bytes_per_seq_step": 13965882950.986938,
+   "decode_bytes_per_seq_step": 25148849703.37361,
+   "linear_params_fp8": 29286727680.0,
+   "lm_head_params_bf16": 1409286144.0,
+   "fp8_compute_credit": false,
+   "implied_prefill_tok_s_at_c_ref": 1941.0,
+   "implied_prefill_tok_s_at_0": 2134.0,
+   "heavy_load": "mean requests in flight = 1.4317 (the Qwen3-8B heavy measured workload under its fit)"
+  }
+ }
+]

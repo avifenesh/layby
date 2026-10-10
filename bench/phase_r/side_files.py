@@ -13,8 +13,12 @@ get scorable false and no state. The side files hold public-source text: they st
 workload or the repository. Prints the share of public-source turns without a state (the plan fails a workload
 over 1%).
 
+Every output is written under a temporary name and renamed, so a copy taken while the builder runs never sees a
+partial side file. --only PREFIX ... limits the run to workloads whose name starts with a prefix. A cached state
+build in WORKDIR is reused only when it was built for the same boundaries.
+
 Usage: side_files.py DIR --feat feat5.parquet --content content5.parquet --tracelab tracelab5.bnd.jsonl \
-       --builder build_cls_v5.py [--python PY] [--work WORKDIR]
+       --builder build_cls_v5.py [--python PY] [--work WORKDIR] [--only PREFIX ...]
 """
 import argparse
 import glob
@@ -49,11 +53,13 @@ ap.add_argument("--tracelab", required=True)
 ap.add_argument("--builder", required=True)
 ap.add_argument("--python", default=sys.executable)
 ap.add_argument("--work")
+ap.add_argument("--only", nargs="*", help="workload name prefixes (default: every NAME.refs.parquet in DIR)")
 a = ap.parse_args()
 work = a.work or os.path.join(a.dir, "_states")
 os.makedirs(work, mode=0o700, exist_ok=True)
 
-files = sorted(glob.glob(os.path.join(a.dir, "*.refs.parquet")))
+files = sorted(f for f in glob.glob(os.path.join(a.dir, "*.refs.parquet"))
+               if not a.only or os.path.basename(f).startswith(tuple(a.only)))
 R = {f: pd.read_parquet(f) for f in files}
 pub = pd.concat([r[r.src != "cc_traces"] for r in R.values()])
 refs = pd.DataFrame({"feat_ref": sorted(set(pub.feat_ref))})
@@ -61,7 +67,11 @@ pairs = pub[["src", "source_session"]].drop_duplicates()
 print(f"{len(refs)} public boundaries from {len(pairs)} sessions", flush=True)
 
 out_dir = os.path.join(work, "cls")
-if not os.path.exists(os.path.join(out_dir, "replay.parquet")):
+rp = os.path.join(work, "refs.parquet")
+cached = os.path.exists(os.path.join(out_dir, "replay.parquet")) and os.path.exists(rp)
+if cached and set(pd.read_parquet(rp).feat_ref) != set(refs.feat_ref):
+    raise SystemExit(f"{work} holds states built for other boundaries: pass a new --work")
+if not cached:
     sess = sorted(set(pairs.source_session))
     ft = pq.read_table(a.feat, filters=[("session", "in", sess), ("src", "in", sorted(set(pairs.src)))])
     f = ft.to_pandas()
@@ -71,7 +81,6 @@ if not os.path.exists(os.path.join(out_dir, "replay.parquet")):
     ct = pq.read_table(a.content, filters=[("ref", "in", sorted(set(f.ref)))])
     cp = os.path.join(work, "content.parquet")
     ct.to_pandas().to_parquet(cp, index=False)
-    rp = os.path.join(work, "refs.parquet")
     refs.to_parquet(rp, index=False)
     for p in (fp, cp, rp):
         os.chmod(p, 0o600)
@@ -91,11 +100,16 @@ for f, r in R.items():
     d["state"] = m
     d["scorable"] = d.state.notna()
     p = os.path.join(a.dir, f"{name}.side.parquet")
-    d.to_parquet(p, index=False)
-    os.chmod(p, 0o600)
+    tmp = os.path.join(a.dir, f".{name}.side.parquet.tmp")      # hidden: no *.side.parquet glob matches it
+    d.to_parquet(tmp, index=False)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, p)
     pubm = d[d.src != "cc_traces"]
     summary[name] = dict(turns=len(d), public_turns=len(pubm), public_without_state=int((~pubm.scorable).sum()),
                          share_without_state=round(float((~pubm.scorable).mean()), 5) if len(pubm) else None,
                          unscorable_source_turns=int((d.src == "cc_traces").sum()))
     print(name, summary[name], flush=True)
-json.dump(summary, open(os.path.join(a.dir, "side_files.json"), "w"), indent=1)
+sp = os.path.join(a.dir, "side_files.json")
+with open(sp + ".tmp", "w") as fh:
+    json.dump(summary, fh, indent=1)
+os.replace(sp + ".tmp", sp)
