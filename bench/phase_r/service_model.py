@@ -14,6 +14,10 @@ KV accounting (bytes, BF16 KV cache: the FP8 checkpoints carry no kv_cache_schem
          Gemma 4's sliding-window layers: K and V of the newest `window` tokens (layers x KV heads x head dim x 2
          x 2 bytes per token), so a session holds min(context, window) x window_bytes.
 A session at context c holds grow x c + state + min(c, window) x window_bytes.
+  state_block_tokens (--state-block NAME=TOKENS:SOURCE)
+         the KV block size at which an engine may keep a recurrent state per block (vLLM's mamba "align" prefix
+         caching sets the attention block so its page equals the state's page); the builder's upper bound on unique
+         KV counts one state per block.
 
 Service time (seconds per turn at the heavy load, the form build_workloads.py sizes with): C0 + TPOT x out_len + B x
 prompt / 1000, least squares on the C0 arms of the 2026-10 Qwen3-8B heavy rounds (BF16, vLLM, one RTX PRO 6000 on
@@ -114,7 +118,9 @@ ap.add_argument("--config", action="append", required=True,
 ap.add_argument("--max-model-len", type=int, default=131072)
 ap.add_argument("--inflight-ref", type=float, required=True)
 ap.add_argument("--compat")
+ap.add_argument("--state-block", action="append", default=[], help="NAME=TOKENS:SOURCE")
 a = ap.parse_args()
+blocks = {x.split("=", 1)[0]: x.split("=", 1)[1].split(":", 1) for x in a.state_block}
 
 rc = json.load(open(a.ref_config))
 R = ref_arch(rc)
@@ -143,6 +149,8 @@ for spec in a.config:
         kv=dict(dtype="bf16", grow_bytes_per_token=A["grow"], state_bytes_per_session=A["state"],
                 window_tokens=A["window"], window_bytes_per_token=A["window_bytes"],
                 window_bytes_per_session_max=A["window_bytes"] * A["window"], longest_request_bytes=longest,
+                state_block_tokens=int(blocks[name][0]) if name in blocks else None,
+                state_block_source=blocks[name][1] if name in blocks else None,
                 arch=A["detail"]),
         c0=round(FIT["c0"] * rp, 4), tpot=round(FIT["tpot"] * rd, 5), b=round(FIT["b"] * rp, 5),
         inflight=a.inflight_ref,

@@ -89,3 +89,9 @@ Service time: ESTIMATES. The Qwen3-8B fit (C0 0.649, TPOT 0.0190, B 0.0266 per 1
 token (C0, B) and decode bytes per sequence step (TPOT) at the fit's mean prompt (23,015 tokens), no FP8 compute
 credit: Qwen3.8-27B x2.13 / x1.49, Gemma 4 31B x2.74 / x1.80. Heavy load = mean requests in flight 1.43, that of the
 v1 Qwen3-8B measured workload under its fit. Replace with the pilot's microbenchmarks.
+
+Disk tier (1.2 x unique KV) is sized at an upper bound until the pilot measures the bytes the engines write: Gemma's
+sliding layers counted for every token, and for Qwen3.8 one recurrent state per 784-token block (vLLM 0.31.0 sets the
+attention block to 784 tokens so its page equals the 3.21 MB per-layer mamba page; the compat boot log confirms the
+state size). `disk_bytes_turn_end` (one state and the window's new tokens per turn end) is the lower figure.
+GPU KV is floored at 1.1 x one 131,072-token request (Qwen 9.62 GB, Gemma 12.73 GB), above 0.15 P for both models.

@@ -13,6 +13,8 @@
    "window_bytes_per_token": 0,
    "window_bytes_per_session_max": 0,
    "longest_request_bytes": 8743878656,
+   "state_block_tokens": 784,
+   "state_block_source": "vLLM 0.31.0 boot log, compat check 2026-10-11 (attention block set to 784 tokens so its page equals the mamba page)",
    "arch": {
     "full_layers": 16,
     "kv_heads": 4,
@@ -67,6 +69,8 @@
    "window_bytes_per_token": 819200,
    "window_bytes_per_session_max": 838860800,
    "longest_request_bytes": 11576279040,
+   "state_block_tokens": null,
+   "state_block_source": null,
    "arch": {
     "global_layers": 10,
     "global_kv_heads": 4,

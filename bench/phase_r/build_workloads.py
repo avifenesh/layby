@@ -33,8 +33,9 @@ growing full-attention KV, a fixed recurrent state, a sliding window). Peak live
 started, unfinished sessions at their current context on the sizing model. Unique KV, what a disk tier that never
 evicts ends up holding: grow x (new + output tokens of every turn, a keep cut counted as new) + one recurrent state
 per turn end (each turn end is a different prefix state) + the window tokens new at each turn end
-(min(new + output, window), the window's blocks at turn ends without duplicates); unique_kv_bytes_all_window_blocks
-is the bound if an engine stores the sliding layers' blocks for every token.
+(min(new + output, window), the window's blocks at turn ends without duplicates). unique_kv_bytes_upper is the bound
+if an engine stores the sliding layers' KV for every token and a recurrent state at every KV block boundary
+(state_block_tokens, vLLM's mamba "align" prefix caching: ceil((new + output) / block) states per turn, at least one).
 
 Outputs in OUT: NAME.json (engine/replay.py format, content-free, surv_v6 null until the frozen model scores the
 side file), NAME.refs.parquet (key, session, turn, src, source_session, feat_ref: which source boundary each turn
@@ -372,9 +373,12 @@ def kv_load(M, sessions, T, peak_b):
         return out
     win = int(sum(min(t["new_tokens"] + t["out_len"], k["window_tokens"]) for t in T)) if k["window_tokens"] else 0
     ub = k["grow_bytes_per_token"] * uniq + k["state_bytes_per_session"] * len(T) + k["window_bytes_per_token"] * win
+    blk = k.get("state_block_tokens") or 0
+    nb = int(sum(max(1, -(-(t["new_tokens"] + t["out_len"]) // blk)) for t in T)) if blk else len(T)
+    up = k["grow_bytes_per_token"] * uniq + k["state_bytes_per_session"] * nb + k["window_bytes_per_token"] * uniq
+    st = bool(k["state_bytes_per_session"])
     return dict(out, peak_live_kv_bytes=int(peak_b), unique_kv_bytes=int(ub), unique_window_tokens=win,
-                unique_kv_bytes_all_window_blocks=int(ub + k["window_bytes_per_token"] * (uniq - win)),
-                state_snapshots=len(T) if k["state_bytes_per_session"] else 0)
+                unique_kv_bytes_upper=int(up), state_snapshots=len(T) if st else 0, state_blocks=nb if st else 0)
 
 
 def write(M, name, sessions, refs, extra):

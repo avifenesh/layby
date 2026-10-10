@@ -8,9 +8,9 @@ For every workload NAME.json in DIR whose name starts with a model's name:
   kv       the builder's accounting (manifest load): P = peak live KV bytes, unique KV bytes, the disk tier
 Capacities per model, from its measured workload's P (BENCH_PLAN section 5): GPU KV max(0.15 P, 1.1 x the longest
 request the model admits at its context cap, so the engine can start), CPU tier 0.4 P. Per workload: disk tier
-1.2 x unique KV. Where the model has a sliding window, the disk tier counts the sliding layers' KV of every token
-(unique_kv_bytes_all_window_blocks: what a tier that stores every computed block holds) until the compatibility check
-shows the engines store only the window; disk_bytes_turn_end_windows is the smaller figure (windows at turn ends).
+1.2 x unique KV, counted at the builder's upper bound (unique_kv_bytes_upper: the sliding layers' KV of every token, a
+recurrent state at every KV block boundary) until the engines' written bytes are measured, so no arm evicts from
+disk; disk_bytes_turn_end is the smaller figure (one state and the window's new tokens per turn end).
 
 Writes NAME.json (annotated), NAME.manifest.json (curves, ct_eta, capacities, new bytes and sha256) and
 DIR/capacities.json, each through a hidden temporary name and a rename.
@@ -54,8 +54,8 @@ caps = dict(_note=(
     "of started, unfinished sessions on the builder's service-time model: grow x context + recurrent state + "
     "min(context, window) x window bytes), not a C0 replay. Per model, from its measured workload: GPU KV "
     "max(0.15 P, 1.1 x longest_request_bytes at max_model_len), CPU tier 0.4 P. Per workload: disk_bytes = 1.2 x "
-    "unique KV (sliding layers counted for every token where the model has a window; disk_bytes_turn_end_windows "
-    "the smaller figure), ct_eta = layby.continuum.memoryfulness. KV constants from the Hugging Face config.json "
+    "unique KV at its upper bound (sliding layers' KV for every token; a recurrent state per KV block, vLLM's mamba "
+    "align mode), disk_bytes_turn_end the smaller figure (one state and the window's new tokens per turn end), ct_eta = layby.continuum.memoryfulness. KV constants from the Hugging Face config.json "
     "(bench/phase_r/service_model.py); service times are ESTIMATES scaled from the Qwen3-8B fit, to be replaced by "
     "the pilot's microbenchmarks."), models={}, workloads={})
 for M in models:
@@ -71,6 +71,7 @@ for M in models:
               kv_dtype=k["dtype"], grow_bytes_per_token=k["grow_bytes_per_token"],
               state_bytes_per_session=k["state_bytes_per_session"], window_tokens=k["window_tokens"],
               window_bytes_per_token=k["window_bytes_per_token"], window_bytes_per_session_max=k["window_bytes_per_session_max"],
+              state_block_tokens=k.get("state_block_tokens"), state_block_source=k.get("state_block_source"),
               longest_request_bytes=k["longest_request_bytes"], P_bytes=P, P_grow_tokens=meas["peak_live_kv_tokens"],
               gpu_kv_bytes_plan=int(0.15 * P), gpu_kv_floor_bytes=floor, gpu_kv_bytes=gpu, gpu_kv_floored=gpu == floor,
               cpu_bytes=int(0.4 * P), service_model=dict(c0=M["c0"], tpot=M["tpot"], b_per_1k_prompt=M["b"],
@@ -82,16 +83,14 @@ for M in models:
         r = annotate(W, KM, a.alpha)
         eta = round(memoryfulness(W["sessions"]), 4)
         L = mans[n]["load"]
-        ub = L["unique_kv_bytes_all_window_blocks"] if k["window_tokens"] else L["unique_kv_bytes"]
+        ub = L["unique_kv_bytes_upper"]
         wc = dict(model=M["name"], sessions=L["sessions"], turns=L["turns"], peak_live_kv_bytes=L["peak_live_kv_bytes"],
                   peak_live_kv_grow_tokens=L["peak_live_kv_tokens"], peak_over_model_P=round(L["peak_live_kv_bytes"] / P, 3),
                   unique_kv_grow_tokens=L["unique_kv_tokens"], unique_kv_bytes=ub, disk_bytes=int(1.2 * ub),
+                  unique_kv_bytes_turn_end=L["unique_kv_bytes"], disk_bytes_turn_end=int(1.2 * L["unique_kv_bytes"]),
                   ct_eta=eta, est_mean_inflight=L["est_mean_inflight"])
-        if k["window_tokens"]:
-            wc.update(unique_kv_bytes_turn_end_windows=L["unique_kv_bytes"],
-                      disk_bytes_turn_end_windows=int(1.2 * L["unique_kv_bytes"]))
         if k["state_bytes_per_session"]:
-            wc.update(state_snapshots=L["state_snapshots"])
+            wc.update(state_snapshots=L["state_snapshots"], state_blocks=L["state_blocks"])
         caps["workloads"][n] = wc
         put_json(p, W)
         man = mans[n]
