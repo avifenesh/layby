@@ -7,6 +7,10 @@ sees, and forward it, streaming or not, while collecting the response (text, rea
 usage). When the response ends: build the v6 server-view state, score it with Laya (batched, on a
 background task), and send {key, surv} to the engine adapter.
 
+Live scoring for replays (POST /park/score {"key", "state", "kind"}): a client that already holds the turn's
+server-view state (engine/replay.py --side-file) gets it scored by the same batched path, the curve sent to the
+engine adapter under its key, and {"key", "surv"} back once the adapter has it.
+
 Engines (--engine):
   vllm    park key in kv_transfer_params; hints to layby.vllm's hint port (POST /hint)
   sglang  park key in custom_params (SGLang's OpenAI API passes it to the scheduler as
@@ -78,14 +82,20 @@ class Sidecar:
             batch = [await self.queue.get()]
             while not self.queue.empty() and len(batch) < self.a.batch:
                 batch.append(self.queue.get_nowait())
-            keys, states, kinds = zip(*batch)
+            keys, states, kinds, futs = zip(*batch)
             try:
                 S = await asyncio.to_thread(self.scorer.score, list(states), list(kinds))
                 await self.adapter.send(self.http, list(zip(keys, S.tolist())))
                 self.stats["hints"] += len(batch)
+                for f, row in zip(futs, S.tolist()):
+                    if f is not None and not f.done():
+                        f.set_result(row)
             except Exception as e:  # noqa: BLE001  (a lost hint leaves the engine on its default order)
                 self.stats["hint_errors"] += len(batch)
                 log.warning("hint batch failed: %r", e)
+                for f in futs:
+                    if f is not None and not f.done():
+                        f.set_exception(e)
 
     @staticmethod
     def user_of(req, body):
@@ -159,7 +169,20 @@ class Sidecar:
     def boundary(self, sess, body, msg, usage, user, key):
         state, kind = self.tracker.on_response(sess, body, msg, usage, user)
         self.stats["boundaries"] += 1
-        self.queue.put_nowait((key, state, kind))
+        self.queue.put_nowait((key, state, kind, None))
+
+    async def score(self, req):
+        """Score a state the client built (a replay's side file) under the client's key; answer with the curve
+        after the adapter has it."""
+        d = await req.json()
+        self.stats["requests"] += 1
+        fut = asyncio.get_running_loop().create_future()
+        self.queue.put_nowait((str(d["key"]), d["state"], d.get("kind") or "human", fut))
+        try:
+            surv = await fut
+        except Exception as e:  # noqa: BLE001
+            return web.json_response({"key": d["key"], "error": repr(e)[:200]}, status=502)
+        return web.json_response({"key": d["key"], "surv": surv})
 
     async def passthrough(self, req):
         data = await req.read()
@@ -191,6 +214,7 @@ def main():
     app.on_cleanup.append(sc.stop)
     app.router.add_post("/v1/chat/completions", sc.chat)
     app.router.add_get("/park/stats", sc.park_stats)
+    app.router.add_post("/park/score", sc.score)
     app.router.add_route("*", "/{tail:.*}", sc.passthrough)
     web.run_app(app, host=a.host, port=a.listen)
 

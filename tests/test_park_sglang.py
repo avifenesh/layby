@@ -5,7 +5,7 @@
 Eviction order and placement on mock nodes; the plugin's registration and hook targets against the
 installed SGLang; a real ParkRadixCache on the Python TreeCore with a CPU allocator (no host tier:
 HiCache needs CUDA) for split, eviction events and the tick path; the hint port; the sidecar tag;
-replay.py against a mock SGLang server, with and without --window.
+replay.py against a mock SGLang server, with and without --hard-cap.
 """
 import json
 import os
@@ -341,28 +341,29 @@ def run_replay(tmp_path, port, hint_port, extra=()):
     return [json.loads(l) for l in open(out)], time.time() - t0
 
 
-def test_replay_sglang_and_window(tmp_path):
+def test_replay_sglang_and_hard_cap(tmp_path):
     port, hport, seen = free_port(), free_port(), []
     mock_sglang(port, hport, seen)
-    rows, wall = run_replay(tmp_path, port, hport, ["--window", "2"])
-    turns = [r for r in rows if "ttft" in r]
-    trunc = [r for r in rows if r.get("truncated_at_window")]
-    # s0: turn 0 and 1 sent; turn 1's 5 s gap would pass the 2 s window: stop at once at turn 2.
-    # s1 starts at 30 s, past the window: stopped before turn 0 without waiting for it.
+    rows, wall = run_replay(tmp_path, port, hport, ["--hard-cap", "2"])
+    turns = [r for r in rows if "ttft" in r and not r.get("censored")]
+    cens = [r for r in rows if "ttft" in r and r.get("censored")]
+    # s0: turn 0 and 1 served; the cap hits during turn 1's 5 s gap: turn 2 censored.
+    # s1 starts at 30 s, past the cap: all three turns censored, without waiting for its start.
     assert [(r["session"], r["turn"]) for r in turns] == [("s0", 0), ("s0", 1)]
-    assert sorted((r["session"], r["turn"]) for r in trunc) == [("s0", 2), ("s1", 0)]
-    assert wall < 10
+    assert sorted((r["session"], r["turn"]) for r in cens) == [("s0", 2), ("s1", 0), ("s1", 1), ("s1", 2)]
+    assert all(r["ttft"] == float("inf") for r in cens)
+    assert next(r["wall_s"] for r in rows if "wall_s" in r) < 5      # the cap, not s1's 30 s start (startup excluded)
     gens = [b for k, _, b in seen if k == "gen"]
     assert gens[0]["sampling_params"]["custom_params"] == {"park_key": "s0-0"}
     assert gens[0]["sampling_params"]["ignore_eos"] and gens[0]["sampling_params"]["max_new_tokens"] == 3
     # turn 1's prompt is turn 0's prompt, its output ids, and 8 new tokens
     assert gens[1]["input_ids"][:11] == gens[0]["input_ids"] + [7, 8, 9] and len(gens[1]["input_ids"]) == 19
     hints = sorted(b["key"] for k, _, b in seen if k == "hint")
-    assert hints == ["s0-0", "s0-1"]                  # the truncated session's last hint still goes out
+    assert hints == ["s0-0", "s0-1"]                  # the censored session's last served hint still goes out
     assert turns[0]["usage"]["prompt_tokens"] == 8 and turns[0]["out_tokens"] == 3
 
 
-def test_replay_sglang_without_window_runs_all_turns(tmp_path):
+def test_replay_sglang_without_cap_runs_all_turns(tmp_path):
     port, hport, seen = free_port(), free_port(), []
     mock_sglang(port, hport, seen)
     turns = [dict(new_tokens=8, out_len=2, kind="tool", gap_after=0.1, surv_v6=[0.5] * 15),
@@ -374,7 +375,7 @@ def test_replay_sglang_without_window_runs_all_turns(tmp_path):
                     "sglang", "--url", f"http://127.0.0.1:{port}"], check=True, timeout=60)
     rows = [json.loads(l) for l in open(out)]
     assert [r["turn"] for r in rows if "ttft" in r] == [0, 1]
-    assert not any(r.get("truncated_at_window") for r in rows)
+    assert not any(r.get("censored") or r.get("failed") for r in rows if "ttft" in r)
 
 
 def test_replay_vllm_path_unchanged(tmp_path):

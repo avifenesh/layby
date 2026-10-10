@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Engine workload from the 32k-scaled ReturnBench pools, as mix36_w0.json: N sessions drawn with sim.eval_pop.workload
-(an even share per pool, starts uniform over 600 s, numpy seed W), gaps capped at 300 s, user/tool/prog fields dropped.
+(an even share per pool, starts uniform over 600 s, numpy seed W), gaps capped at 300 s, user
+fields dropped, tool and program names (tool, prog) kept for Continuum's per-tool TTL.
 
 Usage: build_scaled_workload.py OUT.json N W POOL.json [POOL.json ...]
 """
@@ -18,8 +19,6 @@ for s in W["sessions"]:
     for t in s["turns"]:
         if t["gap_after"] is not None:
             t["gap_after"] = float(min(t["gap_after"], 300.0))
-        t.pop("tool", None)
-        t.pop("prog", None)
 W["src"] = f"ReturnBench mix ({'+'.join(os.path.basename(p).split('.')[0] for p in pools)}), n={n}, workload {w}, gap cap 300 s"
 json.dump(W, open(out, "w"))
 print(out, len(W["sessions"]), "sessions", sum(len(s["turns"]) for s in W["sessions"]), "turns")
