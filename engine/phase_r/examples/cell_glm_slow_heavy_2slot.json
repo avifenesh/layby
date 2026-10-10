@@ -1,0 +1,100 @@
+{
+ "_comment": "GLM 5.3 Flash on an 8x RTX PRO 6000 node: two TP4 engines, one per NUMA half, each with its own disk, cgroup and io.max; arms split across halves by order.assign_slots and run in lockstep rounds. PLACEHOLDER values.",
+ "cell": "large-glm-slow-heavy",
+ "plan": "BENCH_PLAN draft 4 (freeze commit to fill)",
+ "seed": 20261010,
+ "engine": "vllm",
+ "model": "zai-org/GLM-5.3-Flash",
+ "regime": "slow",
+ "load": "heavy",
+ "pilot": "pilot_qwen3_8b_vllm.json",
+ "workload": {
+  "path": "/data/phase_r/glm_measured.json",
+  "sessions": 150,
+  "turns": 7858
+ },
+ "capacities": {
+  "gpu_kv_bytes": "4G",
+  "cpu_bytes": "28G"
+ },
+ "cgroup": {
+  "rss_bytes": "24G"
+ },
+ "io_max": {
+  "rbps": "450M",
+  "wbps": "450M"
+ },
+ "runner": {
+  "mode": "docker",
+  "container": "park",
+  "layby_root": "/root/layby",
+  "venv": "/root/venv",
+  "env": {
+   "MAXLEN": "262144",
+   "BOOT_WAIT": "360",
+   "VOCAB": "150000",
+   "SERVE_ARGS": "--tensor-parallel-size 4 --enforce-eager --kv-cache-dtype fp8 --prefix-match-unit 256 --revision eb9eb208 --max-num-seqs 32",
+   "OFF_EXTRA": ",\"blocks_per_chunk\":1"
+  },
+  "timeout_s": 18000
+ },
+ "slots": [
+  {
+   "name": "A",
+   "cuda": "0,1,2,3",
+   "port": 8000,
+   "park_port": 28765,
+   "cpus": "2-95",
+   "mems": "0",
+   "disk": {
+    "mount": "/mnt/layby/A",
+    "wipe": "fstrim"
+   }
+  },
+  {
+   "name": "B",
+   "cuda": "4,5,6,7",
+   "port": 8001,
+   "park_port": 28766,
+   "cpus": "98-191",
+   "mems": "1",
+   "disk": {
+    "mount": "/mnt/layby/B",
+    "wipe": "fstrim"
+   }
+  }
+ ],
+ "arms": [
+  {
+   "label": "C0",
+   "code": "C0"
+  },
+  {
+   "label": "T",
+   "code": "T"
+  },
+  {
+   "label": "K",
+   "code": "K"
+  },
+  {
+   "label": "K_ewma",
+   "code": "K",
+   "env": {
+    "PARK_HINTS": "ewma"
+   }
+  }
+ ],
+ "dry_run": {
+  "probe": {
+   "seq_read_Bps": 1200000000.0,
+   "seq_write_Bps": 1000000000.0,
+   "rand_read_Bps": 800000000.0
+  },
+  "throttled_probe": {
+   "seq_read_Bps": 471859200,
+   "seq_write_Bps": 471859200,
+   "rand_read_Bps": 450000000.0
+  }
+ }
+}

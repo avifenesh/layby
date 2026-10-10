@@ -103,3 +103,37 @@ output (`engine/smoke_restore.py`).
 The Layby adapter serves `GET /live` (rates, measured link speeds, decision counts, disk tier counters), `GET /prof`
 and `GET /prof/windows` (a sampling profile of the engine's scheduler thread, whole run and per minute with the
 engine's load) on its hint port. `run_arms.sh` saves all three at the end of each Layby arm.
+
+## Phase R harness (engine/phase_r)
+
+The host-side harness for the Phase R evaluation (`paper/BENCH_PLAN.md`, sections 5 and 7). One call runs one block:
+every arm of one cell on one host in one repeat, in the seeded random order, through `run_arms.sh` or
+`run_arms_sglang.sh`. Run it as root on the GPU host; engines run on the host or in the `park` container.
+
+    # container for Phase R: cgroups and io.max are set from inside it, and the tier mounts reach it
+    DOCKER_EXTRA="--privileged --cgroupns=host --mount type=bind,source=/mnt/layby,target=/mnt/layby,bind-propagation=rshared" \
+      bash engine/node_prep.sh
+    python3 engine/phase_r/orchestrate.py preflight --cell CELL.json --host HOST --out OUT
+    python3 engine/phase_r/orchestrate.py run --cell CELL.json --host HOST --repeat N --out OUT
+    python3 engine/phase_r/orchestrate.py run --cell CELL.json --host HOST --repeat N --out OUT --aa C0   # A/A pair
+    python3 engine/phase_r/orchestrate.py run ... --dry-run    # print every command, execute none
+
+What it does per arm: a fresh cgroup v2 child (`memory.max` = pinned tiers + measured RSS + 256 MiB, swap 0, cpuset,
+`io.max` on the tier's disk), page cache dropped, the tier wiped (rm and fstrim, mkfs, or a fresh tmpfs for the RAM
+tier), a quick fio probe held to the host's first probe (10%), health checks (GPU clock-event reasons, free memory,
+workload counts, the SGLang patch), then telemetry during the arm (cgroup memory and PSI, io.stat, diskstats, tier
+page-cache residency, nvidia-smi clocks and reasons, iostat) and a verdict after it (OOM, memory PSI full over 1% of
+the replay window, hardware or thermal GPU event, engine crash, vLLM O_DIRECT fallback). An excluded arm reruns the
+whole block. Exit codes: 0 done, 2 attempts used up, 3 host fault (rerun on a new host with `--attempt A+1`),
+4 configuration or regime mismatch, 5 preflight failure.
+
+Inputs: a cell file (`engine/phase_r/examples/cell_*.json`, fields documented in its `_comment`) and the pilot JSON
+(`examples/pilot_qwen3_8b_vllm.json`: KV bytes per token, engine RSS, prefill tok/s and write-through's offered write
+rate per load). The regime is checked from measured numbers before any arm runs (`orchestrate.py regime` computes r and
+w by hand). SGLang arms need `engine/phase_r/sglang/hicache_fadvise.patch` (HiCacheFile drops its page-cache pages
+after each write and read); `apply_patch.sh PYTHON apply` installs it and the orchestrator checks it before every arm.
+
+Runner hooks the harness uses (unset, the runners behave as before): `SERVER_WRAP` (command prefix for the server),
+`ARM_HOOK` (replay_start and replay_end markers), `PARK_HINTS` (arm K's curve), `WRITE_POLICY` (SGLang).
+
+Tests (CPU only, no root): `python3 -m unittest discover -s engine/phase_r/tests -p 'test_*.py'`.

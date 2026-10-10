@@ -1,0 +1,26 @@
+{
+ "_comment": "SGLang 0.5.21 fast regime: the disk tier is a tmpfs of ram_tier_bytes (same size for every arm), charged to the engine's cgroup, so memory.max adds it. The 10% fio health probe runs on the NVMe volume (probe_dir). HC-sel is HiCache file L3 with write_through_selective. PLACEHOLDER values.",
+ "cell": "main-sglang-fast-heavy",
+ "plan": "BENCH_PLAN draft 4 (freeze commit to fill)",
+ "seed": 20261010,
+ "engine": "sglang",
+ "model": "Qwen/Qwen3-8B",
+ "regime": "fast",
+ "load": "heavy",
+ "pilot": "pilot_qwen3_8b_vllm.json",
+ "workload": {"path": "/root/phase_r/measured.json", "sessions": 150, "turns": 7858},
+ "capacities": {"gpu_kv_bytes": "16G", "cpu_bytes": "28G"},
+ "ram_tier_bytes": "64G",
+ "runner": {"mode": "host", "layby_root": "/root/layby", "venv": "/root/.venv-sglang", "timeout_s": 14400},
+ "cuda": "0", "port": 30000, "park_port": 28765, "cpus": "2-25", "mems": "0",
+ "disk": {"mount": "/mnt/layby/ram", "wipe": "ram", "probe_dir": "/mnt/layby/A"},
+ "arms": [
+  {"label": "C0", "code": "C0"},
+  {"label": "HC-wt", "code": "T"},
+  {"label": "HC-sel", "code": "T", "env": {"WRITE_POLICY": "write_through_selective"}},
+  {"label": "K", "code": "K"},
+  {"label": "K_ewma", "code": "K", "env": {"PARK_HINTS": "ewma"}}
+ ],
+ "dry_run": {"probe": {"seq_read_Bps": 3.6e9, "seq_write_Bps": 2.4e9, "rand_read_Bps": 2.0e9},
+             "ram_probe": {"seq_read_Bps": 2.0e10, "seq_write_Bps": 8.0e9, "rand_read_Bps": 1.0e10}}
+}
