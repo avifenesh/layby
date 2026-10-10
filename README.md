@@ -272,7 +272,8 @@ tests/          CPU tests (vLLM 0.30 and 0.31, SGLang 0.5.21)
 The paper is "Layby: placing idle LLM sessions' KV cache by when they come back" (2026; arXiv id to follow).
 `CITATION.cff` at the repository root carries the same entry for GitHub and Zenodo. The code is archived on
 Zenodo: [10.5281/zenodo.23285213](https://doi.org/10.5281/zenodo.23285213) (all versions; v1.0.0 is
-[10.5281/zenodo.23285214](https://doi.org/10.5281/zenodo.23285214)).
+[10.5281/zenodo.23285214](https://doi.org/10.5281/zenodo.23285214)). The Layby-Dwell model is
+[10.57967/hf/10852](https://doi.org/10.57967/hf/10852) on the Hugging Face Hub.
 
 ```
 @misc{fenesh2026layby,

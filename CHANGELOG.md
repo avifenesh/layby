@@ -6,7 +6,7 @@ was built from. The archive DOI is copied here, into `CITATION.cff` and into the
 ## 1.0.0 (2026-10-10)
 
 Archive: [10.5281/zenodo.23285214](https://doi.org/10.5281/zenodo.23285214) (all versions:
-[10.5281/zenodo.23285213](https://doi.org/10.5281/zenodo.23285213)).
+[10.5281/zenodo.23285213](https://doi.org/10.5281/zenodo.23285213)). Model weights: [10.57967/hf/10852](https://doi.org/10.57967/hf/10852).
 
 The release the paper describes:
 
