@@ -75,7 +75,8 @@ if not cached:
     sess = sorted(set(pairs.source_session))
     ft = pq.read_table(a.feat, filters=[("session", "in", sess), ("src", "in", sorted(set(pairs.src)))])
     f = ft.to_pandas()
-    f = f[[(s, x) in set(zip(pairs.src, pairs.source_session)) for s, x in zip(f.src, f.session)]]
+    want = set(zip(pairs.src, pairs.source_session))           # built once (per row it is quadratic)
+    f = f[[(s, x) in want for s, x in zip(f.src, f.session)]]
     fp = os.path.join(work, "feat.parquet")
     f.to_parquet(fp, index=False)
     ct = pq.read_table(a.content, filters=[("ref", "in", sorted(set(f.ref)))])
@@ -110,6 +111,8 @@ for f, r in R.items():
                          unscorable_source_turns=int((d.src == "cc_traces").sum()))
     print(name, summary[name], flush=True)
 sp = os.path.join(a.dir, "side_files.json")
+if os.path.exists(sp):                 # keep the entries of workloads this run did not rebuild
+    summary = {k: v for k, v in json.load(open(sp)).items() if k not in summary} | summary
 with open(sp + ".tmp", "w") as fh:
-    json.dump(summary, fh, indent=1)
+    json.dump(dict(sorted(summary.items())), fh, indent=1)
 os.replace(sp + ".tmp", sp)

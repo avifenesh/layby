@@ -4,7 +4,7 @@
   "hf": "Qwen/Qwen3.8-27B-FP8@017b9c7af6b5689d5dd426a76e0bc077eb5ca20a",
   "config_sha256": "74227dd615bf1ea975aa676bdf355a0379858c12f394b5365cd9dfa5fc2c70bc",
   "cap": 131072,
-  "cap_source": "default 131,072 (compat check not in yet)",
+  "cap_source": "compat check boot_maxlen",
   "kv": {
    "dtype": "bf16",
    "grow_bytes_per_token": 65536,
@@ -26,12 +26,15 @@
     "max_position_embeddings": 262144
    }
   },
-  "c0": 1.3846,
+  "c0": 1.2235,
   "tpot": 0.02836,
-  "b": 0.05675,
+  "b": 0.05015,
   "inflight": 1.4317,
   "service_assumption": {
-   "status": "ESTIMATE: replace with the pilot's microbenchmarks (prefill tok/s, TPOT at the heavy batch)",
+   "status": "measured: prefill (C0, B); ESTIMATE (replace with the pilot's microbenchmarks): TPOT",
+   "measured": [
+    "prefill (C0, B)"
+   ],
    "ref_model": "Qwen3-8B BF16 (Qwen/Qwen3-8B config sha256 f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30)",
    "ref_fit": {
     "c0": 0.649,
@@ -40,8 +43,8 @@
     "source": "least squares on the C0 arms of the 2026-10 Qwen3-8B heavy rounds (nebius_q8 p1, p2, p4: 2,748 turns; BF16, vLLM, 1x RTX PRO 6000 Nebius); work/svc_fit2.py"
    },
    "c_ref_tokens": 23015,
-   "prefill_ratio": 2.1335,
-   "prefill_ratio_source": "FLOP ratio at C_REF (no measured run)",
+   "prefill_ratio": 1.8852,
+   "prefill_ratio_source": "MEASURED: 16983 / b1 prefill 9009 tok/s at 23015 tokens (compat prefill.json sha256 f3fe02f674316b726bd59497a5ac960e9a482ab2450d7b452de1c84e314ab73f)",
    "decode_ratio": 1.4925,
    "ref_prefill_flops_per_token": 27466334208.0,
    "prefill_flops_per_token": 58599276544.0,
@@ -50,9 +53,9 @@
    "linear_params_fp8": 24699207680.0,
    "lm_head_params_bf16": 1271398400.0,
    "fp8_compute_credit": false,
-   "implied_prefill_tok_s_at_c_ref": 2495.0,
-   "implied_prefill_tok_s_at_0": 2523.0,
-   "heavy_load": "mean requests in flight = 1.4317 (the Qwen3-8B heavy measured workload under its fit)"
+   "ref_prefill_tok_s": 16983.0,
+   "prefill_tok_s_at_c_ref": 9009.0,
+   "flop_ratio": 2.1335
   }
  },
  {
@@ -89,7 +92,8 @@
   "b": 0.07296,
   "inflight": 1.4317,
   "service_assumption": {
-   "status": "ESTIMATE: replace with the pilot's microbenchmarks (prefill tok/s, TPOT at the heavy batch)",
+   "status": "ESTIMATE (replace with the pilot's microbenchmarks): TPOT, C0, B",
+   "measured": [],
    "ref_model": "Qwen3-8B BF16 (Qwen/Qwen3-8B config sha256 f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30)",
    "ref_fit": {
     "c0": 0.649,
@@ -99,7 +103,7 @@
    },
    "c_ref_tokens": 23015,
    "prefill_ratio": 2.7428,
-   "prefill_ratio_source": "FLOP ratio at C_REF (no measured run)",
+   "prefill_ratio_source": "ESTIMATE: FLOP ratio at C_REF (no measured run)",
    "decode_ratio": 1.8007,
    "ref_prefill_flops_per_token": 27466334208.0,
    "prefill_flops_per_token": 75334287360.0,
@@ -108,9 +112,9 @@
    "linear_params_fp8": 29286727680.0,
    "lm_head_params_bf16": 1409286144.0,
    "fp8_compute_credit": false,
-   "implied_prefill_tok_s_at_c_ref": 1941.0,
-   "implied_prefill_tok_s_at_0": 2134.0,
-   "heavy_load": "mean requests in flight = 1.4317 (the Qwen3-8B heavy measured workload under its fit)"
+   "ref_prefill_tok_s": 16983.0,
+   "prefill_tok_s_at_c_ref": 6192.0,
+   "flop_ratio": 2.7428
   }
  }
 ]

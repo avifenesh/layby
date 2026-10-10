@@ -30,26 +30,29 @@ one scaled by a cost ratio at the fit's mean prompt (C_REF tokens):
   TPOT   x  bytes a decode step reads per sequence: (linear weights + lm_head) / B_REF sequences in flight + the
             sequence's KV (+ the recurrent state, read and written; + the window).
 No credit is taken for FP8 tensor-core speed (FP8 weights count at 1 byte for decode reads only), so prefill is
-estimated slow, not fast. Heavy load is matched by engine utilization, not by live sessions: sessions are added
-until the estimated mean number of requests in flight (summed turn times / run length) equals that of the Qwen3-8B
-heavy measured workload under its own fit (INFLIGHT_REF, from the archived qwen3_8b.measured.json).
-REPLACE: these are estimates to be replaced by the pilot's microbenchmarks (prefill tok/s, TPOT at the heavy batch);
-when phase_r/compat/compat.json reports prefill tok/s for a model, --compat scales C0 and B by
-(Qwen3-8B prefill tok/s at C_REF) / (the model's measured prefill tok/s) instead of the FLOP ratio.
+estimated slow, not fast. INFLIGHT_REF (the v1 Qwen3-8B measured workload's mean requests in flight under its fit)
+is kept for the v1 sizing rule; v2 sizes by KV pressure (build_workloads.py --size-by-kv).
+Measured prefill: --prefill NAME=prefill.json (the compatibility check's microbenchmark, {"LEN": {"b1_tok_s"}},
+one request at a time) replaces the FLOP ratio of C0 and B by REF_PREFILL_TPS / (the model's b1 tok/s at C_REF,
+log-linear in the prompt length between the measured points). REF_PREFILL_TPS is Qwen3-8B's solo-like prefill rate
+on the same GPU type, from the fit's own C0 runs: p90 of uncached tokens / TTFT over turns with at least 8,192
+uncached tokens (16,859 / 16,983 / 17,131 tok/s in the three runs, about 22K tokens of context; the median taken).
+TPOT stays the bytes estimate until a decode microbenchmark exists. Each model records which parts are measured.
+--max-len NAME=FILE takes the max-model-len the compatibility check booted with (default --max-model-len).
 
 Usage: service_model.py OUT.json --ref-config qwen3_8b.config.json --config NAME=CONFIG.json:REPO@REV:F8_PARAMS:BF16_LM_HEAD
-       [--compat compat.json] [--max-model-len 131072] [--inflight-ref 1.4317]
+       [--prefill NAME=prefill.json] [--max-len NAME=boot_maxlen] [--max-model-len 131072] [--inflight-ref 1.4317]
 """
 import argparse
 import hashlib
 import json
+import math
 import os
 
 FIT = dict(c0=0.649, tpot=0.0190, b=0.0266, source="least squares on the C0 arms of the 2026-10 Qwen3-8B heavy rounds "
            "(nebius_q8 p1, p2, p4: 2,748 turns; BF16, vLLM, 1x RTX PRO 6000 Nebius); work/svc_fit2.py")
 C_REF = 23015        # mean prompt tokens of those turns
-REF_PREFILL_TPS0 = 9000.0   # sim.engine_sim.Params f0 = 1/9000 s per token at position 0 (Qwen3-8B reference engine)
-REF_ATT = 0.03              # its attention growth per 1000 tokens of position
+REF_PREFILL_TPS = 16983.0   # Qwen3-8B, the fit's C0 runs (docstring)
 
 
 def sha(p):
@@ -117,7 +120,8 @@ ap.add_argument("--config", action="append", required=True,
                      "from the Hub's safetensors metadata; the BF16 lm_head)")
 ap.add_argument("--max-model-len", type=int, default=131072)
 ap.add_argument("--inflight-ref", type=float, required=True)
-ap.add_argument("--compat")
+ap.add_argument("--prefill", action="append", default=[], help="NAME=prefill.json")
+ap.add_argument("--max-len", action="append", default=[], help="NAME=FILE holding the booted max-model-len")
 ap.add_argument("--state-block", action="append", default=[], help="NAME=TOKENS:SOURCE")
 a = ap.parse_args()
 blocks = {x.split("=", 1)[0]: x.split("=", 1)[1].split(":", 1) for x in a.state_block}
@@ -126,7 +130,21 @@ rc = json.load(open(a.ref_config))
 R = ref_arch(rc)
 ref_w = R["lin"] * 2 + R["head"]                     # BF16
 f_ref, d_ref = flops(R, C_REF), decode_bytes(R, C_REF, ref_w, a.inflight_ref)
-compat = json.load(open(a.compat)) if a.compat and os.path.exists(a.compat) else None
+prefill = {x.split("=", 1)[0]: x.split("=", 1)[1] for x in a.prefill}
+maxlen = {x.split("=", 1)[0]: x.split("=", 1)[1] for x in a.max_len}
+
+
+def tps_at(path, c):
+    """b1 tok/s at prompt length c, log-linear between the measured lengths (clamped at the ends)."""
+    P = sorted((int(k), float(v["b1_tok_s"])) for k, v in json.load(open(path)).items())
+    if c <= P[0][0]:
+        return P[0][1]
+    for (x0, y0), (x1, y1) in zip(P, P[1:]):
+        if c <= x1:
+            f = math.log(c / x0) / math.log(x1 / x0)
+            return y0 + f * (y1 - y0)
+    return P[-1][1]
+
 out = []
 for spec in a.config:
     name, rest = spec.split("=", 1)
@@ -135,17 +153,19 @@ for spec in a.config:
     A = arch(c, float(f8), float(head) * 2)
     w = A["lin"] * 1 + A["head"]                       # FP8 linear weights, BF16 lm_head
     rp, rd = flops(A, C_REF) / f_ref, decode_bytes(A, C_REF, w, a.inflight_ref) / d_ref
-    src = "FLOP ratio at C_REF (no measured run)"
-    cm = (compat or {}).get(name) or {}
-    tps = cm.get("prefill_tok_s") if isinstance(cm, dict) else None
-    ref_tps = REF_PREFILL_TPS0 / (1 + REF_ATT * C_REF / 1000)
-    if tps:
-        rp, src = ref_tps / float(tps), f"compat.json prefill_tok_s {tps}"
-    cap = int((cm.get("max_model_len") if isinstance(cm, dict) else None) or a.max_model_len)
+    src, measured = "ESTIMATE: FLOP ratio at C_REF (no measured run)", []
+    tps = None
+    if name in prefill and os.path.exists(prefill[name]):
+        tps = tps_at(prefill[name], C_REF)
+        rp, src = REF_PREFILL_TPS / tps, (f"MEASURED: {REF_PREFILL_TPS:.0f} / b1 prefill {tps:.0f} tok/s at {C_REF} "
+                                         f"tokens (compat prefill.json sha256 {sha(prefill[name])})")
+        measured.append("prefill (C0, B)")
+    cap = int(open(maxlen[name]).read().strip()) if name in maxlen and os.path.exists(maxlen[name]) else a.max_model_len
     longest = A["grow"] * cap + A["state"] + A["window_bytes"] * min(cap, A["window"])
     out.append(dict(
         name=name, hf=repo, config_sha256=sha(path), cap=cap,
-        cap_source="compat.json" if cm.get("max_model_len") else "default 131,072 (compat check not in yet)",
+        cap_source=("compat check boot_maxlen" if name in maxlen and os.path.exists(maxlen[name])
+                    else "default 131,072 (compat check not in yet)"),
         kv=dict(dtype="bf16", grow_bytes_per_token=A["grow"], state_bytes_per_session=A["state"],
                 window_tokens=A["window"], window_bytes_per_token=A["window_bytes"],
                 window_bytes_per_session_max=A["window_bytes"] * A["window"], longest_request_bytes=longest,
@@ -155,15 +175,16 @@ for spec in a.config:
         c0=round(FIT["c0"] * rp, 4), tpot=round(FIT["tpot"] * rd, 5), b=round(FIT["b"] * rp, 5),
         inflight=a.inflight_ref,
         service_assumption=dict(
-            status="ESTIMATE: replace with the pilot's microbenchmarks (prefill tok/s, TPOT at the heavy batch)",
+            status=("measured: " + ", ".join(measured) + "; " if measured else "") +
+                   ("ESTIMATE (replace with the pilot's microbenchmarks): TPOT" + ("" if measured else ", C0, B")),
+            measured=measured,
             ref_model="Qwen3-8B BF16 (Qwen/Qwen3-8B config sha256 " + sha(a.ref_config) + ")", ref_fit=FIT,
             c_ref_tokens=C_REF, prefill_ratio=round(rp, 4), prefill_ratio_source=src, decode_ratio=round(rd, 4),
             ref_prefill_flops_per_token=f_ref, prefill_flops_per_token=flops(A, C_REF),
             ref_decode_bytes_per_seq_step=d_ref, decode_bytes_per_seq_step=decode_bytes(A, C_REF, w, a.inflight_ref),
             linear_params_fp8=float(f8), lm_head_params_bf16=float(head), fp8_compute_credit=False,
-            implied_prefill_tok_s_at_c_ref=round(ref_tps / rp, 0),
-            implied_prefill_tok_s_at_0=round(REF_PREFILL_TPS0 * flops(R, 0) / flops(A, 0), 0),
-            heavy_load="mean requests in flight = %.4f (the Qwen3-8B heavy measured workload under its fit)" % a.inflight_ref)))
+            ref_prefill_tok_s=REF_PREFILL_TPS, prefill_tok_s_at_c_ref=round(tps if tps else REF_PREFILL_TPS / rp, 0),
+            flop_ratio=round(flops(A, C_REF) / f_ref, 4))))
     print(name, json.dumps({k: v for k, v in out[-1].items() if k not in ("service_assumption",)} |
                            {"ratios": [round(rp, 3), round(rd, 3)]}))
 json.dump(out, open(a.out, "w"), indent=1)

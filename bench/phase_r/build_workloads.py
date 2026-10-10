@@ -27,6 +27,10 @@ the summed turn times reach INFLIGHT x duration (the mean number of requests in 
 the summed session time reaches LIVE x duration, LIVE the mean number of live sessions), and each starts uniformly
 in [0, duration - its length], so the run to completion is estimated at --duration seconds. Tuning also gets the
 shorter stages of section 8 (--stages, nested prefixes of the tuning order).
+With --size-by-kv F (KV pressure, the Phase R v2 rule): tuning, pilot, measured and heldout_cc take sessions until
+their peak live KV bytes reach F x the model's longest request (F = 1.1 / 0.15: the GPU KV floor is 0.15 P), and every
+session runs to completion (no cut; starts uniform over --duration, the estimated makespan is reported); the tuning
+stages take the same P target, cut at their lengths; extras with a p factor are multiples of the measured P.
 
 KV (kv in the model spec): a session at context c holds grow x c + state + min(c, window) x window_bytes bytes (the
 growing full-attention KV, a fixed recurrent state, a sliding window). Peak live KV (P) is the largest sum over
@@ -85,8 +89,15 @@ ap.add_argument("out")
 ap.add_argument("--feat", required=True)
 ap.add_argument("--used", required=True)
 ap.add_argument("--cc")
-ap.add_argument("--models", required=True, help="service_model.py output (a JSON list of model specs)")
+ap.add_argument("--models", help="service_model.py output (a JSON list of model specs); without it only --pool-out")
+ap.add_argument("--pool-out", help="NAME: also write NAME.json and NAME.refs.parquet with every turn of every candidate "
+                                   "session of the three partitions (the side-file builder and the scorer take it "
+                                   "like a workload, so any later workload takes its curves from it)")
 ap.add_argument("--duration", type=float, default=2700.0)
+ap.add_argument("--size-by-kv", type=float, help="F: size tuning, pilot, measured and heldout_cc by KV pressure: "
+                "sessions are added until peak live KV bytes reach F x the model's longest request (F = 1.1 / 0.15 puts "
+                "the GPU KV floor at 0.15 P), each runs to completion (no cut), starts uniform over --duration; the "
+                "tuning stages take the same P target and are cut at their --stages lengths")
 ap.add_argument("--stages", type=float, nargs="*", default=[1200.0, 2400.0])
 ap.add_argument("--split", type=float, nargs=2, default=[0.25, 0.15], help="tuning and pilot fractions")
 ap.add_argument("--retain", type=float, default=0.16)
@@ -281,7 +292,7 @@ def cut(M, T, limit):
     return out, length, len(out) < len(T)
 
 
-def assemble(M, name, items, duration, build_turns, src_of, live=1.0, skip=frozenset(), peak=None):
+def assemble(M, name, items, duration, build_turns, src_of, live=1.0, skip=frozenset(), peak=None, limit=None):
     rng = np.random.default_rng(abs(hash_int(name)) % 2**32)
     by_turns = "inflight" in M
     sessions, refs, target, total = [], [], M["inflight" if by_turns else "live"] * live * duration, 0.0
@@ -289,7 +300,7 @@ def assemble(M, name, items, duration, build_turns, src_of, live=1.0, skip=froze
         if (src, sess) in skip:
             continue
         full = build_turns(M, g)
-        T, L, was_cut = cut(M, full, duration)
+        T, L, was_cut = cut(M, full, duration if limit is None else limit)
         if len(T) < 3:
             continue
         sid = f"{TAG[src]}{len(sessions):04d}"
@@ -303,7 +314,7 @@ def assemble(M, name, items, duration, build_turns, src_of, live=1.0, skip=froze
                              _src_session=sess, _unit=unit, _len=L, _cut=was_cut, _turns_src=len(full), _why=why))
         total += sum(t["_e2e"] for t in T) if by_turns else L
         if peak is not None:
-            if load(sessions, M, duration)["peak_live_kv_bytes" if M["kv"] else "peak_live_kv_tokens"] >= peak:
+            if load(sessions, M, duration, limit == float("inf"))["peak_live_kv_bytes" if M["kv"] else "peak_live_kv_tokens"] >= peak:
                 break
         elif total >= target:
             break
@@ -329,7 +340,7 @@ def hash_int(s):
     return int.from_bytes(hashlib.blake2b(s.encode(), digest_size=4).digest(), "big")
 
 
-def load(sessions, M, duration):
+def load(sessions, M, duration, to_completion=False):
     ev, evb, busy = [], [], 0.0
     for s in sessions:
         tm, cur, curb = s["start"], 0, 0.0
@@ -344,6 +355,7 @@ def load(sessions, M, duration):
     peak = float(np.max(np.cumsum([d for _, d in ev])))
     peak_b = float(np.max(np.cumsum([d for _, d in evb])))
     ends = [s["start"] + s["_len"] for s in sessions]
+    span = max(ends) if to_completion else duration
     mx = np.array([max(t["ctx"] for t in s["turns"]) for s in sessions])
     T = [t for s in sessions for t in s["turns"]]
     return dict(sessions=len(sessions), turns=len(T),
@@ -360,8 +372,9 @@ def load(sessions, M, duration):
                 prompt_tokens_M=round(sum(t["ctx"] - t["out_len"] for t in T) / 1e6, 1),
                 gaps_capped=int(sum(t["gap_uncapped"] is not None and t["gap_uncapped"] > a.gap_cap for t in T)),
                 peak_live_kv_tokens=int(peak), **kv_load(M, sessions, T, peak_b),
-                est_makespan_s=round(max(ends), 0), est_mean_live_sessions=round(sum(s["_len"] for s in sessions) / duration, 2),
-                est_mean_inflight=round(busy / duration, 3), est_duration_target_s=duration)
+                est_makespan_s=round(max(ends), 0), est_mean_live_sessions=round(sum(s["_len"] for s in sessions) / span, 2),
+                est_mean_inflight=round(busy / span, 3), est_duration_target_s=None if to_completion else duration,
+                arrival_window_s=duration, run_to_completion=to_completion)
 
 
 def kv_load(M, sessions, T, peak_b):
@@ -389,12 +402,15 @@ def write(M, name, sessions, refs, extra):
     put_json(p, W)
     R = pd.DataFrame(refs, columns=["key", "session", "turn", "src", "source_session", "feat_ref"])
     put(os.path.join(a.out, f"{name}.refs.parquet"), lambda t: R.to_parquet(t, index=False))
-    L = load(sessions, M, extra["duration"])
+    L = load(sessions, M, extra["duration"], extra.get("to_completion", False))
     man = dict(workload=f"{name}.json", model=M["name"], ctx_cap=M["cap"], partition=extra["partition"],
                bytes=os.path.getsize(p), sha256=hashlib.sha256(open(p, "rb").read()).hexdigest(),
                load=L, service_model=dict(c0=M["c0"], tpot=M["tpot"], b_per_1k_prompt=M["b"],
                                           **{k: M[k] for k in ("inflight", "live", "service_assumption") if k in M}),
                kv=M["kv"], hf=M.get("hf"), ctx_cap_source=M.get("cap_source"),
+               sizing=dict(by="peak live KV bytes", heavy_P_target_bytes=int(P_heavy), factor_of_longest_request=a.size_by_kv,
+                           run_to_completion=extra.get("to_completion", False)) if P_heavy else
+               dict(by="inflight" if "inflight" in M else "live"),
                sessions=[dict(id=s["id"], source=s["pool"], source_session=s["_src_session"], turns=len(s["turns"]),
                               turns_in_source=s["_turns_src"], cut_at_duration=s["_cut"]) for s in sessions])
     put_json(os.path.join(a.out, f"{name}.manifest.json"), man, indent=1)
@@ -402,16 +418,46 @@ def write(M, name, sessions, refs, extra):
     return man
 
 
+# ---------------------------------------------------------------- candidate pool file
+if a.pool_out:
+    PS, PR = [], []
+    for p in PARTS:
+        for src in SRC:
+            for sess, unit in order[p][src]:
+                g = pool[src][sess]
+                sid = f"{TAG[src]}{len(PS):05d}"
+                turns = []
+                for i, r in enumerate(g.itertuples()):
+                    gap = float(r.gap) if r.returned else None
+                    turns.append(dict(kind=r.kind, gap_after=None if gap is None else min(gap, a.gap_cap),
+                                      gap_uncapped=gap, surv_v6=None))
+                    PR.append((f"{sid}:{i}", sid, i, src, sess, r.ref, p))
+                PS.append(dict(id=sid, pool=src, partition=p, turns=turns))
+    put_json(os.path.join(a.out, f"{a.pool_out}.json"),
+             dict(src="Layby Phase R candidate pool: every turn of every candidate session of the tuning, pilot and "
+                      "measured partitions (not a replay workload)", gap_cap=a.gap_cap,
+                  curve="surv_v6 (null until scored from the side file)", sessions=PS))
+    RP = pd.DataFrame(PR, columns=["key", "session", "turn", "src", "source_session", "feat_ref", "partition"])
+    put(os.path.join(a.out, f"{a.pool_out}.refs.parquet"), lambda t: RP.to_parquet(t, index=False))
+    print(a.pool_out, dict(sessions=len(PS), turns=len(RP), by_partition=RP.groupby("partition").size().to_dict(),
+                           by_source=RP.groupby("src").size().to_dict()), flush=True)
+if not a.models:
+    raise SystemExit(0)
+
 # ---------------------------------------------------------------- build
 models = [spec(m) for m in json.load(open(a.models))]
 built = {}
 for M in models:
+    P_heavy = a.size_by_kv * M["kv"]["longest_request_bytes"] if a.size_by_kv else None
+    LIM = float("inf") if P_heavy else None
+    if P_heavy:
+        print(M["name"], f"heavy P target {P_heavy / 1e9:.2f} GB", flush=True)
     for p in PARTS:
         items = [(src, sess, unit, pool[src][sess]) for src, (sess, unit) in
                  interleave([[(s, x) for x in order[p][s]] for s in SRC])]
         name = f"{M['name']}.{p}"
-        S, R, _ = assemble(M, name, items, a.duration, turns_feat, None)
-        built[name] = write(M, name, S, R, dict(duration=a.duration, partition=p))
+        S, R, _ = assemble(M, name, items, a.duration, turns_feat, None, peak=P_heavy, limit=LIM)
+        built[name] = write(M, name, S, R, dict(duration=a.duration, partition=p, to_completion=bool(P_heavy)))
         if p == "measured":
             taken = {(x["pool"], x["_src_session"]) for x in S}
             for e in a.extra:
@@ -423,8 +469,8 @@ for M in models:
                 if f.endswith("p"):     # a multiple of the measured workload's peak live KV
                     pk = float(f[:-1]) * built[name]["load"]["peak_live_kv_bytes" if M["kv"] else "peak_live_kv_tokens"]
                 S2, R2, _ = assemble(M, nm, items, a.duration, turns_feat, None, live=1.0 if pk else float(f),
-                                     skip=frozenset(taken), peak=pk)
-                man = write(M, nm, S2, R2, dict(duration=a.duration, partition=p))
+                                     skip=frozenset(taken), peak=pk, limit=LIM)
+                man = write(M, nm, S2, R2, dict(duration=a.duration, partition=p, to_completion=bool(P_heavy)))
                 man["live_factor" if pk is None else "peak_kv_factor"] = float(f.rstrip("p"))
                 built[nm] = man
                 new = {(x["pool"], x["_src_session"]) for x in S2}
@@ -433,14 +479,14 @@ for M in models:
         if p == "tuning":
             for d in a.stages:
                 nm = f"{M['name']}.tuning_{int(d / 60)}min"
-                S2, R2, _ = assemble(M, nm, items, d, turns_feat, None)
+                S2, R2, _ = assemble(M, nm, items, d, turns_feat, None, peak=P_heavy)
                 built[nm] = write(M, nm, S2, R2, dict(duration=d, partition=p))
     if cc is not None:
         items = sorted(((h01("order", "cc_traces", tr), tr, g) for tr, g in cc.groupby("trace")), key=lambda x: x[0])
         items = [("cc_traces", tr, tr, g) for _, tr, g in items]
         name = f"{M['name']}.heldout_cc"
-        S, R, _ = assemble(M, name, items, a.duration, turns_cc, None)
-        built[name] = write(M, name, S, R, dict(duration=a.duration, partition="heldout_cc"))
+        S, R, _ = assemble(M, name, items, a.duration, turns_cc, None, peak=P_heavy, limit=LIM)
+        built[name] = write(M, name, S, R, dict(duration=a.duration, partition="heldout_cc", to_completion=bool(P_heavy)))
 
 # ---------------------------------------------------------------- checks
 chk = {}

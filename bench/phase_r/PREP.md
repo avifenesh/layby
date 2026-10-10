@@ -95,3 +95,12 @@ sliding layers counted for every token, and for Qwen3.8 one recurrent state per 
 attention block to 784 tokens so its page equals the 3.21 MB per-layer mamba page; the compat boot log confirms the
 state size). `disk_bytes_turn_end` (one state and the window's new tokens per turn end) is the lower figure.
 GPU KV is floored at 1.1 x one 131,072-token request (Qwen 9.62 GB, Gemma 12.73 GB), above 0.15 P for both models.
+
+Re-sized 2026-10-11 (coordinator's decision): heavy P = the GPU KV floor / 0.15 (Qwen3.8 64.1 GB, Gemma 84.9 GB
+targets; `build_workloads.py --size-by-kv 7.3333`), CPU tier 0.4 P, light 0.5 P, sweeps 1.5, 2 and 3 P; tuning, pilot
+and measured run to completion (estimated makespan in each manifest), the 20- and 40-minute stages keep their
+lengths at the heavy P. Disk tier 1.2x unique KV at turn ends (`disk_bytes`; `disk_bytes_upper` for the pilot check).
+Qwen3.8 prefill is measured (compat `prefill.json`, b1 9,009 tok/s at 23K, vs 16,983 for Qwen3-8B from its C0 runs:
+C0 and B x1.885); its TPOT and all of Gemma's service time are still the FLOP and bytes estimates.
+`pool_all.{json,refs.parquet,side.parquet}`: every turn of every candidate session of the three partitions (12,418
+sessions, 520,605 turns), so a later re-sizing takes v6 curves from one scored file.

@@ -8,9 +8,9 @@ For every workload NAME.json in DIR whose name starts with a model's name:
   kv       the builder's accounting (manifest load): P = peak live KV bytes, unique KV bytes, the disk tier
 Capacities per model, from its measured workload's P (BENCH_PLAN section 5): GPU KV max(0.15 P, 1.1 x the longest
 request the model admits at its context cap, so the engine can start), CPU tier 0.4 P. Per workload: disk tier
-1.2 x unique KV, counted at the builder's upper bound (unique_kv_bytes_upper: the sliding layers' KV of every token, a
-recurrent state at every KV block boundary) until the engines' written bytes are measured, so no arm evicts from
-disk; disk_bytes_turn_end is the smaller figure (one state and the window's new tokens per turn end).
+1.2 x unique KV at turn ends (one recurrent state and the window's new tokens per turn end; the coordinator's
+2026-10-11 decision); disk_bytes_upper is 1.2 x the builder's upper bound (the sliding layers' KV of every token, a
+recurrent state at every KV block boundary), for a check against the bytes the engines write in the pilot.
 
 Writes NAME.json (annotated), NAME.manifest.json (curves, ct_eta, capacities, new bytes and sha256) and
 DIR/capacities.json, each through a hidden temporary name and a rename.
@@ -54,10 +54,12 @@ caps = dict(_note=(
     "of started, unfinished sessions on the builder's service-time model: grow x context + recurrent state + "
     "min(context, window) x window bytes), not a C0 replay. Per model, from its measured workload: GPU KV "
     "max(0.15 P, 1.1 x longest_request_bytes at max_model_len), CPU tier 0.4 P. Per workload: disk_bytes = 1.2 x "
-    "unique KV at its upper bound (sliding layers' KV for every token; a recurrent state per KV block, vLLM's mamba "
-    "align mode), disk_bytes_turn_end the smaller figure (one state and the window's new tokens per turn end), ct_eta = layby.continuum.memoryfulness. KV constants from the Hugging Face config.json "
-    "(bench/phase_r/service_model.py); service times are ESTIMATES scaled from the Qwen3-8B fit, to be replaced by "
-    "the pilot's microbenchmarks."), models={}, workloads={})
+    "unique KV at turn ends (one recurrent state and the window's new tokens per turn end); disk_bytes_upper = 1.2 x "
+    "the upper bound (sliding layers' KV for every token, a recurrent state per KV block, vLLM's mamba align mode), "
+    "ct_eta = layby.continuum.memoryfulness. KV constants from the Hugging Face config.json "
+    "(bench/phase_r/service_model.py); service times: each model's service_model.status says which parts are measured "
+    "(compat prefill microbenchmark) and which are estimates scaled from the Qwen3-8B fit. Sizing: the heavy P is the "
+    "GPU KV floor / 0.15 (build_workloads.py --size-by-kv), sessions run to completion (est_makespan_s)."), models={}, workloads={})
 for M in models:
     k = M["kv"]
     names = sorted(os.path.basename(p)[: -len(".json")] for p in glob.glob(os.path.join(a.dir, f"{M['name']}.*.json"))
@@ -83,11 +85,12 @@ for M in models:
         r = annotate(W, KM, a.alpha)
         eta = round(memoryfulness(W["sessions"]), 4)
         L = mans[n]["load"]
-        ub = L["unique_kv_bytes_upper"]
+        ub = L["unique_kv_bytes"]
         wc = dict(model=M["name"], sessions=L["sessions"], turns=L["turns"], peak_live_kv_bytes=L["peak_live_kv_bytes"],
                   peak_live_kv_grow_tokens=L["peak_live_kv_tokens"], peak_over_model_P=round(L["peak_live_kv_bytes"] / P, 3),
                   unique_kv_grow_tokens=L["unique_kv_tokens"], unique_kv_bytes=ub, disk_bytes=int(1.2 * ub),
-                  unique_kv_bytes_turn_end=L["unique_kv_bytes"], disk_bytes_turn_end=int(1.2 * L["unique_kv_bytes"]),
+                  unique_kv_bytes_upper=L["unique_kv_bytes_upper"], disk_bytes_upper=int(1.2 * L["unique_kv_bytes_upper"]),
+                  est_makespan_s=L["est_makespan_s"], run_to_completion=L.get("run_to_completion", False),
                   ct_eta=eta, est_mean_inflight=L["est_mean_inflight"])
         if k["state_bytes_per_session"]:
             wc.update(state_snapshots=L["state_snapshots"], state_blocks=L["state_blocks"])
