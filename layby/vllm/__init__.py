@@ -17,6 +17,13 @@ Pieces:
   fs_tier.py    the disk tier: writes only what the rule places on disk, also after the request ended
   server.py     a local HTTP port for hints ({key, surv}) and a telemetry snapshot (GET /live)
 
+Baseline arms of the evaluation (default off; none of them changes Layby's own configuration):
+  freq_tier.py  T2: vLLM's native fs tier writing a chunk only on its n-th sighting, counts decaying over time
+                (SGLang write_through_selective, Dynamo KVBM's FrequencyFilter)
+  continuum.py  CT: Continuum's GPU time-to-live pin after tool calls (layby.continuum), CPU tier only
+  fs_tier.py    PT: ParkFsTier with "write_all": every chunk, no rule, to compare its I/O path with vLLM's
+Curves for the K_km and K_ewma controls come from layby.curves (precomputed per turn, sent like any other curve).
+
 A request is identified to the sidecar by kv_transfer_params["park_key"] (the request id otherwise). Its
 idle-period curve arrives either with the request (kv_transfer_params["park_surv"], 15 values of
 P(T > E2[j])) or after it finished (POST /hint), when the sidecar has scored the response.
