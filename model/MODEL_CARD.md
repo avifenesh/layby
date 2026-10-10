@@ -22,7 +22,8 @@ Layby-Dwell predicts how long an LLM session stays idle after a response ends. I
 serving engine can see at that moment and returns a survival curve: the probability that the
 session's next request has not arrived yet, at 15 horizons from 0.5 s to 30 min.
 
-Code, engine adapters and the ReturnBench benchmark: [github.com/avifenesh/layby](https://github.com/avifenesh/layby).
+Code, engine adapters and the ReturnBench benchmark: [github.com/avifenesh/layby](https://github.com/avifenesh/layby), archived on Zenodo as
+[10.5281/zenodo.23285213](https://doi.org/10.5281/zenodo.23285213).
 Paper: arXiv, link to follow. Author: [Avi Fenesh](https://github.com/avifenesh), [Tiyuvta](https://tiyuvta.ai).
 
 It exists for one decision: where to keep the session's KV cache while it waits. Keep it on the GPU,
