@@ -77,7 +77,7 @@ from .live import AG, Live   # shared with the engine adapters
 
 def simulate(W, src, p, rule=None):
     """Replay W's sessions closed-loop through the simulated engine; src None is C0 (LRU, no hints).
-    rule: an object with decide(view) -> dict(eta, disk, pre, warm_eta), called when a turn finishes
+    rule: an object with decide(view) -> dict(eta, disk, pre, warm_eta[, gpu_pin, disk_tokens]), called when a turn finishes
     with the live engine state; it replaces the replay's eta_<src>/pre_<src> (src must not be None)."""
     S = W["sessions"]
     live = Live(p.tw)
@@ -326,15 +326,17 @@ def simulate(W, src, p, rule=None):
             if to_disk and src is not None:
                 if p.disk_write:
                     # REQUEST_LEVEL write of the session; blocks already on disk are skipped
-                    new = tot - max(disk.get(k, 0), disk_writing.get(k, 0))
+                    # a rule may write only a prefix of the session (disk_tokens)
+                    wtot = min(dec_r.get("disk_tokens") or tot, tot) if dec_r is not None else tot
+                    new = wtot - max(disk.get(k, 0), disk_writing.get(k, 0))
                     if new > 0:
                         io["disk_write"] += new
                         live.add(now, busy_disk=new * KIB * 1024 / (p.disk_gbps * 1e9), n_disk=1.0, wait_disk=max(link_disk - now, 0.0))
                         link_disk = max(link_disk, now) + new * KIB * 1024 / (p.disk_gbps * 1e9)
-                        disk_writing[k] = tot
-                        push(link_disk, "disk", (k, tot))
+                        disk_writing[k] = wtot
+                        push(link_disk, "disk", (k, wtot))
                 else:
-                    disk[k] = tot
+                    disk[k] = min(dec_r.get("disk_tokens") or tot, tot) if dec_r is not None else tot
             if r.warm:
                 wlog[(k, r.turn)] = [r.t_send, r.t_adm, now]
                 continue

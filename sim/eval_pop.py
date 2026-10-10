@@ -11,9 +11,10 @@ import numpy as np
 
 from .engine_sim import simulate, summarize, Params
 from .cost_rule import StkRule, CostRule, Oracle
-from .baselines import ContinuumTTL, ChoiJoshi, KeepAlive, WriteThroughDisk
+from .baselines import ContinuumTTL, ChoiJoshi, KeepAlive, WriteThroughDisk, WriteThroughHit
 
-POOLS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bench", "pools")
+# RETURNBENCH_POOLS: a directory of pools to read instead (same files with extra curve fields, e.g. surv_km)
+POOLS = os.environ.get("RETURNBENCH_POOLS") or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bench", "pools")
 # engine calibration of the reference runs (Qwen3-8B on vLLM 0.30, see README)
 CAL = dict(f0=1 / 6000, att=0.0, t0=0.025, bw=600e9, jitter=0.05)
 # stk_p constants (tuned in simulation in the Layby work); load_gate is not applied
@@ -25,6 +26,13 @@ REFERENCE = [("swechat", 6), ("swechat", 12), ("swechat", 18), ("tracelab_claude
 DISKS = (0.5, 1.5, 3.0)
 
 
+def _curve(W, name):
+    """CostRule on the field surv_NAME, which every turn of the workload must carry (no silent 0.5 curves)."""
+    if any(f"surv_{name}" not in t for s in W["sessions"] for t in s["turns"]):
+        raise ValueError(f"a pool lacks surv_{name}; pass --pools with pools that carry it")
+    return CostRule(name)
+
+
 def _oracle(options):
     o = Oracle(); o.options = options
     return o
@@ -34,6 +42,7 @@ def _oracle(options):
 RULES = dict(
     C0=lambda W, c: None,
     wt=lambda W, c: WriteThroughDisk(W),
+    wt2=lambda W, c: WriteThroughHit(W),
     stk=lambda W, c: StkRule(c, STK),
     cost=lambda W, c: CostRule(c),
     orc=lambda W, c: Oracle(),
@@ -43,6 +52,16 @@ RULES = dict(
     c_nopark=lambda W, c: CostRule(c, ("none", "ins", "drop")),
     c_disk=lambda W, c: CostRule(c, ("ins", "park")),
     o_disk=lambda W, c: _oracle(("ins", "park")),
+    # controls: the cost rule on a curve from no learned model (fields surv_km, surv_kmpool, surv_kmsrc that a pool
+    # must carry: Kaplan-Meier curves per wait kind, one pooled curve, per source and kind)
+    cost_km=lambda W, c: _curve(W, "km"),
+    cost_kmpool=lambda W, c: _curve(W, "kmpool"),
+    cost_kmsrc=lambda W, c: _curve(W, "kmsrc"),
+    # ablations: the cost rule with one cost term set to zero (sim.rule.ABLATE)
+    cost_noprice=lambda W, c: CostRule(c, ablate=("price",)),
+    cost_noext=lambda W, c: CostRule(c, ablate=("ext",)),
+    cost_noW=lambda W, c: CostRule(c, ablate=("W",)),
+    cost_noQ=lambda W, c: CostRule(c, ablate=("Q",)),
 )
 
 

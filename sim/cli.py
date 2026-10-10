@@ -1,14 +1,14 @@
 """returnbench: run placement policies on ReturnBench pools in the engine simulator.
 
   returnbench eval [--rules C0 wt cost ...] [--cells POOL:N ...] [--workloads 8] [--seeds 3]
-                   [--disk 0.5 1.5 3] [--policy NAME=module:Class ...] [--out rows.jsonl]
+                   [--disk 0.5 1.5 3] [--policy NAME=module:Class ...] [--pools DIR] [--out rows.jsonl]
   returnbench table rows.jsonl [--cells] [--ref wt]
 
 eval runs the 33-cell reference set unless --cells is given, prints the summary, and appends one JSON
 row per (cell, workload, seed, rule) to --out. table summarizes rows written earlier. C0 always runs:
 every ratio is against it.
 """
-import argparse, json, sys
+import argparse, json, os, sys
 
 from . import eval_pop as E
 
@@ -47,6 +47,7 @@ def main(argv=None):
     e.add_argument("--disk", type=float, nargs="+", default=list(E.DISKS))
     e.add_argument("--curve", default="v6", help="survival curve field surv_NAME the curve-driven rules read")
     e.add_argument("--window", type=float, help="run length in seconds (no send after it)")
+    e.add_argument("--pools", help="directory of pools to read instead of bench/pools (sets RETURNBENCH_POOLS)")
     e.add_argument("--procs", type=int, default=8); e.add_argument("--out")
     e.add_argument("--ref", default="wt"); e.add_argument("--per-cell", action="store_true")
     t = sub.add_parser("table", help="summarize rows written by eval")
@@ -54,6 +55,8 @@ def main(argv=None):
     a = ap.parse_args(argv)
 
     if a.cmd == "eval":
+        if a.pools:
+            os.environ["RETURNBENCH_POOLS"] = E.POOLS = os.path.abspath(a.pools)   # workers read it at import
         extra = [x for x in a.policy]
         names = [E.register(x) for x in extra]
         rules = ["C0"] + [r for r in a.rules + names if r != "C0"]
