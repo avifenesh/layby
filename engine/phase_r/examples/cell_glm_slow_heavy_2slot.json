@@ -18,7 +18,12 @@
   "cpu_bytes": "28G"
  },
  "cgroup": {
-  "rss_bytes": "24G"
+  "arm_rss_bytes": {
+   "C0": "24G",
+   "T": "25G",
+   "K": "26G",
+   "K_ewma": "26G"
+  }
  },
  "io_max": {
   "rbps": "450M",

@@ -58,7 +58,7 @@ class RunnerHooks(unittest.TestCase):
         self.d = tempfile.mkdtemp(dir=SCRATCH)
         self.venv = os.path.join(self.d, "venv")
         os.makedirs(os.path.join(self.venv, "bin"))
-        for name, body in (("vllm", SERVER), ("sglang", SERVER), ("python", CLIENT)):
+        for name, body in (("vllm", SERVER), ("sglang", SERVER), ("lmcache", SERVER), ("python", CLIENT)):
             p = os.path.join(self.venv, "bin", name)
             with open(p, "w") as f:
                 f.write(body)
@@ -83,7 +83,7 @@ class RunnerHooks(unittest.TestCase):
     def check(self, r, rows, arm):
         self.assertIn("ALL_DONE", r.stdout, r.stdout + r.stderr)
         self.assertIn(f"arm {arm} rc=0 1 turns", r.stdout)
-        server = [x for x in rows if "server_argv" in x]
+        server = [x for x in rows if "server_argv" in x and x["server_argv"][0] == "serve"]
         self.assertEqual(len(server), 1)
         self.assertEqual(server[0]["wrapped"], "yes")            # the server ran under SERVER_WRAP
         m = health.read_markers(os.path.join(self.out, f"{arm}.markers"))
@@ -97,6 +97,14 @@ class RunnerHooks(unittest.TestCase):
         self.assertEqual(argv[0], "serve")
         self.assertIn("--park-hints", client)
         self.assertEqual(client[client.index("--park-hints") + 1], "ewma")
+
+    def test_lmcache_server_joins_the_arms_cgroup(self):
+        # arm LM starts an LMCache server beside vLLM; it holds the L1 tier, so it must be charged to the arm's cgroup
+        r, rows = self.run_runner("run_arms.sh", "LM", {"LM_PORT": str(free_port())})
+        self.check(r, rows, "LM")
+        lm = [x for x in rows if "server_argv" in x and x["server_argv"][0] == "server"]
+        self.assertEqual(len(lm), 1)
+        self.assertEqual(lm[0]["wrapped"], "yes")
 
     def test_sglang_runner(self):
         r, rows = self.run_runner("run_arms_sglang.sh", "T", {"WRITE_POLICY": "write_through_selective"})

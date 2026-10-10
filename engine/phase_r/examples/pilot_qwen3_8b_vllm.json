@@ -1,11 +1,29 @@
 {
- "_comment": "PLACEHOLDER numbers for dry runs and tests, not measurements. The pilot overwrites every value: kv_bytes_per_token from the model config, engine_rss_bytes as the peak RSS of a C0 run beyond the pinned CPU tier, prefill_tok_s as the engine's measured prefill rate at each load, wt_offered_write_Bps as write-through's offered write rate at each load (bytes written to the tier per second in a T run with no disk limit).",
+ "_comment": "PLACEHOLDER numbers for dry runs and tests, not measurements. The pilot overwrites every value: kv_bytes_per_token from the model config, arm_rss_bytes per arm label as the peak RSS of that arm's processes beyond its pinned CPU tier (an LMCache arm lists its vLLM engine and its LMCache server, which share the arm's cgroup; the sum is used), prefill_tok_s as the engine's measured prefill rate at each load, wt_offered_write_Bps as write-through's offered write rate at each load (bytes written to the tier per second in a T run with no disk limit).",
  "model": "Qwen/Qwen3-8B",
  "engine": "vllm",
  "kv_bytes_per_token": 147456,
- "engine_rss_bytes": 12884901888,
+ "arm_rss_bytes": {
+  "C0": 12884901888,
+  "T": 13421772800,
+  "LM": {
+   "vllm": 11811160064,
+   "lmcache_server": 3221225472
+  },
+  "K": 13958643712,
+  "K_ewma": 13958643712,
+  "K_km": 13958643712,
+  "HC-wt": 12884901888,
+  "HC-sel": 12884901888
+ },
  "loads": {
-  "heavy": {"prefill_tok_s": 20000.0, "wt_offered_write_Bps": 600000000.0},
-  "light": {"prefill_tok_s": 24000.0, "wt_offered_write_Bps": 220000000.0}
+  "heavy": {
+   "prefill_tok_s": 20000.0,
+   "wt_offered_write_Bps": 600000000.0
+  },
+  "light": {
+   "prefill_tok_s": 24000.0,
+   "wt_offered_write_Bps": 220000000.0
+  }
  }
 }

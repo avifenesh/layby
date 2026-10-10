@@ -118,7 +118,8 @@ every arm of one cell on one host in one repeat, in the seeded random order, thr
     python3 engine/phase_r/orchestrate.py run --cell CELL.json --host HOST --repeat N --out OUT --aa C0   # A/A pair
     python3 engine/phase_r/orchestrate.py run ... --dry-run    # print every command, execute none
 
-What it does per arm: a fresh cgroup v2 child (`memory.max` = pinned tiers + measured RSS + 256 MiB, swap 0, cpuset,
+What it does per arm: a fresh cgroup v2 child (`memory.max` = pinned tiers + that arm's own measured RSS + 256 MiB; an
+LMCache arm's server runs in the same cgroup and its RSS is part of the arm's; swap 0, cpuset,
 `io.max` on the tier's disk), page cache dropped, the tier wiped (rm and fstrim, mkfs, or a fresh tmpfs for the RAM
 tier), a quick fio probe held to the host's first probe (10%), health checks (GPU clock-event reasons, free memory,
 workload counts, the SGLang patch), then telemetry during the arm (cgroup memory and PSI, io.stat, diskstats, tier
@@ -128,7 +129,8 @@ whole block. Exit codes: 0 done, 2 attempts used up, 3 host fault (rerun on a ne
 4 configuration or regime mismatch, 5 preflight failure.
 
 Inputs: a cell file (`engine/phase_r/examples/cell_*.json`, fields documented in its `_comment`) and the pilot JSON
-(`examples/pilot_qwen3_8b_vllm.json`: KV bytes per token, engine RSS, prefill tok/s and write-through's offered write
+(`examples/pilot_qwen3_8b_vllm.json`: KV bytes per token, RSS per arm label (`arm_rss_bytes`; a missing arm is a
+configuration error), prefill tok/s and write-through's offered write
 rate per load). The regime is checked from measured numbers before any arm runs (`orchestrate.py regime` computes r and
 w by hand). SGLang arms need `engine/phase_r/sglang/hicache_fadvise.patch` (HiCacheFile drops its page-cache pages
 after each write and read); `apply_patch.sh PYTHON apply` installs it and the orchestrator checks it before every arm.

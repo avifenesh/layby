@@ -84,6 +84,45 @@ class DryRun(unittest.TestCase):
         self.assertIn("[root] echo 3 > /proc/sys/vm/drop_caches", log)
         self.assertIn("[gpu] docker exec", log)
 
+    def test_memory_max_uses_each_arms_own_rss(self):
+        rc, out = run(["run", "--cell", self.cell("cell_main_vllm_slow_heavy.json"), "--host", "h1", "--out", self.out,
+                       "--dry-run"])
+        self.assertEqual(rc, orchestrate.EXIT_OK)
+        got = {}
+        for ln in out.splitlines():
+            if ln.endswith("/memory.max") and ".r1a1.A." in ln:
+                w = ln.split()
+                got[ln.rsplit("/", 2)[-2].rsplit(".", 1)[-1]] = int(w[w.index("echo") + 1])
+        G, M = 1 << 30, 1 << 20
+        pinned, slack = 28 * G, 256 * M
+        self.assertEqual(got, {"C0": pinned + 12 * G + slack, "T": pinned + 12 * G + 512 * M + slack,
+                               "LM": pinned + (11 + 3) * G + slack,       # vLLM engine plus its LMCache server
+                               "K": pinned + 13 * G + slack, "K_ewma": pinned + 13 * G + slack,
+                               "K_km": pinned + 13 * G + slack})
+        lm = [x for x in self.runs() if x["label"] == "LM"][0]
+        env = load_json(os.path.join(lm["dir"], lm["prefix"] + ".harness_env.json"))
+        self.assertEqual(env["rss"], {"vllm": 11 * G, "lmcache_server": 3 * G})
+
+    def test_missing_arm_rss_is_a_config_error(self):
+        pil = load_json(os.path.join(EX, "pilot_qwen3_8b_vllm.json"))
+        del pil["arm_rss_bytes"]["K_km"]
+        pp = os.path.join(self.tmp, "pilot.json")
+        with open(pp, "w") as f:
+            json.dump(pil, f)
+        p = self.cell("cell_main_vllm_slow_heavy.json")
+        c = load_json(p)
+        c["pilot"] = pp
+        with open(p, "w") as f:
+            json.dump(c, f)
+        rc, _ = run(["run", "--cell", p, "--host", "h1", "--out", self.out, "--dry-run"])
+        self.assertEqual(rc, orchestrate.EXIT_CONFIG)
+        self.assertFalse(os.path.exists(os.path.join(self.out, "runs.jsonl")))
+        # an A/A block runs only C0's two copies, which use C0's entry
+        rc, out = run(["run", "--cell", p, "--aa", "C0", "--host", "h1", "--out", self.out, "--dry-run"])
+        self.assertEqual(rc, orchestrate.EXIT_OK)
+        self.assertIn(f"echo {28 * (1 << 30) + 12 * (1 << 30) + (256 << 20)} > /sys/fs/cgroup/layby/"
+                      "main-vllm-slow-heavy-AA.r1a1.A.C0_aa1/memory.max", out)
+
     def test_regime_mismatch_stops_before_any_arm(self):
         # without io.max the NVMe reads 3.6 GB/s: medium, not slow
         p = self.cell("cell_main_vllm_slow_heavy.json", io_max=None, io_max_none_reason="test")

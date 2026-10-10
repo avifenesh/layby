@@ -114,7 +114,7 @@ def load_cell(path, aa=None):
         src = [a for a in c["arms"] if a["label"] == aa]
         if not src:
             raise ValueError(f"--aa {aa}: no such arm")
-        c["arms"] = order.aa_arms(src[0])
+        c["arms"] = [dict(a, aa_of=src[0]["label"]) for a in order.aa_arms(src[0])]
         c["cell"] = f"{c['cell']}-AA"
     pil = c.get("pilot")
     c["_pilot"] = load_json(pil if os.path.isabs(pil) else os.path.join(base, pil)) if pil else None
@@ -124,6 +124,8 @@ def load_cell(path, aa=None):
     c.setdefault("telemetry", {})
     c.setdefault("cgroup", {})
     c.setdefault("dry_run", {})
+    for a in c["arms"]:   # every arm has its own RSS before anything runs
+        arm_rss(c, a)
     return c
 
 
@@ -131,18 +133,31 @@ def arm_by_label(c):
     return {a["label"]: a for a in c["arms"]}
 
 
-def budget_of(c, code):
+def arm_rss(c, arm):
+    """(bytes, {process: bytes}) of one arm's measured RSS beyond its pinned tier, from the cell's
+    cgroup.arm_rss_bytes or the pilot's arm_rss_bytes, keyed by arm label (an A/A arm uses its base label). A value is
+    bytes, or a map of the arm's processes to bytes (summed): an LMCache arm counts its LMCache server, which runs in
+    the same cgroup (run_arms.sh starts it through SERVER_WRAP too). There is no per-engine default: every arm needs
+    its own number."""
+    table = c["cgroup"].get("arm_rss_bytes")
+    if table is None and c["_pilot"]:
+        table = c["_pilot"].get("arm_rss_bytes")
+    if not isinstance(table, dict):
+        raise ValueError("no per-arm RSS: give the pilot's arm_rss_bytes (or cgroup.arm_rss_bytes), keyed by label")
+    label = arm["label"]
+    v = table.get(label, table.get(arm.get("aa_of")) if arm.get("aa_of") else None)
+    if v is None:
+        raise ValueError(f"arm_rss_bytes has no entry for arm {label!r}")
+    parts = {k: parse_size(x) for k, x in v.items()} if isinstance(v, dict) else {"engine": parse_size(v)}
+    return sum(parts.values()), parts
+
+
+def budget_of(c, arm):
     cg = c["cgroup"]
     pinned = parse_size(cg.get("pinned_bytes", c["capacities"]["cpu_bytes"]))
-    rss = cg.get("rss_bytes")
-    if rss is None and c["_pilot"]:
-        rss = c["_pilot"].get("engine_rss_bytes")
-    if isinstance(rss, dict):
-        rss = rss.get(code, rss.get("default"))
-    if rss is None:
-        raise ValueError("no engine RSS: give cgroup.rss_bytes or the pilot's engine_rss_bytes")
+    rss, _ = arm_rss(c, arm)
     ram = parse_size(c["ram_tier_bytes"]) if c.get("ram_tier_bytes") else 0
-    return cgroup.budget(pinned, parse_size(rss), parse_size(cg.get("slack_bytes", cgroup.SLACK)), ram)
+    return cgroup.budget(pinned, rss, parse_size(cg.get("slack_bytes", cgroup.SLACK)), ram)
 
 
 def io_limits(c, dev):
@@ -458,7 +473,7 @@ class Block:
         round_budget = 0
         for x in ctx:
             s, arm = x["slot"], x["arm"]
-            b = budget_of(c, arm["code"])
+            b = budget_of(c, arm)
             round_budget += b
             io = io_limits(c, self.devs.get(s["name"]))
             x["cg"] = cgroup.create(rn, cg_name(c, s, arm["label"], self.repeat, self.attempt), b, s["cpus"], s["mems"], io)
@@ -529,7 +544,7 @@ class Block:
                 "arm_env": arm["env"], "host": self.host, "repeat": self.repeat, "attempt": self.attempt,
                 "position": int(os.path.basename(x["dir"]).split(".")[0]), "slot": s["name"], "seed": c["seed"],
                 "engine": c["engine"], "model": c["model"], "regime": c["regime"], "load": c["load"],
-                "cgroup": x["cg"], "memory_max": x["budget"], "cpus": s["cpus"], "mems": s["mems"],
+                "cgroup": x["cg"], "memory_max": x["budget"], "rss": arm_rss(c, arm)[1], "cpus": s["cpus"], "mems": s["mems"],
                 "io_max": [cgroup.io_max_line(*i) for i in x["io"]], "disk": s["disk"], "device": dev,
                 "capacities": c["capacities"], "workload": c["workload"]})
             cmd = arm_command(c, s, arm, x["dir"], x["cg"])
