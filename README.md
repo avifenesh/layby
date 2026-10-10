@@ -187,11 +187,11 @@ stored nothing for that model, and at equal GPU KV the engine ran out of memory 
   overlay filesystems of those boxes, so recent writes were read back from the OS page cache (about 125 GB of host
   RAM); the cold disk read at about 60 MB/s. Write-through (T) there acts as a larger RAM tier, which is why it wins.
   On a real slow disk (the GLM round) the order flips: T is worse than no disk and Layby is best.
-- **A slow disk under CPU-tier pressure can beat the rule.** On a PCIe A100 whose disk ran at 0.54 GB/s, the
-  fixed adapter recomputed 1.52M prompt tokens against 0.95M for write-through, p95 13.5 s against 4.5 s. Most of
-  it came from sessions the rule left in the CPU tier to spill at eviction: the slower GPU kept more sessions in
-  flight, and the eviction-time writes fell behind. The rule prices a spill as a delay to others, not the chance
-  it is not done when the session returns. Pricing that would move those sessions to an early write; not tested.
+- **CPU-tier pressure the rule does not foresee can beat it.** On a PCIe A100 (disk 0.54 GB/s), the fixed
+  adapter recomputed 1.52M prompt tokens against 0.95M for write-through, p95 13.5 s against 4.5 s. On every box
+  the rule kept about 94% of sessions in the CPU tier with no disk copy, expecting the tier to hold them. On the
+  fast boxes it did. On this box the slower GPU kept more sessions in flight, the tier evicted more, and those
+  sessions recomputed; write-through had a disk copy of each. No fix is tested.
 - **Write-back on eviction (KD) is a negative result on vLLM 0.30.** vLLM frees an evicted CPU slot at once, so the
   adapter writes chunks ahead of eviction, and the write pins them. Bursts of pinned chunks starve the CPU tier, and
   the arm recomputes about as much as having no disk (p95 1.67x T). A clean version needs write-on-evict inside vLLM's
