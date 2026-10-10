@@ -32,11 +32,34 @@ Decision rules (spec file, --spec): tests run in order:
   {"name": "H4a", "rule": "pooled", "cells": [...], "pair": "K:K_ewma", "threshold": 1.0, "metric": "p95"}
                           the geometric mean over the cells of the per-cell estimands (equal cell weights),
                           Welch-Satterthwaite df; holds if its upper bound is below the threshold
+  {"name": "H5b", "rule": "throughput_tost", "cells": "all", "pair": "K:C0", "margin": 0.10}
+                          open-loop sweeps (below): holds if in every cell the host-bootstrap bounds of the peak
+                          sustainable rate ratio lie inside (1 - margin, 1 + margin)
+  {"name": "H6", "rule": "kendall", "sim": {cell: {arm: predicted p95 ratio}} or a JSON path, "reference": "C0",
+   "threshold": 0.6}      per cell, Kendall tau-b between the simulator's ratios and the engine's p95 ratios to the
+                          reference, engine arms whose host-level bounds overlap counted as ties (the reference is
+                          1 with no width); holds if the mean over cells reaches the threshold (an undefined tau,
+                          one side all ties, counts as 0)
 and "holm": [["H4a", "H4b"], ...] adjusts one-sided p-values (H0: ratio >= threshold; an IUT's p-value is the
 largest of its parts) within each group by Holm at alpha. Spec keys "best" ({cell: arm}) and "alpha" are optional.
 
+Live scoring validity: a run whose hinted turns fell back to the precomputed curve (no side-file row, a failed or
+late scoring call) on more than 1% of turns is invalid (plan section 1): it is left out of the common set and
+every pair, and listed under invalid_runs.
+
+Open-loop sweeps (H5 throughput half): runs named CELL__ARM__HOST__rate<R>.jsonl. Per (cell, arm, host): every
+request's TTFT; a rate is sustainable when the served p95 is under the cell's SLO (spec "slo": {cell: seconds})
+and at most 1% of requests failed or were censored; the peak sustainable rate is found by linear interpolation
+between the last sustainable rate and the next one. Per pair: per-host ratios, geometric mean, a bootstrap over
+hosts (the repeats) and the t bounds.
+
+Run order (--order {host: ["cell/arm", ...]}): per pair, OLS of the per-host log p95 ratio on the position
+difference pos(X) - pos(Y) across hosts, the slope with one-sided bounds at alpha (df = n - 2), as a sensitivity
+analysis beside the primary estimate.
+
 Usage: analyze_phase_r.py DIR [--pair K:C0 ...] [--best CELL=ARM ...] [--spec spec.json] [--alpha 0.05]
-       [--boot 10000] [--seed 0] [--out result.json]
+       [--boot 10000] [--seed 0] [--order order.json]
+       [--out result.json]
 """
 import argparse
 import glob
@@ -149,11 +172,33 @@ def load_dir(d):
     runs, skipped = {}, []
     for f in sorted(glob.glob(os.path.join(d, "*.jsonl"))):
         parts = os.path.basename(f)[:-6].split("__")
+        if len(parts) == 4 and rate_of(parts[3]) is not None:
+            continue                                      # an open-loop sweep run: load_sweeps
         if len(parts) != 3 or not all(parts):
             skipped.append(os.path.basename(f)); continue
         cell, arm, host = parts
         runs.setdefault(cell, {}).setdefault(host, {})[arm] = load_run(f)
     return runs, skipped
+
+
+def rate_of(tag):
+    if not tag.startswith("rate"):
+        return None
+    try:
+        return float(tag[4:])
+    except ValueError:
+        return None
+
+
+def load_sweeps(d):
+    """{cell: {host: {arm: {rate: run}}}} from open-loop runs named CELL__ARM__HOST__rate<R>.jsonl."""
+    sweeps = {}
+    for f in sorted(glob.glob(os.path.join(d, "*.jsonl"))):
+        parts = os.path.basename(f)[:-6].split("__")
+        if len(parts) == 4 and all(parts) and rate_of(parts[3]) is not None:
+            cell, arm, host, tag = parts
+            sweeps.setdefault(cell, {}).setdefault(host, {}).setdefault(arm, {})[rate_of(tag)] = load_run(f)
+    return sweeps
 
 
 # --- per run --------------------------------------------------------------------------------------
@@ -203,11 +248,22 @@ def run_metrics(run, common, served_all):
         m["concurrency"] = dict(peak=int(s[:, 1].max()),
                                 mean=float((s[:-1, 1] * dt).sum() / dt.sum()) if dt.sum() > 0 else None)
     if run["curves"]:
-        d = [c["max_abs_diff"] for c in run["curves"] if c.get("max_abs_diff") is not None]
-        m["live"] = dict(compared=len(d), max_abs_diff=max(d) if d else None,
-                         missing=sum(1 for c in run["curves"] if c.get("live_missing")),
-                         errors=sum(1 for c in run["curves"] if c.get("live_error")))
+        m["live"] = live_check(run["curves"])
     return m
+
+
+LIVE_FLAG_MAX = 0.01      # plan section 1: more than 1% flagged turns (fallback curve used) invalidates a K run
+
+
+def live_check(curves):
+    """Live scoring: max |live - precomputed|, and the share of hinted turns that fell back to the precomputed
+    curve (no side-file row, or a failed or late scoring call). Over LIVE_FLAG_MAX the run is invalid."""
+    d = [c["max_abs_diff"] for c in curves if c.get("max_abs_diff") is not None]
+    missing = sum(1 for c in curves if c.get("live_missing"))
+    errors = sum(1 for c in curves if c.get("live_error"))
+    frac = (missing + errors) / len(curves)
+    return dict(hinted=len(curves), compared=len(d), max_abs_diff=max(d) if d else None, missing=missing,
+                errors=errors, flagged_frac=frac, valid=frac <= LIVE_FLAG_MAX)
 
 
 def tiers(mets):
@@ -307,8 +363,24 @@ def resolve(arm, cell, best):
     return arm
 
 
+def drop_invalid(runs):
+    """Runs whose live scoring fell back on more than 1% of turns are invalid (plan section 1): they leave the
+    analysis (common set and pairs) and are listed; the protocol reruns the host's block."""
+    kept, invalid = {}, {}
+    for cell, hosts in runs.items():
+        for host, arms in hosts.items():
+            for arm, run in arms.items():
+                lc = live_check(run["curves"]) if run["curves"] else None
+                if lc is not None and not lc["valid"]:
+                    invalid[f"{cell}__{arm}__{host}"] = lc
+                else:
+                    kept.setdefault(cell, {}).setdefault(host, {})[arm] = run
+    return kept, invalid
+
+
 def analyze(runs, pairs, best, alpha, boot, seed):
-    out = dict(runs={}, pairs={})
+    runs, invalid = drop_invalid(runs)
+    out = dict(runs={}, pairs={}, invalid_runs=invalid)
     per = {}                       # (cell, host, arm) -> metrics
     common = {}
     for cell, hosts in runs.items():
@@ -387,12 +459,18 @@ def holm(pvals, alpha):
     return out
 
 
+def load_sim(sim):
+    return json.load(open(sim)) if isinstance(sim, str) else sim
+
+
 def run_tests(spec, res, alpha):
     cells_all = sorted(res["pairs"])
     tests = {}
     for t in spec.get("tests", []):
-        cells = cells_all if t.get("cells") == "all" else t["cells"]
+        cells = cells_all if t.get("cells", "all") == "all" else t["cells"]
         met = t.get("metric", "p95")
+        if t["rule"] in ("throughput_tost", "kendall"):
+            continue                                      # handled in main (they need the sweeps / the simulator)
         if t["rule"] == "pooled":
             logs, used = [], []
             for c in cells:
@@ -423,11 +501,173 @@ def run_tests(spec, res, alpha):
                                     holds=bool(parts) and all(tost(x["lower"], x["upper"], t["margin"]) for x in parts))
         else:
             raise ValueError(f"unknown rule {t['rule']}")
+    for t in spec.get("tests", []):
+        if t["rule"] == "kendall":
+            sim = load_sim(t["sim"])
+            cells = sorted(sim) if t.get("cells", "all") == "all" else t["cells"]
+            tests[t["name"]] = h6(res, sim, t.get("reference", "C0"), cells, t["threshold"])
+        elif t["rule"] == "throughput_tost":
+            tp = res.get("throughput", {}).get("pairs", {})
+            cells = sorted(tp) if t.get("cells", "all") == "all" else t["cells"]
+            parts = []
+            for c in cells:
+                b = (tp.get(c, {}).get(t["pair"]) or {}).get("bootstrap")
+                parts.append(dict(cell=c, lower=b and b["lower"], upper=b and b["upper"], gm=b and b["gm"]))
+            tests[t["name"]] = dict(rule="throughput_tost", pair=t["pair"], margin=t["margin"], parts=parts,
+                                    holds=bool(parts) and all(tost(x["lower"], x["upper"], t["margin"]) for x in parts))
     for group in spec.get("holm", []):
         adj = holm({g: tests[g]["p"] for g in group}, alpha)
         for g, (pa, rej) in adj.items():
             tests[g]["holm"] = dict(group=group, p_adj=pa, holds=rej)
     return tests
+
+
+# --- H5 throughput half: open-loop rate sweeps -------------------------------------------------------
+BAD_MAX = 0.01            # a rate is sustainable only with at most 1% failed or censored requests
+
+
+def sweep_point(run):
+    """One open-loop run at a fixed rate: p95 TTFT over served requests (every row: open-loop requests do not
+    resume a session) and the share of failed or censored requests."""
+    T = list(run["turns"].values())
+    served = [t["ttft"] for t in T if t["status"] == "served"]
+    return dict(n=len(T), p95=quantile(served, .95), bad_frac=(len(T) - len(served)) / len(T) if T else 1.0)
+
+
+def peak_rate(points, slo):
+    """points {rate: sweep_point}. Excess g(rate) = max(p95 / slo, bad_frac / BAD_MAX); sustainable when g <= 1.
+    Going up from the lowest rate, the peak is where g crosses 1 between the last sustainable rate and the next
+    one, by linear interpolation in g (a later rate that passes again does not count). Every rate sustainable:
+    the top rate, flagged above_grid (a lower bound). The lowest rate not sustainable: None, below_grid."""
+    rates = sorted(points)
+    g = []
+    for r in rates:
+        p = points[r]
+        x = max(p["p95"] / slo, p["bad_frac"] / BAD_MAX)
+        g.append(INF if math.isnan(x) else x)
+    out = dict(rates=rates, excess=g)
+    if g[0] > 1:
+        return dict(out, peak=None, below_grid=True)
+    i = 0
+    while i + 1 < len(rates) and g[i + 1] <= 1:
+        i += 1
+    if i + 1 == len(rates):
+        return dict(out, peak=rates[-1], above_grid=True)
+    r0, r1, g0, g1 = rates[i], rates[i + 1], g[i], g[i + 1]
+    peak = r0 if g1 == INF else r0 + (1 - g0) / (g1 - g0) * (r1 - r0)
+    return dict(out, peak=peak)
+
+
+def host_bootstrap(logs, alpha, B, seed):
+    """Resample hosts (the repeats) with replacement; percentile bounds of the geometric mean."""
+    logs = np.asarray(logs, float)
+    if len(logs) < 2 or not np.all(np.isfinite(logs)):
+        return None
+    rng = np.random.default_rng(seed)
+    g = logs[rng.integers(0, len(logs), size=(B, len(logs)))].mean(axis=1)
+    return dict(B=B, n=len(logs), gm=math.exp(logs.mean()), lower=math.exp(np.quantile(g, alpha)),
+                upper=math.exp(np.quantile(g, 1 - alpha)))
+
+
+def throughput(sweeps, pairs, slo, alpha, B, seed):
+    """Peak sustainable rate per (cell, arm, host) and, per pair X:Y, the per-host ratios, their geometric mean, a
+    bootstrap over hosts and the host-level t bounds."""
+    out = dict(peaks={}, pairs={})
+    for cell, hosts in sweeps.items():
+        if cell not in slo:
+            continue
+        for host, arms in hosts.items():
+            for arm, pts in arms.items():
+                pk = peak_rate({r: sweep_point(run) for r, run in pts.items()}, slo[cell])
+                out["peaks"][f"{cell}__{arm}__{host}"] = pk
+        for spec in pairs:
+            x, y = spec.split(":")
+            hs = sorted(h for h in hosts if x in hosts[h] and y in hosts[h])
+            if not hs:
+                continue
+            pk = {h: (out["peaks"][f"{cell}__{x}__{h}"]["peak"], out["peaks"][f"{cell}__{y}__{h}"]["peak"]) for h in hs}
+            r = {h: (a / b if a is not None and b else None) for h, (a, b) in pk.items()}
+            ok = all(v is not None and v > 0 for v in r.values())
+            logs = [math.log(v) for v in r.values()] if ok else []
+            out["pairs"].setdefault(cell, {})[spec] = dict(
+                per_host=r, slo=slo[cell], gm=math.exp(np.mean(logs)) if ok else None,
+                bootstrap=host_bootstrap(logs, alpha, B, seed) if ok else None,
+                t=t_bounds(logs, alpha) if ok else None,
+                above_grid=[h for h in hs for a in (x, y) if out["peaks"][f"{cell}__{a}__{h}"].get("above_grid")])
+    return out
+
+
+# --- H6: simulator fidelity ---------------------------------------------------------------------
+def kendall_tau_b(sim, est, lo, hi):
+    """Kendall tau-b between the simulator's values and the engine's, where two engine arms whose intervals
+    [lo, hi] overlap are tied (and two equal simulator values are tied). None when either side is all ties."""
+    arms = sorted(sim)
+    nc = nd = t1 = t2 = n0 = 0
+    for i in range(len(arms)):
+        for j in range(i + 1, len(arms)):
+            a, b = arms[i], arms[j]
+            n0 += 1
+            ss = np.sign(sim[a] - sim[b])
+            es = 0 if (lo[a] <= hi[b] and lo[b] <= hi[a]) else np.sign(est[a] - est[b])
+            t1 += ss == 0; t2 += es == 0
+            nc += ss * es > 0; nd += ss * es < 0
+    den = math.sqrt((n0 - t1) * (n0 - t2))
+    return (nc - nd) / den if den else None
+
+
+def h6(res, sim, ref, cells, threshold):
+    """Per cell: the engine's p95 ratio of every simulator arm to the reference arm, with its host-level bounds
+    (the reference arm is 1 with no width), against the simulator's predicted ratios. An undefined tau counts as 0
+    toward the mean (no agreement shown)."""
+    per = {}
+    for c in cells:
+        est, lo, hi, missing = {}, {}, {}, []
+        for arm in sim.get(c, {}):
+            if arm == ref:
+                est[arm] = lo[arm] = hi[arm] = 1.0; continue
+            r = res["pairs"].get(c, {}).get(f"{arm}:{ref}")
+            t = r and r["p95"]["t"]
+            if not t:
+                missing.append(arm); continue
+            est[arm], lo[arm], hi[arm] = t["gm"], t["lower"], t["upper"]
+        sv = {a: sim[c][a] for a in est}
+        tau = kendall_tau_b(sv, est, lo, hi) if len(est) >= 2 else None
+        per[c] = dict(tau=tau, arms=sorted(est), missing=missing, engine=est, engine_lower=lo, engine_upper=hi)
+    taus = [0.0 if v["tau"] is None else v["tau"] for v in per.values()]
+    mean = float(np.mean(taus)) if taus else None
+    return dict(rule="kendall", per_cell=per, mean=mean, threshold=threshold,
+                undefined=[c for c, v in per.items() if v["tau"] is None],
+                holds=mean is not None and mean >= threshold)
+
+
+# --- run-order covariate ----------------------------------------------------------------------------
+def order_sensitivity(res, order, alpha):
+    """order {host: ["cell/arm", ...]} in run order. Per pair X:Y: regress the per-host log p95 ratio on the
+    position difference pos(X) - pos(Y) across hosts (OLS with intercept, df = n - 2). Reports the slope (log ratio
+    per position), its one-sided bounds at alpha, and the intercept as a ratio (the estimate at no difference)."""
+    pos = {h: {e: i for i, e in enumerate(lst)} for h, lst in order.items()}
+    out = {}
+    for cell, ps in res["pairs"].items():
+        for name, r in ps.items():
+            X, Y = r["x"], r["y"]
+            hs = [h for h in r["p95"]["per_host"] if h in pos and f"{cell}/{X}" in pos[h] and f"{cell}/{Y}" in pos[h]]
+            d = np.array([pos[h][f"{cell}/{X}"] - pos[h][f"{cell}/{Y}"] for h in hs], float)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                y = np.log(np.array([r["p95"]["per_host"][h] for h in hs], float))
+            rec = dict(hosts=hs, position_diff=d.tolist(), n=len(hs))
+            sxx = ((d - d.mean()) ** 2).sum() if len(d) else 0.0
+            if len(hs) >= 3 and sxx > 0 and np.all(np.isfinite(y)):
+                b = ((d - d.mean()) * (y - y.mean())).sum() / sxx
+                a0 = y.mean() - b * d.mean()
+                s2 = ((y - a0 - b * d) ** 2).sum() / (len(hs) - 2)
+                se = math.sqrt(s2 / sxx)
+                q = stats.t.ppf(1 - alpha, len(hs) - 2)
+                rec.update(slope=b, lower=b - q * se, upper=b + q * se, se=se, df=len(hs) - 2,
+                           per_position=math.exp(b), intercept_ratio=math.exp(a0))
+            else:
+                rec["slope"] = None
+            out.setdefault(cell, {})[name] = rec
+    return out
 
 
 def main(argv=None):
@@ -439,18 +679,33 @@ def main(argv=None):
     ap.add_argument("--alpha", type=float, default=None)
     ap.add_argument("--boot", type=int, default=10000)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--order", help="JSON {host: [\"cell/arm\", ...]} in run order: adds the position sensitivity")
     ap.add_argument("--out")
     a = ap.parse_args(argv)
     spec = json.load(open(a.spec)) if a.spec else {}
     alpha = a.alpha if a.alpha is not None else spec.get("alpha", 0.05)
     best = dict(spec.get("best", {}))
     best.update(dict(x.split("=", 1) for x in a.best))
-    pairs = list(dict.fromkeys(a.pair + [p for t in spec.get("tests", []) for p in t.get("pairs", [t.get("pair")]) if p]))
+    tests = spec.get("tests", [])
+    pairs = [p for t in tests if t["rule"] not in ("throughput_tost", "kendall") for p in t.get("pairs", [t.get("pair")]) if p]
+    for t in tests:                                       # H6 needs every simulator arm against the reference
+        if t["rule"] == "kendall":
+            sim = load_sim(t["sim"])
+            pairs += [f"{arm}:{t.get('reference', 'C0')}" for c in sim for arm in sim[c] if arm != t.get("reference", "C0")]
+    pairs = list(dict.fromkeys(a.pair + pairs))
+    tp_pairs = list(dict.fromkeys(t["pair"] for t in tests if t["rule"] == "throughput_tost"))
     runs, skipped = load_dir(a.d)
     if skipped:
         print("ignored (not CELL__ARM__HOST.jsonl):", ", ".join(skipped), file=sys.stderr)
     res = analyze(runs, pairs, best, alpha, a.boot, a.seed)
     res.update(alpha=alpha, best=best, ignored=skipped)
+    sweeps = load_sweeps(a.d)
+    if sweeps:
+        res["throughput"] = throughput(sweeps, tp_pairs, spec.get("slo", {}), alpha, a.boot, a.seed)
+    if a.order:
+        res["order_sensitivity"] = order_sensitivity(res, json.load(open(a.order)), alpha)
+    for name in res["invalid_runs"]:
+        print(f"INVALID (live scoring fell back on over {LIVE_FLAG_MAX:.0%} of turns): {name}", file=sys.stderr)
     if spec.get("tests"):
         res["tests"] = run_tests(spec, res, alpha)
     for cell, ps in sorted(res["pairs"].items()):

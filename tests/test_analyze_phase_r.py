@@ -210,3 +210,106 @@ def test_spec_end_to_end(tmp_path):
     assert set(res["pairs"]["slow"]) == {"K:C0", "K:best"}
     assert res["pairs"]["slow"]["K:best"]["y"] == "C0"
     assert json.load(open(tmp_path / "res.json"))["alpha"] == 0.05
+
+
+# --- live-scoring validity ----------------------------------------------------------------------------
+def with_curves(run, n, flagged):
+    run["curves"] = [dict(curve=f"s-{i}", pre=[.5] * 15, live=[.5] * 15, max_abs_diff=0.0) for i in range(n - flagged)] \
+        + [dict(curve=f"f-{i}", pre=[.5] * 15, live_missing=True) for i in range(flagged)]
+    return run
+
+
+def test_live_fallback_over_one_percent_invalidates_the_run():
+    rng = np.random.default_rng(5)
+    runs = synth(0.7, 3, rng)
+    with_curves(runs["cell"]["h0"]["K"], 100, 2)                 # 2%: invalid
+    with_curves(runs["cell"]["h1"]["K"], 100, 1)                 # 1%: valid (more than 1% invalidates)
+    res = A.analyze(runs, ["K:C0"], {}, 0.05, 0, 0)
+    assert list(res["invalid_runs"]) == ["cell__K__h0"] and res["invalid_runs"]["cell__K__h0"]["flagged_frac"] == 0.02
+    assert res["pairs"]["cell"]["K:C0"]["hosts"] == ["h1", "h2"]
+    assert res["runs"]["cell__K__h1"]["live"]["valid"] and "cell__K__h0" not in res["runs"]
+
+
+# --- H5 throughput half ---------------------------------------------------------------------------------
+def pts(p95s, bad=None):
+    return {r: dict(n=100, p95=v, bad_frac=(bad or {}).get(r, 0.0)) for r, v in p95s.items()}
+
+
+def test_peak_rate_interpolates_and_flags_the_grid_edges():
+    pk = A.peak_rate(pts({1: .5, 2: .8, 3: 1.4, 4: .9}), 1.0)
+    assert pk["peak"] == pytest.approx(2 + 0.2 / 0.6)              # rate 4 passing again does not count
+    pk = A.peak_rate(pts({1: .5, 2: .5}, bad={2: .03}), 1.0)        # failures, not latency, end it: g = 3 at rate 2
+    assert pk["peak"] == pytest.approx(1 + 0.5 / 2.5)
+    assert A.peak_rate(pts({1: .5, 2: .6}), 1.0) == dict(rates=[1, 2], excess=[.5, .6], peak=2, above_grid=True)
+    assert A.peak_rate(pts({1: 1.5, 2: 2.0}), 1.0)["peak"] is None
+
+
+def test_throughput_sweep_end_to_end(tmp_path):
+    f = {"h1": 1.02, "h2": 0.98, "h3": 1.0}
+    for h, fh in f.items():
+        for arm, scale in (("C0", 1.0), ("K", fh)):
+            for r in (1, 2, 3, 4, 5):
+                write(tmp_path / f"tp__{arm}__{h}__rate{r}.jsonl", [row(f"q{i}", 0, 0.2 * r * scale) for i in range(100)])
+    spec = dict(slo={"tp": 0.7}, tests=[dict(name="H5b", rule="throughput_tost", pair="K:C0", margin=0.10),
+                                        dict(name="H5b_tight", rule="throughput_tost", pair="K:C0", margin=0.005)])
+    (tmp_path / "spec.json").write_text(json.dumps(spec))
+    res = A.main([str(tmp_path), "--spec", str(tmp_path / "spec.json"), "--boot", "2000"])
+    assert res["ignored"] == [] and res["pairs"] == {}
+    assert res["throughput"]["peaks"]["tp__C0__h1"]["peak"] == pytest.approx(3.5)
+    per = res["throughput"]["pairs"]["tp"]["K:C0"]["per_host"]
+    for h, fh in f.items():                                         # peak where 0.2 r fh = 0.7, inside (3, 4)
+        assert per[h] == pytest.approx((3.5 / fh) / 3.5, rel=1e-9)
+    assert res["tests"]["H5b"]["holds"] and not res["tests"]["H5b_tight"]["holds"]
+
+
+# --- H6 ------------------------------------------------------------------------------------------------------
+def test_kendall_tau_b_matches_scipy_and_counts_overlaps_as_ties():
+    from scipy import stats
+    rng = np.random.default_rng(2)
+    for _ in range(20):
+        sim = {f"a{i}": float(v) for i, v in enumerate(rng.integers(0, 4, 6))}      # with ties
+        est = {a: float(rng.normal()) for a in sim}
+        want = stats.kendalltau([sim[a] for a in sorted(sim)], [est[a] for a in sorted(sim)]).statistic
+        assert A.kendall_tau_b(sim, est, est, est) == pytest.approx(want)
+    sim = {"a": 1, "b": 2, "c": 3}
+    est = {"a": 1.0, "b": 1.1, "c": 3.0}
+    lo, hi = {"a": .9, "b": 1.0, "c": 2.9}, {"a": 1.05, "b": 1.2, "c": 3.1}                # a and b overlap
+    assert A.kendall_tau_b(sim, est, lo, hi) == pytest.approx(2 / math.sqrt(3 * 2))
+    assert A.kendall_tau_b(sim, est, {a: 0 for a in sim}, {a: 9 for a in sim}) is None   # all tied
+
+
+def test_h6_end_to_end():
+    rng = np.random.default_rng(4)
+    base = {(f"s{s}", t): float(v) for s in range(30) for t in range(1, 6) for v in [rng.lognormal()]}
+    runs = {"cell": {}}
+    for h in range(4):
+        j = 1 + 0.01 * rng.normal(size=2)
+        runs["cell"][f"h{h}"] = {"C0": run_of(base), "K": run_of({k: v * 0.6 * j[0] for k, v in base.items()}),
+                                 "T": run_of({k: v * 0.9 * j[1] for k, v in base.items()})}
+    sim_good = {"cell": {"C0": 1.0, "K": 0.5, "T": 0.8}}
+    sim_bad = {"cell": {"C0": 1.0, "K": 0.8, "T": 0.5}}
+    res = A.analyze(runs, ["K:C0", "T:C0"], {}, 0.05, 0, 0)
+    good = A.h6(res, sim_good, "C0", ["cell"], 0.6)
+    bad = A.h6(res, sim_bad, "C0", ["cell"], 0.6)
+    assert good["mean"] == pytest.approx(1.0) and good["holds"]
+    assert bad["mean"] == pytest.approx(1 / 3) and not bad["holds"]
+
+
+# --- run-order covariate ------------------------------------------------------------------------------------
+def test_order_sensitivity_recovers_a_position_slope():
+    rng = np.random.default_rng(9)
+    d = {"h1": -2, "h2": -1, "h3": 1, "h4": 2, "h5": 3}
+    order, per = {}, {}
+    for h, dh in d.items():                       # K at position 3 + dh, C0 at 3
+        lst = [f"x/{i}" for i in range(8)]
+        lst[3] = "c/C0"; lst[3 + dh] = "c/K"
+        order[h] = lst
+        per[h] = math.exp(math.log(0.8) + 0.05 * dh + 0.01 * rng.normal())
+    order["h9"] = ["c/K", "c/C0"]                 # not in the pair: ignored
+    res = {"pairs": {"c": {"K:C0": dict(x="K", y="C0", p95=dict(per_host=per))}}}
+    o = A.order_sensitivity(res, order, 0.05)["c"]["K:C0"]
+    assert o["n"] == 5 and o["position_diff"] == [-2, -1, 1, 2, 3]
+    assert o["lower"] < 0.05 < o["upper"] and o["upper"] - o["lower"] < 0.05
+    assert o["intercept_ratio"] == pytest.approx(0.8, rel=0.03)
+    res["pairs"]["c"]["K:C0"]["p95"]["per_host"] = {h: per[h] for h in ("h1", "h2")}
+    assert A.order_sensitivity(res, order, 0.05)["c"]["K:C0"]["slope"] is None          # n < 3
