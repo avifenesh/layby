@@ -40,6 +40,13 @@ assert np.allclose(K["tool"], km([2, 4, 8, 1])) and np.allclose(K["human"], km([
 assert np.allclose(K["all"], km([2, 4, 100, 8, 600, 1])) and K["_n"] == {"human": 2, "tool": 4, "all": 6}
 Kc = fit_km(sessions, cap=300)
 assert np.allclose(Kc["human"], km([100, 300]))
+assert "_censored" not in K
+# a wait that never returned ("returned": false) is censored at its gap; unmarked turns stay returns
+cens = copy.deepcopy(sessions); cens[1]["turns"][0]["returned"] = False
+Kx = fit_km(cens)
+assert np.allclose(Kx["human"], km([100, 600], [1, 0])) and np.allclose(Kx["tool"], K["tool"])
+assert np.allclose(Kx["all"], km([2, 4, 100, 8, 600, 1], [1, 1, 1, 1, 0, 1]))
+assert Kx["_censored"] == {"human": 1, "tool": 0, "all": 1} and Kx["_n"] == K["_n"]
 
 # --- 3. session curves ------------------------------------------------------------------------------------------
 C = session_curves(sessions[0]["turns"], K, alpha=0.5)

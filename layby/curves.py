@@ -17,7 +17,8 @@ K_ewma a per-session curve from the session's own past waits of the same kind: a
 
 A curve is P(T > t) at the horizons E2 (layby.rule.E2), T the seconds from the turn's end to the session's next
 request. Gaps as stored in the workload (the engine workloads cap them at the replay cap, a longer wait being a
-return at the cap; pass --cap to fit on the same capped scale).
+return at the cap; pass --cap to fit on the same capped scale). A fitting turn with "returned": false is a wait that
+never ended in a return (the session's last boundary): KM censors it at its gap_after.
 
 CLI:
   python -m layby.curves fit-km SRC.json [SRC2.json ...] --out km.json [--cap 300]
@@ -46,18 +47,12 @@ def km(gaps, events=None, H=E2):
     e = np.ones(len(g), bool) if events is None else np.asarray(events, bool)
     order = np.argsort(g, kind="stable")
     g, e = g[order], e[order]
-    ts = np.unique(g[e])
-    s = 1.0
-    j = 0
-    out = np.empty(len(H))
-    for i, h in enumerate(H):
-        while j < len(ts) and ts[j] <= h:
-            t = ts[j]
-            at_risk = np.count_nonzero(g >= t)
-            d = np.count_nonzero((g == t) & e)
-            s *= 1.0 - d / at_risk
-            j += 1
-        out[i] = s
+    ut, first = np.unique(g, return_index=True)       # distinct times, the first sorted index of each
+    at_risk = len(g) - first                           # waits >= t
+    d = np.add.reduceat(e.astype(float), first)        # returns at t
+    S = np.cumprod(1.0 - d / at_risk)
+    k = np.searchsorted(ut, np.asarray(H, float), side="right") - 1   # last distinct time <= h
+    out = np.where(k >= 0, S[np.maximum(k, 0)], 1.0)
     return out
 
 
@@ -67,19 +62,22 @@ def _turns(sessions, cap=None):
             if t.get("gap_after") is None:
                 continue
             g = float(t["gap_after"])
-            yield t.get("kind") or "?", (min(g, cap) if cap is not None else g)
+            yield t.get("kind") or "?", (min(g, cap) if cap is not None else g), t.get("returned", True) is not False
 
 
 def fit_km(sessions, cap=None):
-    """{"<kind>": curve, ..., "all": curve} from every turn with a wait (gap_after not None)."""
-    by = {}
-    allg = []
-    for kind, g in _turns(sessions, cap):
-        by.setdefault(kind, []).append(g)
-        allg.append(g)
-    out = {k: km(v).tolist() for k, v in sorted(by.items())}
-    out["all"] = km(allg).tolist()
+    """{"<kind>": curve, ..., "all": curve} from every turn with a wait (gap_after not None); a turn with
+    "returned": false is censored at its wait. _n counts waits, _censored the censored ones."""
+    by, ev = {}, {}
+    allg, alle = [], []
+    for kind, g, e in _turns(sessions, cap):
+        by.setdefault(kind, []).append(g); ev.setdefault(kind, []).append(e)
+        allg.append(g); alle.append(e)
+    out = {k: km(v, ev[k]).tolist() for k, v in sorted(by.items())}
+    out["all"] = km(allg, alle).tolist()
     out["_n"] = {k: len(v) for k, v in sorted(by.items())} | {"all": len(allg)}
+    if not all(alle):
+        out["_censored"] = {k: len(v) - sum(v) for k, v in sorted(ev.items())} | {"all": len(alle) - sum(alle)}
     return out
 
 
