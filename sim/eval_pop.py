@@ -1,7 +1,9 @@
 """Run placement policies on workloads sampled from ReturnBench pools, in the engine simulator.
 
 A cell is (pool, n, disk). A workload draws n sessions from a pool (several pools joined with +, drawn
-evenly) with fresh starts uniform over 600 s. Each workload runs under `seeds` engine seeds at each disk
+evenly) with fresh starts uniform over 600 s. n = 0 with a replay workload file (engine/replay.py format, every
+session with its own start, e.g. a Phase R workload) runs that file as it is, every session at its start, so the
+workload index only names a repeat. Each workload runs under `seeds` engine seeds at each disk
 speed. Per cell and rule: the median over workloads of the per-workload median-over-seeds p50 and p95
 TTFT of returning turns, and the geometric mean over workloads of the ratio against C0.
 """
@@ -25,6 +27,14 @@ REFERENCE = [("swechat", 6), ("swechat", 12), ("swechat", 18), ("tracelab_claude
              ("tracelab_claude", 25), ("wildchat", 60), ("wildchat", 120), ("wildchat", 211),
              ("swechat+tracelab_claude+wildchat", 18), ("swechat+tracelab_claude+wildchat", 36)]
 DISKS = (0.5, 1.5, 3.0)
+# engine profiles: Params on top of CAL. glm53_flash: one TP4 GLM 5.3 Flash engine on 4x RTX PRO 6000, vLLM 0.31, as
+# the pre-registered GLM prediction (park-predictor tools/predict_glm53.py: constants from the 2026-10-08 round's
+# telemetry; CPU and disk tiers move all four ranks' latent copies, 30,316 B/token; att 0 fitted on C0 only)
+PROFILES = dict(
+    qwen3_8b={},
+    glm53_flash=dict(gpu_tokens=1178582, cpu_tokens=int(68719476736 // 30316.444), budget=4096, max_seqs=32, t0=0.170,
+                     f0=5.12e-5, att=0.0, cpu_gbps=52.4, kib=30316.444 / 1024, hbm_kib=7579 / 1024, bw=525e9),
+)
 # RETURNBENCH_KM: per-kind KM curves (python -m layby.curves fit-km, on waits outside the evaluated sessions) for the
 # cost_km and cost_ewma controls; returnbench eval --km sets it
 _KM = {}
@@ -144,6 +154,9 @@ def pool_path(name):
 
 
 def workload(pool, n, w):
+    if n == 0:                               # a replay workload file, run as it is
+        W = json.load(open(pool_path(pool)))
+        return dict(gap_cap=W.get("gap_cap", 300.0), ctx_cap=W.get("ctx_cap", 32768), sessions=W["sessions"])
     rng = np.random.default_rng(w)
     parts = pool.split("+")
     ss = []
@@ -158,18 +171,21 @@ def workload(pool, n, w):
 
 
 def run(job):
-    pool, n, w, seed, disk, name, curve, window, extra = job
+    pool, n, w, seed, disk, name, curve, window, extra = job[:9]
+    params = dict(CAL, **(job[9] if len(job) > 9 else {}))   # engine profile and overrides on top of CAL
     for spec in extra:                       # policies added with register() must exist in the worker too
         register(spec)
     W = workload(pool, n, w)
     rule = make_rule(name, W, curve)
-    rows, info = simulate(W, None if rule is None else "x", Params(seed=seed, disk_gbps=disk, window=window, **CAL), rule)
+    rows, info = simulate(W, None if rule is None else "x", Params(seed=seed, disk_gbps=disk, window=window, **params), rule)
     s = summarize(rows)
     return dict(pool=pool, n=n, w=w, seed=seed, disk=disk, rule=name, p50=s["p50"], p95=s["p95"], p99=s["p99"], warms=info["warms"])
 
 
-def evaluate(cells, rules, workloads=8, seeds=3, disks=DISKS, curve="v6", window=None, procs=8, extra=()):
-    jobs = [(p, n, w, s, d, r, curve, window, tuple(extra)) for p, n in cells for d in disks
+def evaluate(cells, rules, workloads=8, seeds=3, disks=DISKS, curve="v6", window=None, procs=8, extra=(), params=None):
+    """params: Params values on top of CAL (an engine profile, capacities); None keeps the reference engine."""
+    tail = (dict(params),) if params else ()
+    jobs = [(p, n, w, s, d, r, curve, window, tuple(extra)) + tail for p, n in cells for d in disks
             for w in range(workloads) for s in range(seeds) for r in rules]
     with Pool(procs) as P:
         return P.map(run, jobs, chunksize=1)

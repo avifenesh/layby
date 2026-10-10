@@ -84,7 +84,7 @@ class CostRule:
 
     def decide(self, v):
         t, p = v["turn"], v["p"]
-        p.bytes_per_token = KIB * 1024
+        p.bytes_per_token = getattr(p, "kib", KIB) * 1024
         d = decide(self.curve(t), v["tokens"], v["on_disk"], v["idle_g"], v["idle_c"], v["live"], p, v["now"],
                    **({"options": self.options} if self.options else {}),
                    **({"ablate": self.ablate} if self.ablate else {}))

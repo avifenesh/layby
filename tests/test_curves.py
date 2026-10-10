@@ -114,6 +114,25 @@ finally:
     os.unlink(kmp)
 print("sim ok: cost_km and cost_ewma[_aALPHA] read the curves layby.curves annotate gives the engine workload")
 
+# a replay workload with a context cut (keep) and the GLM profile: the cut turn reuses only its kept prefix
+from sim.engine_sim import Params, simulate
+wf = {"gap_cap": 300, "ctx_cap": 32768, "sessions": [{"id": "s0", "start": 0.0, "turns": [
+    dict(kind="tool", new_tokens=1000, out_len=10, ctx=1010, gap_after=1.0, keep=None),
+    dict(kind="tool", new_tokens=500, out_len=10, ctx=1520, gap_after=1.0, keep=None),
+    dict(kind="tool", new_tokens=300, out_len=10, ctx=410, gap_after=None, keep=100)]}]}
+fd, wp = tempfile.mkstemp(suffix=".json", dir=os.path.expanduser("~/.cache"))
+try:
+    with os.fdopen(fd, "w") as f:
+        json.dump(wf, f)
+    Wr = E.workload(wp, 0, 3)
+    assert [s["start"] for s in Wr["sessions"]] == [0.0] and len(Wr["sessions"][0]["turns"]) == 3
+    rows, _ = simulate(Wr, None, Params(**dict(E.CAL, **E.PROFILES["glm53_flash"])))
+    P = {r["turn"]: (r["P"], r["hit"]) for r in rows}
+    assert P[1] == (1510, 1010) and P[2] == (400, 100), P     # 100 kept + 300 new; only the 100 match
+finally:
+    os.unlink(wp)
+print("sim ok: replay workloads run as they are, a keep cut matches only the kept prefix")
+
 # --- 4. into the unchanged rule -------------------------------------------------------------------------------
 from types import SimpleNamespace as NS
 import layby.vllm.connector as PCm

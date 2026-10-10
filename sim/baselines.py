@@ -46,7 +46,7 @@ def _restore_c(v):
     p, live, now, N = v["p"], v["live"], v["now"], v["tokens"]
     lam = live.rate("n_cpu", now)
     wait = live.rate("wait_cpu", now) / lam if lam > 0 else 0.0
-    return wait + N * KIB * 1024 / (p.cpu_gbps * 1e9) + p.t0
+    return wait + N * getattr(p, "kib", KIB) * 1024 / (p.cpu_gbps * 1e9) + p.t0
 
 
 class _History:
