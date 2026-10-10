@@ -45,10 +45,18 @@ def interp_surv(P, t, H=E2):
     return np.exp((1 - w) * np.log(np.maximum(Pg[k], 1e-9)) + w * np.log(np.maximum(Pg[k + 1], 1e-9)))
 
 
-def decide(S, N, on_disk, idle_g, idle_c, live, p, now, options=OPTIONS):
+ABLATE = ("price", "ext", "W", "Q")
+
+
+def decide(S, N, on_disk, idle_g, idle_c, live, p, now, options=OPTIONS, ablate=()):
     """S: P(T > TG) for the idle period (interp_surv of the curve on TG). N: the session's KV tokens.
     on_disk: tokens of it already on disk. idle_g, idle_c: (age, tokens) of the idle periods still open
-    on the GPU and in the CPU tier. Returns dict(opt, eta, disk, first_out, tot)."""
+    on the GPU and in the CPU tier. ablate: cost terms set to zero, for ablations only (ABLATE: price
+    the CPU tier holding price, ext the delays to other requests, W the disk write's delay, Q the
+    admission wait before the KV lookup). Returns dict(opt, eta, disk, first_out, tot)."""
+    bad = set(ablate) - set(ABLATE)
+    if bad:
+        raise ValueError(f"unknown ablation {sorted(bad)}; known: {ABLATE}")
     Sg = np.concatenate([[1.0], S])
     m = Sg[:-1] - Sg[1:]                                            # T as atoms between grid points
     tm = np.sqrt(np.concatenate([[TG[0] / 2], TG[:-1]]) * TG)
@@ -58,6 +66,8 @@ def decide(S, N, on_disk, idle_g, idle_c, live, p, now, options=OPTIONS):
     npf = live.rate("pf", now)
     na = live.rate("n_adm", now)
     Q = live.rate("qwait", now) / na if na > 0 else 0.0             # mean wait for admission
+    if "Q" in ablate:
+        Q = 0.0
     tc_, td_ = b / (p.cpu_gbps * 1e9), b / (p.disk_gbps * 1e9)
     # per link: transfers per second and their mean queue wait; a transfer of x seconds delays the
     # ones that arrive while it waits and runs, about lam * (wait + x) of them, by x each
@@ -81,6 +91,8 @@ def decide(S, N, on_disk, idle_g, idle_c, live, p, now, options=OPTIONS):
     # that arrive (na per second) while it runs: about npf + na * x requests, each delayed by x
     prf = lambda x: (npf + na * x) * x
     ext = dict(c=dly("cpu", tc_) + blk * own["c"], d=dly("disk", td_) + dly("cpu", tc_) + blk * own["d"], r=prf(own["r"]))
+    if "ext" in ablate:
+        ext = dict.fromkeys(ext, 0.0)
     # without a new disk write, a miss past the CPU tier loads the disk copy the session already has
     # (the engine takes any external prefix) and recomputes the rest
     d0 = min(on_disk, N)
@@ -90,13 +102,15 @@ def decide(S, N, on_disk, idle_g, idle_c, live, p, now, options=OPTIONS):
         ext["o"] = dly("disk", f0 * td_) + dly("cpu", f0 * tc_) + blk * (own["o"] - rec(N - d0)) + prf(rec(N - d0))
     else:
         own["o"], ext["o"] = own["r"], ext["r"]
+    if "ext" in ablate:
+        ext["o"] = 0.0
     Rg = live.resid("g", now, idle_g); Rc = live.resid("c", now, idle_c)
     cumc = np.concatenate([[0.0], np.cumsum(np.diff(AG) * (Rc[1:] + Rc[:-1]) / 2)])
     g = lambda a: np.interp(a, AG, Rg)
     Gc = lambda a: np.interp(a, AG, cumc) + np.maximum(a - AG[-1], 0) * Rc[-1]
     ec = live.rate("w_c", now)
-    price_c = ec * live.lam("c", N / ec, now) if ec > 0 else 0.0     # seconds lost per second held
-    W = 0.0 if on_disk >= N else dly("disk", td_)                    # a disk write delays the link's other users
+    price_c = ec * live.lam("c", N / ec, now) if ec > 0 and "price" not in ablate else 0.0  # seconds lost per second held
+    W = 0.0 if on_disk >= N or "W" in ablate else dly("disk", td_)  # a disk write delays the link's other users
     ne = live.rate("ne_c", now)        # a first-out copy stays in the CPU tier until the tier's next eviction
     # in an LRU tier a copy is evicted once about C tokens newer than it came in, so while it sits there
     # the tier evicts at most about C tokens: at e tokens/s that bounds the time it costs price_c to C / e

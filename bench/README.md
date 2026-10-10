@@ -98,6 +98,9 @@ Sources, versions and licenses: [bench/LICENSES.md](LICENSES.md).
 | `cj` | Choi and Joshi (arXiv 2608.30830): GPU hold until the break-even time. |
 | `ka` | Serverless in the Wild (ATC '20): GPU keep-alive to the user's 99th percentile gap. |
 | `c_nopark`, `c_disk`, `o_disk` | Ablations of the cost rule and the oracle over option subsets. |
+| `wt2` | Frequency-gated write-through: a prefix goes to disk only once it has been reused (access count 2), as SGLang HiCache `write_through_selective` and NVIDIA Dynamo KVBM's frequency filter do. |
+| `cost_noprice`, `cost_noext`, `cost_noW`, `cost_noQ` | Ablations of the cost rule: one cost term set to zero (the CPU tier's holding price, the delays a restore causes others, the disk write's delay, the admission wait before the KV lookup). |
+| `cost_km`, `cost_kmpool`, `cost_kmsrc` | Controls with no learned model: the cost rule on a Kaplan-Meier curve per wait kind, one pooled curve, or one per source and kind. The shipped pools do not carry these curves; fit them on data outside the evaluated sessions, add them to each turn as `surv_km`, `surv_kmpool`, `surv_kmsrc` and pass `--pools DIR`. |
 
 ## Reference results
 
