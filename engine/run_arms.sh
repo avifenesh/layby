@@ -27,6 +27,10 @@
 #      (default 40960), BOOT_WAIT (5 s polls, default 180), REPLAY_TIMEOUT (s, default 5400), VOCAB (replay token
 #      ids, default 150000), WINDOW (replay --window seconds), PORT (default 8000), PARK_PORT (hint port, default
 #      8765). The server runs in its own session (setsid); cleanup kills only that process group.
+#      Phase R (engine/phase_r/orchestrate.py): SERVER_WRAP (a command prefix for the server and the LMCache server,
+#      e.g. "phase_r/cg_exec.sh CGROUP" to start them inside the arm's cgroup), ARM_HOOK (called as
+#      "ARM_HOOK EVENT ARM OUTDIR" with replay_start once the server is healthy and replay_end after the replay),
+#      PARK_HINTS (the curve arm K's client posts, default v6).
 set -u
 W=$1; O=$2; KV=$3; CPU=$4; DISK=$5; shift 5
 MODEL=${MODEL:-Qwen/Qwen3-8B}
@@ -50,7 +54,7 @@ for arm in "$@"; do
     K|K0|KW|KD|SM) pol='"eviction_policy":"ParkCachePolicy","cache_policy_module_path":"layby.vllm.policy"'
        tier=",\"spec_name\":\"TieringOffloadingSpec\",\"secondary_tiers\":[{\"type\":\"ParkFsTier\",\"module_path\":\"layby.vllm.fs_tier\",\"root_dir\":\"$DISK\",\"n_read_threads\":16,\"n_write_threads\":16}]"
        conn='"kv_connector":"ParkConnector","kv_connector_module_path":"layby.vllm.connector"'
-       extra=",\"park_port\":$PARK_PORT,\"park_prof\":1"; client="--park-hints v6 --park-port $PARK_PORT"
+       extra=",\"park_port\":$PARK_PORT,\"park_prof\":1"; client="--park-hints ${PARK_HINTS:-v6} --park-port $PARK_PORT"
        [ ${arm%%.*} = K0 ] && client=""                                  # no curves: the rule never runs
        [ ${arm%%.*} = SM ] && client=""                                  # smoke: restore gate, no replay
        [ ${arm%%.*} = KW ] && extra="$extra,\"park_write\":\"through\""   # write-through mode
@@ -65,12 +69,12 @@ for arm in "$@"; do
     OFF="{$conn,\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{$extra}}"
     LMX=""; [ ${arm%%.*} = LMR ] && LMX="--l2-prefetch-policy retain --eviction-trigger-watermark 0.95 --eviction-ratio 0.1"
     L2="{\"type\":\"nixl_store_dynamic\",\"backend\":\"POSIX\",\"backend_params\":{\"file_path\":\"$DISK\",\"use_direct_io\":\"true\",\"max_capacity_gb\":\"${LM_DISK_GB:-340}\"},\"persist_enabled\":false,\"eviction\":{\"eviction_policy\":\"LRU\",\"trigger_watermark\":0.9,\"eviction_ratio\":0.1}}"
-    setsid lmcache server --port ${LM_PORT:-6555} --http-port $(( ${LM_PORT:-6555} + 100 )) --chunk-size ${LM_CHUNK:-256} --separate-object-groups \
+    setsid ${SERVER_WRAP:-} lmcache server --port ${LM_PORT:-6555} --http-port $(( ${LM_PORT:-6555} + 100 )) --chunk-size ${LM_CHUNK:-256} --separate-object-groups \
       --l1-size-gb $(( CPU / 1073741824 )) --eviction-policy LRU $LMX --l2-adapter "$L2" > $O/$arm.lmcache.log 2>&1 &
     LMP=$!; sleep 20 ;;
   esac
   echo "=== arm $arm $(date -u +%H:%M:%S)"
-  setsid $VENV/bin/vllm serve $MODEL --port $PORT --max-model-len ${MAXLEN:-40960} --enable-prefix-caching \
+  setsid ${SERVER_WRAP:-} $VENV/bin/vllm serve $MODEL --port $PORT --max-model-len ${MAXLEN:-40960} --enable-prefix-caching \
     --kv-cache-memory-bytes $KV --max-num-seqs 64 --enable-prompt-tokens-details ${SERVE_ARGS:-} \
     --kv-transfer-config "$OFF" > $O/$arm.server.log 2>&1 &
   SP=$!
@@ -78,6 +82,7 @@ for arm in "$@"; do
   for i in $(seq 1 ${BOOT_WAIT:-180}); do curl -sf localhost:$PORT/health >/dev/null && break; kill -0 $SP 2>/dev/null || break; sleep 5; done
   curl -sf localhost:$PORT/health >/dev/null || { echo "server failed"; tail -30 $O/$arm.server.log; kill -9 -- -$SP ${LMP:+-$LMP} 2>/dev/null; wait $SP 2>/dev/null
     comm -13 <(echo "$SHM0") <(ls /dev/shm | grep '^vllm_offload_' | sort) | sed 's|^|/dev/shm/|' | xargs -r rm -f; continue; }
+  [ -n "${ARM_HOOK:-}" ] && $ARM_HOOK replay_start "$arm" "$O"
   if [ ${arm%%.*} = SM ] || [ ${arm%%.*} = LMS ]; then
     timeout ${REPLAY_TIMEOUT:-5400} $VENV/bin/python $ENGINE_DIR/smoke_restore.py --url http://127.0.0.1:$PORT --model $MODEL \
       --vocab ${VOCAB:-150000} ${SMOKE_ARGS:-} > $O/$arm.client.log 2>&1
@@ -85,6 +90,7 @@ for arm in "$@"; do
   timeout ${REPLAY_TIMEOUT:-5400} $VENV/bin/python $ENGINE_DIR/replay.py $W $O/$arm.jsonl --url http://127.0.0.1:$PORT --cpu-hint $src --prefetch $src --model $MODEL --vocab ${VOCAB:-150000} ${WINDOW:+--window $WINDOW} $client > $O/$arm.client.log 2>&1
   fi
   rc=$?
+  [ -n "${ARM_HOOK:-}" ] && $ARM_HOOK replay_end "$arm" "$O"
   case ${arm%%.*} in K|K0|KW|KD|SM) curl -sf localhost:$PARK_PORT/live > $O/$arm.park_live.json
                               curl -sf localhost:$PARK_PORT/prof > $O/$arm.prof.json
                               curl -sf localhost:$PARK_PORT/prof/windows > $O/$arm.profw.json ;; esac
