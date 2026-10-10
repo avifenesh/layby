@@ -14,13 +14,11 @@ test skips there.
 
 Run: python engine/phase_r/tests/test_sglang_fadvise.py
 """
-import importlib.util
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
-import types
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -30,78 +28,14 @@ import pagecache  # noqa: E402
 
 FIXTURE = os.path.join(HERE, "fixtures", "hicache_storage_v0.5.21.py")
 PATCH = os.path.join(PR, "sglang", "hicache_fadvise.patch")
+PATCH_SFR = os.path.join(PR, "sglang", "hicache_fadvise_sfr.patch")
 PAGE_BYTES = 8 << 20   # one stored page of 8 MiB (Qwen3-8B at page size 64 is 9 MiB)
 
-try:
-    import torch  # noqa: F401
-    HAVE_TORCH = True
-except Exception:
-    HAVE_TORCH = False
+sys.path.insert(0, os.path.join(PR, "sglang"))
+import hicache_write_pilot as pilot  # noqa: E402
 
-
-def _numpy_torch():
-    """The torch surface hicache_storage.py touches in set/get: uint8, Tensor, numel, element_size, view, contiguous,
-    numpy."""
-    import numpy as np
-    t = types.ModuleType("torch")
-    t.uint8 = np.uint8
-
-    class Tensor:
-        def __init__(self, a):
-            self.a = a
-        def numel(self):
-            return self.a.size
-        def element_size(self):
-            return self.a.itemsize
-        def contiguous(self):
-            return Tensor(np.ascontiguousarray(self.a))
-        def view(self, dtype=None):
-            return Tensor(self.a.view(dtype))
-        def numpy(self):
-            return self.a
-    t.Tensor = Tensor
-    t.from_numpy = Tensor
-    return t
-
-
-def _load(path, store_dir):
-    """Import hicache_storage.py from path with stubbed sglang.srt.environ and the LRU evictor."""
-    for k in [k for k in sys.modules if k == "sglang" or k.startswith("sglang.")]:
-        del sys.modules[k]
-    if not HAVE_TORCH:
-        sys.modules["torch"] = _numpy_torch()
-    class _Env:
-        def __init__(self, v):
-            self.v = v
-        def get(self):
-            return self.v
-    envs = types.SimpleNamespace(SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=_Env(store_dir),
-                                 SGLANG_HICACHE_FILE_BACKEND_ENABLE_METADATA_CACHE=_Env(False),
-                                 SGLANG_HICACHE_FILE_BACKEND_METADATA_TTL=_Env(None))
-    class LRUFileEvictor:
-        def __init__(self, *a, **k):
-            pass
-        def reserve(self, *a, **k):
-            return True
-        def commit(self, *a, **k):
-            pass
-        def touch(self, *a, **k):
-            pass
-        def abort(self, *a, **k):
-            pass
-        def clear(self):
-            pass
-    names = ["sglang", "sglang.srt", "sglang.srt.environ", "sglang.srt.mem_cache", "sglang.srt.mem_cache.storage",
-             "sglang.srt.mem_cache.storage.file", "sglang.srt.mem_cache.storage.file.lru_file_evictor"]
-    for n in names:
-        sys.modules[n] = types.ModuleType(n)
-    sys.modules["sglang.srt.environ"].envs = envs
-    sys.modules["sglang.srt.mem_cache.storage.file.lru_file_evictor"].LRUFileEvictor = LRUFileEvictor
-    spec = importlib.util.spec_from_file_location("sglang.srt.mem_cache.hicache_storage", path)
-    m = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = m
-    spec.loader.exec_module(m)
-    return m
+HAVE_TORCH = pilot.HAVE_TORCH
+_load = pilot.load_hicache   # v0.5.21's module with stubbed sglang.srt.environ and LRU evictor
 
 
 def _tensor(nbytes, fill):
@@ -158,6 +92,12 @@ class FadviseTest(unittest.TestCase):
                            capture_output=True, text=True)
         assert r.returncode == 0, r.stdout + r.stderr
         cls.patched = os.path.join(cls.patched_pkg, "sglang", "srt", "mem_cache", "hicache_storage.py")
+        cls.sfr_pkg = os.path.join(cls.tmp, "patched_sfr")
+        shutil.copytree(pkg, cls.sfr_pkg)
+        r = subprocess.run(["patch", "--forward", "-p2", "-d", cls.sfr_pkg], stdin=open(PATCH_SFR),
+                           capture_output=True, text=True)
+        assert r.returncode == 0, r.stdout + r.stderr
+        cls.sfr = os.path.join(cls.sfr_pkg, "sglang", "srt", "mem_cache", "hicache_storage.py")
 
     @classmethod
     def tearDownClass(cls):
@@ -187,6 +127,45 @@ class FadviseTest(unittest.TestCase):
               f"after warm read {r['warmed']}, after get {r['after_get']}")
 
 
+    def test_sync_file_range_variant_drops_pages(self):
+        # the pilot's alternative: sync_file_range on the data instead of fdatasync, then DONTNEED
+        text = open(self.sfr).read()
+        self.assertEqual((text.count("layby-fadvise"), text.count("layby-fadvise-sfr")), (3, 2))
+        self.assertNotIn("fdatasync", text)
+        r = _run(self.sfr, self._store("store_sfr"))
+        self.assertTrue(r["roundtrip"])
+        self.assertEqual(r["after_set"], 0, r)
+        self.assertGreater(r["warmed"], PAGE_BYTES // 2, r)
+        self.assertEqual(r["after_get"], 0, r)
+
+
+class WritePilot(unittest.TestCase):
+    """hicache_write_pilot.py: HC-wt's L3 write throughput per variant (the harness runs it under the cell's io.max)."""
+
+    def test_measures_every_variant(self):
+        base = os.environ.get("LAYBY_TEST_DIR", os.path.expanduser("~/.cache/layby-phase-r-test"))
+        os.makedirs(base, exist_ok=True)
+        if _fstype(base) in ("tmpfs", "ramfs"):
+            self.skipTest("RAM-backed")
+        d = tempfile.mkdtemp(dir=base)
+        try:
+            p = subprocess.run([sys.executable, os.path.join(PR, "sglang", "hicache_write_pilot.py"), "--dir", d,
+                                "--bytes", "64M", "--page-bytes", "8M"], capture_output=True, text=True, timeout=300)
+            self.assertEqual(p.returncode, 0, p.stderr[-2000:])
+            rows = {r["variant"]: r for r in map(__import__("json").loads, p.stdout.splitlines())}
+            self.assertEqual(sorted(rows), ["fdatasync", "stock", "sync_file_range"])
+            for r in rows.values():
+                self.assertEqual((r["pages"], r["failed_sets"]), (8, 0))
+                self.assertGreater(r["set_Bps"], 0)
+                self.assertGreaterEqual(r["set_Bps"], r["durable_Bps"])
+            self.assertGreater(rows["stock"]["cached_after"], 0)          # stock leaves its pages cached
+            self.assertEqual(rows["fdatasync"]["cached_after"], 0)
+            self.assertEqual(rows["sync_file_range"]["cached_after"], 0)
+            self.assertEqual(os.listdir(d), [])                            # its stores removed
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
 class ApplyScript(unittest.TestCase):
     """apply_patch.sh on a fake installed SGLang (the v0.5.21 file plus dist-info metadata on PYTHONPATH)."""
 
@@ -202,9 +181,9 @@ class ApplyScript(unittest.TestCase):
             f.write(f"Metadata-Version: 2.1\nName: sglang\nVersion: {version}\n")
         return site
 
-    def _run(self, site, mode):
+    def _run(self, site, mode, *variant):
         env = dict(os.environ, PYTHONPATH=site)
-        r = subprocess.run(["bash", os.path.join(PR, "sglang", "apply_patch.sh"), sys.executable, mode], env=env,
+        r = subprocess.run(["bash", os.path.join(PR, "sglang", "apply_patch.sh"), sys.executable, mode, *variant], env=env,
                            capture_output=True, text=True, timeout=60)
         return r.returncode, r.stdout.strip()
 
@@ -219,6 +198,27 @@ class ApplyScript(unittest.TestCase):
         self.assertEqual(rc, 0)
         with open(os.path.join(site, "sglang", "srt", "mem_cache", "hicache_storage.py")) as f:
             self.assertEqual(f.read().count("layby-fadvise"), 2)
+        shutil.rmtree(site)
+
+    def test_variant_switch(self):
+        # the pilot may switch the measured runs to sync_file_range: apply reverses the installed variant first
+        site = self._site("0.5.21")
+        f = os.path.join(site, "sglang", "srt", "mem_cache", "hicache_storage.py")
+        rc, out = self._run(site, "apply")
+        self.assertTrue(out.startswith("PATCHED 0.5.21 fdatasync"), out)
+        self.assertEqual(self._run(site, "check", "sync_file_range")[0], 1)
+        rc, out = self._run(site, "apply", "sync_file_range")
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(out.startswith("PATCHED 0.5.21 sync_file_range"), out)
+        text = open(f).read()
+        self.assertEqual((text.count("layby-fadvise"), text.count("layby-fadvise-sfr")), (3, 2))
+        self.assertNotIn("fdatasync", text)
+        self.assertEqual(self._run(site, "check", "sync_file_range")[0], 0)
+        self.assertEqual(self._run(site, "check")[0], 1)
+        rc, out = self._run(site, "apply", "fdatasync")
+        self.assertTrue(out.startswith("PATCHED 0.5.21 fdatasync"), out)
+        self.assertEqual(open(f).read().count("layby-fadvise-sfr"), 0)
+        self.assertEqual(self._run(site, "apply", "nosuch")[0], 2)
         shutil.rmtree(site)
 
     def test_refuses_other_versions(self):

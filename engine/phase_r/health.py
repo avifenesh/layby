@@ -15,9 +15,19 @@ After the arm (on the replay window, cut by the runner's replay_start and replay
     Under io.max every disk arm stalls on I/O by design, so io PSI measures the regime, not a fault; see the report)
   - a hardware slowdown or thermal event on the arm's GPUs in the window (sampled reason bitmask, and the cumulative
     clock-event counters where the driver has them)
-  - engine crash: the runner's rc, "server failed", no replay_end marker
+  - engine crash: the runner's rc, "server failed" (the sidecar too), no replay_end marker, or "SERVER DIED" (the
+    runner found the server, the LMCache server or the sidecar dead, or /health failing, after the replay)
+  - engine death seen by the client: more than 0.5% of the arm's turn rows (served, failed and censored) failed on a
+    lost connection (replay.py's conn_error flag: refused, reset, disconnected, truncated stream). Pre-registered
+    threshold, conn_fail_max_frac
   - vLLM fell back from O_DIRECT on a disk tier (its own warning in the server log), slow and medium regimes
-Covariates logged: SM clock per GPU (median and min in the window), software power-cap time, max temperature, io PSI.
+  - disk tier over capacity: the tier directory's size (telemetry samples and the runner's du after the replay) above
+    the cell's disk-tier bytes (vLLM's fs tier has no bound of its own, so this is how the 2 P capacity holds)
+  - page-cache slack used: in the replay window, the disk tier's cached bytes (cachestat; not for a RAM tier, whose
+    pages are the tier) or the cgroup's page cache (memory.stat file minus shmem: the pinned CPU tier in /dev/shm and a
+    tmpfs tier are shmem) above page_cache_max_bytes (256 MiB, the budget's slack); the maxima are reported per arm
+Covariates logged: SM clock per GPU (median and min in the window), software power-cap time, max temperature, io PSI,
+the tier's peak size, the page-cache maxima, the connection-failure fraction.
 """
 import csv
 import hashlib
@@ -26,7 +36,7 @@ import json
 import os
 import statistics
 
-from common import GiB
+from common import GiB, MiB
 
 # NVML clock-event reason bits (nvmlClocksEventReason*)
 REASON_BITS = {0x1: "gpu_idle", 0x2: "applications_clocks_setting", 0x4: "sw_power_cap", 0x8: "hw_slowdown",
@@ -40,7 +50,9 @@ GPU_FIELDS = ["timestamp", "index", "clocks.sm", "clocks.mem", "clocks.max.sm", 
 COUNTER_FIELDS = ["clocks_event_reasons_counters." + c for c in
                   ("sw_power_cap", "sw_thermal_slowdown", "hw_thermal_slowdown", "hw_power_brake_slowdown")]
 DEFAULTS = {"fio_tolerance": 0.10, "free_mem_margin_bytes": 8 * GiB, "psi_full_max_frac": 0.01,
-            "psi_resources": ["memory"]}
+            "psi_resources": ["memory"], "conn_fail_max_frac": 0.005, "page_cache_max_bytes": 256 * MiB}
+CONN_PATTERNS = ("ClientConnectorError", "ServerDisconnectedError", "ClientOSError", "ClientPayloadError",
+                 "Connection refused", "Connection reset")
 ODIRECT_FALLBACK = "O_DIRECT is not supported at"
 
 
@@ -197,16 +209,48 @@ def _gpu_t(r):
         return None
 
 
+def conn_failures(turn_rows):
+    """(turn rows, rows that failed on a lost connection) of a replay output's rows."""
+    rows = [r for r in turn_rows if "session" in r and "turn" in r and "ttft" in r]
+    bad = sum(1 for r in rows if r.get("failed") and (r.get("conn_error")
+                                                      or any(p in str(r.get("error", "")) for p in CONN_PATTERNS)))
+    return len(rows), bad
+
+
+def read_jsonl(path):
+    out = []
+    if os.path.exists(path):
+        with open(path, errors="replace") as f:
+            for ln in f:
+                try:
+                    out.append(json.loads(ln))
+                except ValueError:
+                    pass
+    return out
+
+
 def verdict(*, markers, cg_before, cg_after, tel_rows, cg_name, gpu_rows, runner_rc, runner_log="", server_log="",
-            regime=None, engine=None, settings=None):
+            regime=None, engine=None, settings=None, turn_rows=None, disk_bytes=None, tier_bytes_end=None,
+            ram_tier=False):
     """{'valid', 'reasons', 'window_s', 'covariates'} for one arm. gpu_rows: parse_gpu_csv rows of the arm's GPUs,
-    their 'timestamp' in the host's local time (nvidia-smi's own format)."""
+    their 'timestamp' in the host's local time (nvidia-smi's own format). turn_rows: the replay output's rows;
+    disk_bytes: the cell's disk-tier capacity; tier_bytes_end: the runner's du of the tier after the replay; ram_tier:
+    the tier is a tmpfs (its cachestat is the tier itself, not page-cache slack)."""
     s = dict(DEFAULTS, **(settings or {}))
     reasons, cov = [], {}
     t0, t1 = markers.get("replay_start"), markers.get("replay_end")
-    if runner_rc != 0 or "server failed" in runner_log or t0 is None or t1 is None:
+    died = "SERVER DIED" in runner_log
+    if runner_rc != 0 or "server failed" in runner_log or died or t0 is None or t1 is None:
         reasons.append(f"engine_crash: rc={runner_rc}, markers={sorted(markers)}"
-                       + (", server failed" if "server failed" in runner_log else ""))
+                       + (", server failed" if "server failed" in runner_log else "")
+                       + (", server died during the replay" if died else ""))
+    if turn_rows is not None:
+        n, bad = conn_failures(turn_rows)
+        frac = bad / n if n else 0.0
+        cov["conn_failed"], cov["conn_failed_frac"] = bad, frac
+        if frac > s["conn_fail_max_frac"]:
+            reasons.append(f"engine death: {bad} of {n} turns ({frac:.2%}) failed on a lost connection "
+                           f"> {s['conn_fail_max_frac']:.1%}")
     for k in ("oom", "oom_kill"):
         d = cg_after["memory.events"].get(k, 0) - cg_before["memory.events"].get(k, 0)
         if d > 0:
@@ -251,4 +295,27 @@ def verdict(*, markers, cg_before, cg_after, tel_rows, cg_name, gpu_rows, runner
     tier = [r["tier"] for r in tel_rows if r.get("tier")]
     if tier:
         cov["tier_cached_max"] = {k: max(t.get(k, {}).get("cached", 0) for t in tier) for k in tier[-1]}
+    # disk-tier capacity: the largest size the tier directory reached (telemetry samples, the runner's final du)
+    sizes = [t.get(cg_name, {}).get("bytes") for t in tier] + [tier_bytes_end]
+    sizes = [x for x in sizes if x is not None]
+    cov["tier_bytes_max"] = max(sizes) if sizes else None
+    if disk_bytes and sizes and max(sizes) > disk_bytes:
+        reasons.append(f"disk tier reached {max(sizes) / GiB:.2f} GiB > the cell's {disk_bytes / GiB:.2f} GiB")
+    # page-cache slack, in the replay window: the tier's cached pages and the cgroup's non-shmem file pages
+    if t0 is not None and t1 is not None:
+        win = [r for r in tel_rows if t0 <= r.get("t", -1) <= t1]
+        cached = [r["tier"][cg_name]["cached"] for r in win if cg_name in (r.get("tier") or {})]
+        filec = []
+        for r in win:
+            st = (r.get("cg", {}).get(cg_name) or {}).get("memory.stat") or {}
+            if st.get("file") is not None:
+                filec.append(st["file"] - (st.get("shmem") or 0))
+        cov["page_cache"] = {"tier_cached_max": max(cached, default=None), "cg_file_nonshmem_max": max(filec, default=None),
+                             "limit": s["page_cache_max_bytes"], "ram_tier": ram_tier}
+        lim = s["page_cache_max_bytes"]
+        if cached and not ram_tier and max(cached) > lim:
+            reasons.append(f"page cache: tier cached {max(cached) / MiB:.0f} MiB > {lim / MiB:.0f} MiB in the window")
+        if filec and max(filec) > lim:
+            reasons.append(f"page cache: cgroup file (non-shmem) {max(filec) / MiB:.0f} MiB > {lim / MiB:.0f} MiB "
+                           f"in the window")
     return {"valid": not reasons, "reasons": reasons, "covariates": cov}

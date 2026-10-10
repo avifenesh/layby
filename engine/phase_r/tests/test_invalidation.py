@@ -131,6 +131,69 @@ class AfterArm(unittest.TestCase):
         self.assertFalse(verdict(runner_log="server failed\n")["valid"])
         self.assertFalse(verdict(markers={"replay_start": T0})["valid"])   # no replay_end: the run never finished
 
+    def test_server_died_during_the_replay(self):
+        # the runner checks the server (and the LMCache server, the sidecar) after the replay; a dead one fails the arm
+        v = verdict(runner_log="arm K: SERVER DIED during the replay: server /health failed\narm K rc=0 7858 turns")
+        self.assertFalse(v["valid"])
+        self.assertIn("server died", v["reasons"][0])
+
+    def test_connection_failures_over_half_a_percent(self):
+        def rows(n, bad):
+            out = [{"session": f"s{i}", "turn": 1, "ttft": 0.1} for i in range(n - bad)]
+            out += [{"session": f"b{i}", "turn": 1, "ttft": float("inf"), "failed": True, "conn_error": True,
+                     "error": "ServerDisconnectedError()"} for i in range(bad)]
+            return out + [{"wall_s": 1.0}]
+        self.assertTrue(verdict(turn_rows=rows(1000, 5))["valid"])               # 0.5%: at the threshold
+        v = verdict(turn_rows=rows(1000, 6))                                      # 0.6%
+        self.assertFalse(v["valid"])
+        self.assertIn("lost connection", v["reasons"][0])
+        self.assertAlmostEqual(v["covariates"]["conn_failed_frac"], 0.006)
+        # HTTP errors are answers from a live server, not connection failures
+        http = [{"session": f"h{i}", "turn": 1, "ttft": float("inf"), "failed": True, "error": "HTTP 500 boom"}
+                for i in range(10)]
+        self.assertTrue(verdict(turn_rows=rows(1000, 0) + http)["valid"])
+        # rows written before the flag existed: the error text
+        old = [{"session": "o", "turn": 1, "ttft": float("inf"), "failed": True,
+                "error": "ClientConnectorError(ConnectionKey(...), ConnectionRefusedError(111, 'Connect call failed'))"}]
+        self.assertFalse(verdict(turn_rows=rows(100, 0) + old)["valid"])
+
+    def test_disk_tier_over_the_cells_capacity(self):
+        rows = tel()
+        for i, r in enumerate(rows):
+            r["tier"] = {"K": {"files": 1, "bytes": i * GiB, "cached": 0, "dirty": 0}}
+        top = (len(rows) - 1) * GiB
+        self.assertTrue(verdict(tel_rows=rows, disk_bytes=top)["valid"])
+        v = verdict(tel_rows=rows, disk_bytes=top - 1)
+        self.assertFalse(v["valid"])
+        self.assertIn("disk tier reached", v["reasons"][0])
+        self.assertEqual(v["covariates"]["tier_bytes_max"], top)
+        # the runner's du after the replay counts too (the tier grows after the last sample)
+        self.assertFalse(verdict(tel_rows=rows, disk_bytes=top, tier_bytes_end=top + 1)["valid"])
+
+    def test_page_cache_over_the_slack_in_the_window(self):
+        M = 1 << 20
+        def rows(cached=0, file=0, shmem=0, at=T0 + 500):
+            out = tel()
+            for r in out:
+                inwin = abs(r["t"] - at) < 6
+                r["tier"] = {"K": {"files": 1, "bytes": 0, "cached": cached if inwin else 0, "dirty": 0}}
+                r["cg"]["K"]["memory.stat"] = {"file": (file if inwin else 0) + shmem, "shmem": shmem}
+            return out
+        self.assertTrue(verdict(tel_rows=rows(cached=256 * M))["valid"])
+        v = verdict(tel_rows=rows(cached=257 * M))
+        self.assertFalse(v["valid"])
+        self.assertIn("tier cached", v["reasons"][0])
+        self.assertEqual(v["covariates"]["page_cache"]["tier_cached_max"], 257 * M)
+        v = verdict(tel_rows=rows(file=300 * M))
+        self.assertFalse(v["valid"])
+        self.assertIn("cgroup file", v["reasons"][0])
+        # the pinned CPU tier in /dev/shm (and a tmpfs tier) is shmem, not page-cache slack
+        self.assertTrue(verdict(tel_rows=rows(file=100 * M, shmem=28 * GiB))["valid"])
+        # outside the replay window (boot: loading the weights) it does not count
+        self.assertTrue(verdict(tel_rows=rows(cached=2 * GiB, file=2 * GiB, at=T0 - 50))["valid"])
+        # a RAM tier's cached pages are the tier itself
+        self.assertTrue(verdict(tel_rows=rows(cached=8 * GiB), ram_tier=True)["valid"])
+
     def test_vllm_odirect_fallback(self):
         log = "WARNING O_DIRECT is not supported at '/mnt/x'; falling back to buffered I/O"
         self.assertFalse(verdict(server_log=log)["valid"])

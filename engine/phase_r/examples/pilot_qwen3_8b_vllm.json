@@ -1,5 +1,5 @@
 {
- "_comment": "PLACEHOLDER numbers for dry runs and tests, not measurements. The pilot overwrites every value: kv_bytes_per_token from the model config, arm_rss_bytes per arm label as the peak RSS of that arm's processes beyond its pinned CPU tier (an LMCache arm lists its vLLM engine and its LMCache server, which share the arm's cgroup; the sum is used), prefill_tok_s as the engine's measured prefill rate at each load, wt_offered_write_Bps as write-through's offered write rate at each load (bytes written to the tier per second in a T run with no disk limit).",
+ "_comment": "PLACEHOLDER numbers for dry runs and tests, not measurements. The pilot overwrites every value: kv_bytes_per_token from the model config, arm_rss_bytes per arm label as the peak RSS of that arm's processes beyond its pinned CPU tier (an LMCache arm lists its vLLM engine and its LMCache server, which share the arm's cgroup; the sum is used), sidecar_rss_bytes as the live-scoring sidecar's peak RSS (added to arm K's memory.max), prefill_tok_s as the engine's measured prefill rate at each load, wt_offered_write_Bps as write-through's offered write rate at each load (bytes written to the tier per second in a T run with no disk limit).",
  "model": "Qwen/Qwen3-8B",
  "engine": "vllm",
  "kv_bytes_per_token": 147456,
@@ -19,6 +19,7 @@
   "HC-wt": 12884901888,
   "HC-sel": 12884901888
  },
+ "sidecar_rss_bytes": 2147483648,
  "loads": {
   "heavy": {
    "prefill_tok_s": 20000.0,

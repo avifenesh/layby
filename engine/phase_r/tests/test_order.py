@@ -65,11 +65,25 @@ class Slots(unittest.TestCase):
         arms = ["C0", "T", "T2", "K", "K_ewma"]
         for rep in range(1, 7):
             r = order.plan_rounds(arms, 9, "glm", rep, n_slots=2)
-            got = [a for rnd in r for _, a in rnd]
+            got = [a for rnd in r for _, a in rnd if a != order.FILLER]
             self.assertEqual(sorted(got), sorted(arms))
             self.assertEqual(len(r), 3)
             for rnd in r:
                 self.assertEqual(len({s for s, _ in rnd}), len(rnd))   # one arm per slot per round
+
+    def test_an_arm_never_runs_alone_on_two_slots(self):
+        # 5 arms over 2 slots: the last round's empty slot runs the filler, so every measured arm has a neighbour
+        arms = ["C0", "T", "T2", "K", "K_ewma"]
+        for rep in range(1, 5):
+            r = order.plan_rounds(arms, 9, "glm", rep, n_slots=2)
+            self.assertTrue(all(len(rnd) == 2 for rnd in r), r)
+            self.assertEqual(sum(a == order.FILLER for rnd in r for _, a in rnd), 1)
+            self.assertTrue(all(sum(a != order.FILLER for _, a in rnd) >= 1 for rnd in r))
+            self.assertEqual([s for s, _ in r[-1]], [0, 1])
+        self.assertEqual(order.plan_rounds(arms[:4], 9, "glm", 1, n_slots=2)[-1][0][1] != order.FILLER, True)
+        self.assertFalse(any(a == order.FILLER for rnd in order.plan_rounds(arms[:4], 9, "glm", 1, n_slots=2)
+                             for _, a in rnd))                          # an even split needs none
+        self.assertEqual([len(x) for x in order.plan_rounds(arms, 9, "glm", 1, n_slots=2, fill=False)], [2, 2, 1])
 
     def test_each_arm_on_each_half_equally_across_repeats(self):
         arms = ["C0", "T", "T2", "K", "K_ewma"]

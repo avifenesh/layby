@@ -7,7 +7,9 @@ version, on the order the arms are listed in, or on any other cell. A block that
 Slots. A GLM node runs two engines at once, one per NUMA half. Arm i of the cell's list goes to slot
 (i + repeat) mod n_slots, so over n_slots consecutive repeats every arm runs on every slot once; within a slot the
 order is the seeded draw. Slots run in lockstep rounds: round k starts slot A's k-th and slot B's k-th arm together,
-and the between-arm reset (drop caches, wipe, probe) happens with both stopped.
+and the between-arm reset (drop caches, wipe, probe) happens with both stopped. When the arms do not divide evenly,
+the last round has an empty slot; it runs FILLER (an unscored C0 replay of the same workload, outputs discarded), so
+no measured arm runs alone on a node built for two engines.
 
 Pairing rule. A block is all arms of one cell on one host in one repeat. An arm excluded for a failed health check,
 a throttle event, an engine crash or a host fault excludes its whole block, which reruns, so every comparison stays
@@ -16,6 +18,8 @@ A host-level failure (GPU throttle, fio drift, a provider fault) means the block
 """
 import hashlib
 from itertools import zip_longest
+
+FILLER = "_filler"     # the unscored neighbour in a round with an empty slot (labels may not start with _)
 
 
 def _key(*parts):
@@ -40,14 +44,15 @@ def assign_slots(labels, repeat, n_slots):
     return out
 
 
-def plan_rounds(labels, seed, cell, repeat, attempt=1, n_slots=1):
-    """List of rounds; each round is a list of (slot, label) run together."""
+def plan_rounds(labels, seed, cell, repeat, attempt=1, n_slots=1, fill=True):
+    """List of rounds; each round is a list of (slot, label) run together, in slot order. With fill, an empty slot
+    in a round runs FILLER."""
     if n_slots == 1:
         return [[(0, a)] for a in arm_order(labels, seed, cell, repeat, attempt)]
     per = {s: arm_order(ls, seed, cell, repeat, attempt, slot=s) for s, ls in assign_slots(labels, repeat, n_slots).items()}
     rounds = []
     for row in zip_longest(*(per[s] for s in range(n_slots))):
-        rounds.append([(s, a) for s, a in enumerate(row) if a is not None])
+        rounds.append([(s, a if a is not None else FILLER) for s, a in enumerate(row) if a is not None or fill])
     return rounds
 
 

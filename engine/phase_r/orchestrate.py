@@ -7,21 +7,28 @@ engine/run_arms_sglang.sh for SGLang), on the host or inside the long-lived `par
   orchestrate.py plan      --cell CELL.json --repeat N [--attempt A] [--aa LABEL]
   orchestrate.py regime    --pilot PILOT.json --load heavy --read-bps B --write-bps B
   orchestrate.py run       --cell CELL.json --host ID --repeat N --out DIR [--attempt A] [--aa LABEL] [--dry-run]
+  orchestrate.py hicache-pilot --cell CELL.json --host ID --out DIR [--dry-run]     (SGLang cells)
 
 A block, per attempt:
   1. Full fio probe of every slot's disk (O_DIRECT 4 MiB write, read, random read); the host's first full probe is
      kept in OUT/hosts/HOST/ and every later quick probe is held to it (10%).
   2. Regime check before any arm: r and w from the pilot JSON and the probe measured inside a cgroup carrying the
-     cell's io.max (or the RAM tier, buffered); a cell whose measured regime differs from the declared one stops here
-     (exit 4), before an arm runs.
-  3. Arms in the seeded random order (order.py), in lockstep rounds when the node runs two engines. Before each
+     cell's io.max (or the RAM tier, buffered); the read rate is min(sequential read, random read at the tier's chunk
+     size kv_chunk_bytes), the read path the engine issues. A cell whose measured regime differs from the declared
+     one stops here (exit 4), before an arm runs.
+  3. Arms in the seeded random order (order.py), in lockstep rounds when the node runs two engines; a round with
+     fewer arms than slots fills the empty slot with an unscored filler (arm C0's runner on the same workload, its
+     replay output deleted, indexed with status "filler"), so every measured arm has a neighbour; the time each arm's
+     replay window overlapped its neighbour's is a covariate (verdict covariates "neighbour"). Before each
      round: the previous engines' cgroups killed and removed, page cache dropped, quick probe, disk tier wiped (rm and
      fstrim, mkfs, or a fresh tmpfs), page cache dropped again, a fresh cgroup per engine (memory.max, swap 0, cpuset,
      io.max) read back, a throttled probe inside it when io.max is set, then the health checks (health.py).
   4. During the arm: telemetry.py (cgroup memory, PSI, io.stat, diskstats, tier page-cache residency), nvidia-smi
      -lms 1000 (clocks, clock-event reasons and counters) and iostat, each to a file named by cell, arm and host.
   5. After the arm: verdict (health.py: OOM, PSI full > 1% of the replay window, hardware or thermal GPU event,
-     engine crash, vLLM O_DIRECT fallback). Any exclusion ends the attempt; the whole block reruns (pairing rule),
+     engine crash or death (the runner's check, or > 0.5% of turns failed on a lost connection), vLLM O_DIRECT
+     fallback, disk tier above capacities.disk_bytes, page cache above 256 MiB). Any exclusion ends the attempt;
+     the whole block reruns (pairing rule),
      on this host (exit code path "rerun") or, for a host-level failure, on a replacement host (exit 3).
   6. Full probe again after the block.
 
@@ -39,7 +46,20 @@ on any machine.
 
 The cell file format is documented in engine/phase_r/examples/cell_main_vllm_slow_heavy.json. hard_cap_s (optional)
 becomes the runner's HARD_CAP (replay --hard-cap: 3x C0's pilot duration in the plan). Arm codes are checked against the
-runner's (ARM_CODES); CT needs CT_ETA in its env, T2 takes T2_MIN_HITS, T2_DECAY_S and T2_COUNT.
+runner's (ARM_CODES); CT needs CT_ETA in its env, T2 takes T2_MIN_HITS, T2_DECAY_S and T2_COUNT. The pilot JSON must
+be for the cell's engine. capacities.disk_bytes (required) is the disk tier's capacity (the runner's DISK_BYTES).
+Every CPU tier gets capacities.cpu_bytes exactly (LMCache's L1 included; no env may override cpu_bytes_to_use).
+
+Live scoring: an arm with code K needs the cell's "live_scoring" {"side_file", "ckpt", "calib", optional "device"}
+(the replay's side file and the Layby-Dwell release, paths where the engine runs); without it, or with a file
+missing, the cell is refused (exit 4). The runner starts the sidecar in the arm's cgroup, so the pilot's (or
+cgroup's) sidecar_rss_bytes is added to K's RSS in memory.max. The sidecar listens on the slot's sidecar_port
+(default park_port + 1).
+
+hicache-pilot (SGLang cells): HC-wt's L3 write throughput with the fdatasync patch, the sync_file_range variant and
+stock SGLang, each inside a cgroup carrying the cell's io.max (engine/phase_r/sglang/hicache_write_pilot.py), written
+to OUT/CELL/HOST/hicache_pilot.json. The pilot decides the variant; the cell's "sglang_patch_variant"
+(fdatasync, the default, or sync_file_range) is what every SGLang arm then runs with.
 """
 import argparse
 import json
@@ -65,6 +85,16 @@ WIPES = ("fstrim", "mkfs", "ram")
 # what each one runs
 ARM_CODES = {"vllm": {"C0", "T", "T2", "LM", "LMR", "LMS", "CT", "PT", "K", "K_km", "K_ewma", "K0", "KW", "KD", "SM"},
              "sglang": {"C0", "T", "K", "K_km", "K_ewma"}}
+LIVE_CODES = {"K"}                       # arms that score live through the sidecar (K_km and K_ewma post controls)
+PATCH_VARIANTS = ("fdatasync", "sync_file_range")
+FILLER_CODE = "C0"
+
+
+def lmcache_gb(n):
+    """The --l1-size-gb / max_capacity_gb string run_arms.sh passes for n bytes, and the bytes LMCache makes of it
+    (int(float(gb) * 2^30))."""
+    gb = repr(int(n) / 2 ** 30)
+    return gb, int(float(gb) * (1 << 30))
 
 
 # ---------------------------------------------------------------- cell spec
@@ -111,8 +141,19 @@ def load_cell(path, aa=None):
             if cpus[i] & cpus[j]:
                 raise ValueError("slots share CPUs")
     labels = [a["label"] for a in c["arms"]]
-    if len(set(labels)) != len(labels) or any("." in x or "/" in x for x in labels):
-        raise ValueError(f"arm labels must be unique, without dots or slashes: {labels}")
+    if len(set(labels)) != len(labels) or any("." in x or "/" in x or x.startswith("_") for x in labels):
+        raise ValueError(f"arm labels must be unique, without dots or slashes, not starting with _: {labels}")
+    caps = c["capacities"]
+    for k in ("gpu_kv_bytes", "cpu_bytes", "disk_bytes"):
+        if k not in caps:
+            raise ValueError(f"capacities lacks {k!r}")
+    if c.get("ram_tier_bytes") and parse_size(c["ram_tier_bytes"]) < parse_size(caps["disk_bytes"]):
+        raise ValueError("ram_tier_bytes is smaller than capacities.disk_bytes: the RAM tier would fill first")
+    if not c.get("kv_chunk_bytes"):
+        raise ValueError("kv_chunk_bytes missing: the regime's read rate is min(sequential read, random read at the "
+                         "tier's chunk size)")
+    if c.get("sglang_patch_variant", "fdatasync") not in PATCH_VARIANTS:
+        raise ValueError(f"sglang_patch_variant {c['sglang_patch_variant']!r} not in {PATCH_VARIANTS}")
     for a in c["arms"]:
         a.setdefault("code", a["label"])
         a.setdefault("env", {})
@@ -130,6 +171,17 @@ def load_cell(path, aa=None):
         c["cell"] = f"{c['cell']}-AA"
     pil = c.get("pilot")
     c["_pilot"] = load_json(pil if os.path.isabs(pil) else os.path.join(base, pil)) if pil else None
+    if c["_pilot"] is not None and c["_pilot"].get("engine") != c["engine"]:
+        raise ValueError(f"pilot {pil} is for engine {c['_pilot'].get('engine')!r}, the cell runs {c['engine']!r}")
+    for s in c["slots"]:
+        s.setdefault("sidecar_port", int(s["park_port"]) + 1)
+    if any(is_live(a) for a in c["arms"]):
+        ls = c.get("live_scoring") or {}
+        miss = [k for k in ("side_file", "ckpt", "calib") if not ls.get(k)]
+        if miss:
+            raise ValueError(f"arm K scores live: the cell needs live_scoring {miss} (the replay's side file and the "
+                             f"Layby-Dwell release)")
+    check_cpu_tiers(c)
     c.setdefault("max_block_attempts", 2)
     c.setdefault("fio", {})
     c.setdefault("health", {})
@@ -138,7 +190,39 @@ def load_cell(path, aa=None):
     c.setdefault("dry_run", {})
     for a in c["arms"]:   # every arm has its own RSS before anything runs
         arm_rss(c, a)
+    if len(c["slots"]) > 1 and len(c["arms"]) % len(c["slots"]):
+        arm_rss(c, filler_arm(c))   # a filler runs C0's configuration
     return c
+
+
+def is_live(arm):
+    return arm["code"].split(".")[0] in LIVE_CODES
+
+
+def filler_arm(c):
+    """The unscored neighbour of an arm that would run alone in a two-engine round: C0's runner on the same workload,
+    C0's RSS (the cell's arm with code C0, else the label C0)."""
+    src = next((a["label"] for a in c["arms"] if a["code"].split(".")[0] == FILLER_CODE), FILLER_CODE)
+    return {"label": order.FILLER, "code": FILLER_CODE, "env": {}, "filler": True, "rss_of": src}
+
+
+def check_cpu_tiers(c):
+    """Every arm's CPU tier is capacities.cpu_bytes exactly: no env overrides cpu_bytes_to_use, and LMCache's L1
+    (a float of GiB) gives back the same bytes. Returns {label: bytes}."""
+    cpu = parse_size(c["capacities"]["cpu_bytes"])
+    envs = [c["runner"].get("env") or {}] + [s.get("env") or {} for s in c["slots"]] + [a["env"] for a in c["arms"]]
+    for e in envs:
+        if "cpu_bytes_to_use" in str(e.get("OFF_EXTRA", "")):
+            raise ValueError("OFF_EXTRA sets cpu_bytes_to_use: every arm gets capacities.cpu_bytes")
+        if str(e.get("LIVE_SCORING", "on")) == "off":
+            raise ValueError("LIVE_SCORING=off is for pre-Phase R runs: arm K scores live in Phase R")
+    tiers = {}
+    for a in c["arms"]:
+        code = a["code"].split(".")[0]
+        tiers[a["label"]] = lmcache_gb(cpu)[1] if code in ("LM", "LMR", "LMS") else cpu
+    if len(set(tiers.values())) > 1:
+        raise ValueError(f"CPU-tier bytes differ across arms: {tiers}")
+    return tiers
 
 
 def check_arm(c, a):
@@ -176,10 +260,19 @@ def arm_rss(c, arm):
     if not isinstance(table, dict):
         raise ValueError("no per-arm RSS: give the pilot's arm_rss_bytes (or cgroup.arm_rss_bytes), keyed by label")
     label = arm["label"]
-    v = table.get(label, table.get(arm.get("aa_of")) if arm.get("aa_of") else None)
+    base = arm.get("rss_of") or arm.get("aa_of")
+    v = table.get(label, table.get(base) if base else None)
     if v is None:
         raise ValueError(f"arm_rss_bytes has no entry for arm {label!r}")
     parts = {k: parse_size(x) for k, x in v.items()} if isinstance(v, dict) else {"engine": parse_size(v)}
+    if is_live(arm) and "sidecar" not in parts:   # the live-scoring sidecar runs in the arm's cgroup
+        sc = c["cgroup"].get("sidecar_rss_bytes")
+        if sc is None and c["_pilot"]:
+            sc = c["_pilot"].get("sidecar_rss_bytes")
+        if sc is None:
+            raise ValueError(f"arm {label!r} scores live: give the pilot's sidecar_rss_bytes (or cgroup's), the "
+                             f"sidecar's RSS, counted in the arm's memory.max")
+        parts["sidecar"] = parse_size(sc)
     return sum(parts.values()), parts
 
 
@@ -215,6 +308,13 @@ def arm_env(c, slot, arm, cgpath):
            "ARM_HOOK": layby_path(c, "engine/phase_r/arm_hook.sh")}
     if c.get("hard_cap_s") is not None:
         env["HARD_CAP"] = str(c["hard_cap_s"])
+    env["DISK_BYTES"] = str(parse_size(c["capacities"]["disk_bytes"]))
+    if is_live(arm):
+        ls = c["live_scoring"]
+        env.update(SIDE_FILE=ls["side_file"], SIDECAR_CKPT=ls["ckpt"], SIDECAR_CALIB=ls["calib"],
+                   SIDECAR_PORT=str(slot["sidecar_port"]))
+        if ls.get("device"):
+            env["SIDECAR_DEVICE"] = str(ls["device"])
     env.update({k: str(v) for k, v in (r.get("env") or {}).items()})
     env.update({k: str(v) for k, v in (slot.get("env") or {}).items()})
     env.update({k: str(v) for k, v in arm["env"].items()})
@@ -306,12 +406,26 @@ def host_env(rn, c, host):
 
 def sglang_patch(rn, c, mode):
     py = os.path.join(c["runner"]["venv"], "bin", "python")
-    r = rn.run(in_runner(c, ["bash", layby_path(c, "engine/phase_r/sglang/apply_patch.sh"), py, mode]),
-               fake="PATCHED 0.5.21 (dry-run)\n")
+    variant = c.get("sglang_patch_variant", "fdatasync")
+    r = rn.run(in_runner(c, ["bash", layby_path(c, "engine/phase_r/sglang/apply_patch.sh"), py, mode, variant]),
+               fake=f"PATCHED 0.5.21 {variant} (dry-run)\n")
     return r.out.strip() if r.ok else (r.out.strip() or r.err.strip() or f"rc={r.rc}")
 
 
 # ---------------------------------------------------------------- preflight
+
+def live_problems(rn, c):
+    """Arm K's live-scoring inputs, checked where the engine runs (inside the container in docker mode): a missing
+    one is a configuration error (exit 4), like the runner's own check."""
+    if not any(is_live(a) for a in c["arms"]):
+        return []
+    out = []
+    for k in ("side_file", "ckpt", "calib"):
+        p = c["live_scoring"][k]
+        if not rn.run(in_runner(c, ["test", "-f", p])).ok:
+            out.append(f"live_scoring {k} {p} missing")
+    return out
+
 
 def preflight(rn, c, out_root=None):
     problems = []
@@ -383,6 +497,13 @@ def preflight(rn, c, out_root=None):
 
 # ---------------------------------------------------------------- one block
 
+def restore_read_Bps(p):
+    """The read rate r is computed from: the slower of sequential reads and random reads of one tier chunk
+    (kv_chunk_bytes, the size the engine reads), since a restore issues chunk reads, not one long stream."""
+    rr = p.get("rand_read_Bps")
+    return min(p["seq_read_Bps"], rr) if rr else p["seq_read_Bps"]
+
+
 class Block:
     def __init__(self, rn, c, host, repeat, out, attempt):
         self.rn, self.c, self.host, self.repeat, self.out, self.attempt = rn, c, host, repeat, out, attempt
@@ -411,7 +532,7 @@ class Block:
             if d["wipe"] == "ram":
                 wipe(rn, c, s, None)
                 p = probe.run(rn, d["tier_dir"], "full", dict(c["fio"], size=c["fio"].get("ram_probe_size", "2G")),
-                              direct=False, fake=self.dry.get("ram_probe"))
+                              direct=False, rand_bs=c.get("kv_chunk_bytes"), fake=self.dry.get("ram_probe"))
             elif c.get("io_max"):
                 name = f"{c['cell']}.probe.{s['name']}"
                 p_cg = cgroup.create(rn, name, 4 * GiB, s["cpus"], s["mems"], io_limits(c, self.devs[s["name"]]))
@@ -425,7 +546,10 @@ class Block:
                 ok = False
                 res[s["name"]] = {"error": (p or {}).get("error", "no probe")}
                 continue
-            good, detail = regime.check(c["regime"], c["_pilot"], c["load"], p["seq_read_Bps"], p["seq_write_Bps"])
+            read = restore_read_Bps(p)
+            good, detail = regime.check(c["regime"], c["_pilot"], c["load"], read, p["seq_write_Bps"])
+            detail["read_path"] = {"seq_read_Bps": p.get("seq_read_Bps"), "rand_read_Bps": p.get("rand_read_Bps"),
+                                   "rand_bs": c.get("kv_chunk_bytes"), "used": read}
             detail["bounds"] = regime.bandwidth_bounds(c["_pilot"], c["load"])
             detail["probe"] = {k: v for k, v in p.items() if k != "raw"}
             res[s["name"]] = detail
@@ -437,6 +561,8 @@ class Block:
         c, rn = self.c, self.rn
         labels = [a["label"] for a in c["arms"]]
         arms = arm_by_label(c)
+        if len(c["slots"]) > 1:
+            arms[order.FILLER] = filler_arm(c)
         attempts = []
         while True:
             att = self.attempt
@@ -466,9 +592,12 @@ class Block:
             rounds = order.plan_rounds(labels, c["seed"], c["cell"], self.repeat, att, len(c["slots"]))
             plan = {"cell": c["cell"], "plan": c.get("plan"), "host": self.host, "repeat": self.repeat, "attempt": att,
                     "seed": c["seed"], "rounds": [[(c["slots"][s]["name"], a) for s, a in r] for r in rounds],
-                    "regime": reg}
+                    "regime": reg, "cpu_tier_bytes": check_cpu_tiers(c),
+                    "disk_bytes": parse_size(c["capacities"]["disk_bytes"]),
+                    "sglang_patch_variant": c.get("sglang_patch_variant", "fdatasync") if c["engine"] == "sglang" else None}
             dump(os.path.join(attdir, "block.json"), plan)
             verdicts, failures, pos = {}, [], 0
+            self.fillers = []
             for rnd in rounds:
                 stop = self.run_round(rnd, attdir, pos, arms, first, verdicts, failures)
                 pos += len(rnd)
@@ -478,7 +607,7 @@ class Block:
             dump(os.path.join(attdir, "probe_after.json"), after)
             outcome = order.block_outcome(labels, verdicts, failures)
             step = order.next_step(outcome, att, c["max_block_attempts"])
-            plan.update(outcome=outcome, verdicts=verdicts, failures=failures, next=step)
+            plan.update(outcome=outcome, verdicts=verdicts, failures=failures, next=step, fillers=self.fillers)
             dump(os.path.join(attdir, "block.json"), plan)
             attempts.append({"attempt": att, "outcome": outcome, "verdicts": verdicts})
             log(f"attempt {att}: {step} {outcome['reasons'][:3]}")
@@ -592,11 +721,44 @@ class Block:
             x["cg_after"] = cgroup.snapshot(rn, x["cg"])
             cgroup.destroy(rn, x["cg"])
             self.collect(x)
+        for x in ctx:
+            x["neighbour"] = self.overlap(x, ctx)
+        for x in ctx:
             v = self.judge(x)
+            if x["arm"].get("filler"):   # unscored: its replay output is discarded, its verdict kept for the record
+                self.discard(x)
+                self.fillers.append({"slot": x["slot"]["name"], "dir": x["dir"], "valid": v["valid"],
+                                     "reasons": v["reasons"], "neighbour": x["neighbour"]})
+                self.index(x, v, "filler")
+                continue
             verdicts[x["arm"]["label"]] = v
             stop |= not v["valid"]
             self.index(x, v, "ran")
         return stop
+
+    def overlap(self, x, ctx):
+        """Seconds this arm's replay window [replay_start, replay_end] overlapped its neighbours' (two-engine
+        rounds), and the fraction of its own window; None on a one-engine node or without markers (dry run)."""
+        others = [y for y in ctx if y is not x]
+        if not others:
+            return None
+        def win(y):
+            m = health.read_markers(os.path.join(y["dir"], y["prefix"] + ".markers"))
+            return (m["replay_start"], m["replay_end"]) if "replay_start" in m and "replay_end" in m else None
+        mine = win(x)
+        out = {"labels": [y["arm"]["label"] for y in others], "filler": [bool(y["arm"].get("filler")) for y in others],
+               "overlap_s": None, "overlap_frac": None}
+        theirs = [w for w in map(win, others) if w]
+        if mine and theirs:
+            ov = sum(max(0.0, min(mine[1], w[1]) - max(mine[0], w[0])) for w in theirs)
+            out.update(overlap_s=ov, overlap_frac=ov / (mine[1] - mine[0]) if mine[1] > mine[0] else None)
+        return out
+
+    def discard(self, x):
+        """A filler's replay rows are not data: delete them so no analysis can pick them up (logs stay)."""
+        p = os.path.join(x["dir"], x["prefix"] + ".jsonl")
+        if not self.rn.dry and os.path.exists(p):
+            os.remove(p)
 
     def wait(self, proc, deadline):
         import subprocess
@@ -639,11 +801,16 @@ class Block:
             arm_rc = [ln for ln in rl.splitlines() if ln.startswith(f"arm {x['arm']['code']} rc=")]
             if rc == 0 and arm_rc and not arm_rc[-1].split("rc=")[1].startswith("0 "):
                 rc = int(arm_rc[-1].split("rc=")[1].split()[0])
+            tb = text(".tier_bytes").strip()
             v = health.verdict(markers=health.read_markers(pre + ".markers"), cg_before=x["cg_before"],
                                cg_after=x["cg_after"], tel_rows=tel, cg_name=x["arm"]["label"], gpu_rows=gpu,
                                runner_rc=rc, runner_log=rl, server_log=sl, regime=c["regime"], engine=c["engine"],
-                               settings=c["health"])
+                               settings=c["health"], turn_rows=health.read_jsonl(pre + ".jsonl"),
+                               disk_bytes=parse_size(c["capacities"]["disk_bytes"]),
+                               tier_bytes_end=int(tb) if tb.isdigit() else None,
+                               ram_tier=x["slot"]["disk"]["wipe"] == "ram")
         v["rc"] = x.get("rc")
+        v.setdefault("covariates", {})["neighbour"] = x.get("neighbour")
         dump(pre + ".cgroup.json", {"before": x["cg_before"], "after": x["cg_after"]})
         dump(pre + ".verdict.json", v)
         return v
@@ -653,7 +820,44 @@ class Block:
             "cell": self.c["cell"], "label": x["arm"]["label"], "code": x["arm"]["code"], "host": self.host,
             "repeat": self.repeat, "attempt": self.attempt, "slot": x["slot"]["name"], "dir": x["dir"],
             "prefix": x["prefix"], "status": status, "valid": None if v is None else v["valid"],
-            "reasons": None if v is None else v["reasons"], "t": time.time(), "dry_run": self.rn.dry})
+            "reasons": None if v is None else v["reasons"], "t": time.time(), "dry_run": self.rn.dry,
+            "neighbour": x.get("neighbour")})
+
+
+def hicache_pilot(rn, c, host, out):
+    """HC-wt's L3 write throughput per patch variant and stock SGLang, inside a cgroup with the cell's io.max on each
+    slot's disk tier (or the RAM tier). Records every variant; the pilot decides sglang_patch_variant."""
+    hp = dict({"bytes": "4G", "threads": 1}, **(c.get("hicache_pilot") or {}))
+    res = {"cell": c["cell"], "host": host, "time_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+           "io_max": c.get("io_max"), "page_bytes": int(c["kv_chunk_bytes"]), "bytes": parse_size(hp["bytes"]),
+           "threads": int(hp["threads"]), "slots": {}}
+    tarm = next((a for a in c["arms"] if a["code"].split(".")[0] == "T"), None)
+    mem = budget_of(c, tarm) if tarm else 4 * GiB          # HC-wt's own memory.max: its page-cache room
+    res["memory_max"] = mem
+    py = os.path.join(c["runner"]["venv"], "bin", "python")
+    for s in c["slots"]:
+        d = s["disk"]
+        dev = cgroup.block_device(rn, d["mount"], d.get("device")) if d["wipe"] != "ram" else None
+        wipe(rn, c, s, dev)
+        cg = cgroup.create(rn, f"{c['cell']}.hicache_pilot.{s['name']}", mem, s["cpus"], s["mems"], io_limits(c, dev))
+        fake = "\n".join(json.dumps({"variant": v, "set_Bps": 1.0e8, "durable_Bps": 1.0e8, "dry_run": True})
+                         for v in ("stock", "fdatasync", "sync_file_range")) + "\n"
+        cmd = in_runner(c, [layby_path(c, "engine/phase_r/cg_exec.sh"), cg, py,
+                            layby_path(c, "engine/phase_r/sglang/hicache_write_pilot.py"), "--dir", d["tier_dir"],
+                            "--bytes", str(res["bytes"]), "--page-bytes", str(res["page_bytes"]),
+                            "--threads", str(res["threads"])])
+        r = rn.run(cmd, kind="root", fake=fake, timeout=7200)
+        cgroup.destroy(rn, cg)
+        rows = [json.loads(ln) for ln in r.out.splitlines() if ln.strip().startswith("{")]
+        res["slots"][s["name"]] = {"io_max": [cgroup.io_max_line(*i) for i in io_limits(c, dev)], "rc": r.rc,
+                                   "error": None if r.ok else r.err[-1000:], "variants": {x["variant"]: x for x in rows}}
+    path = os.path.join(out, c["cell"], host, "hicache_pilot.json")
+    dump(path, res)
+    for name, sl in res["slots"].items():
+        for v, x in sl["variants"].items():
+            print(f"{name} {v}: set {x['set_Bps'] / 1e6:.0f} MB/s, durable {x['durable_Bps'] / 1e6:.0f} MB/s")
+    print("written", path)
+    return EXIT_OK if all(sl["rc"] == 0 and len(sl["variants"]) == 3 for sl in res["slots"].values()) else EXIT_PREFLIGHT
 
 
 def _strip(p):
@@ -665,7 +869,7 @@ def _strip(p):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("preflight", "plan", "run"):
+    for name in ("preflight", "plan", "run", "hicache-pilot"):
         p = sub.add_parser(name)
         p.add_argument("--cell", required=True)
         p.add_argument("--aa", help="A/A mode: run this arm twice as LABEL_aa1 and LABEL_aa2 (cell id CELL-AA)")
@@ -698,6 +902,17 @@ def main(argv=None):
         return EXIT_OK
     rn = Runner(dry_run=a.dry_run)
     out = os.path.abspath(a.out)
+    live = live_problems(rn, c)
+    if live:
+        for p in live:
+            print("CONFIG FAIL:", p)
+        return EXIT_CONFIG
+    if a.cmd == "hicache-pilot":
+        if c["engine"] != "sglang":
+            log("hicache-pilot is for SGLang cells")
+            return EXIT_CONFIG
+        rn.set_log(os.path.join(out, c["cell"], a.host, "hicache_pilot.commands.log"))
+        return hicache_pilot(rn, c, a.host, out)
     if a.cmd == "preflight":
         probs = preflight(rn, c, out)
         for p in probs:

@@ -1,5 +1,5 @@
 {
- "_comment": "GLM 5.3 Flash on an 8x RTX PRO 6000 node: two TP4 engines, one per NUMA half, each with its own disk, cgroup and io.max; arms split across halves by order.assign_slots and run in lockstep rounds. PLACEHOLDER values. Arm set (plan section 6): C0, T, the better of T2 and CT on the tuning workload (T2 here until tuning picks), K, K_ewma.",
+ "_comment": "GLM 5.3 Flash on an 8x RTX PRO 6000 node: two TP4 engines, one per NUMA half, each with its own disk, cgroup and io.max; arms split across halves by order.assign_slots and run in lockstep rounds. PLACEHOLDER values. Arm set (plan section 6): C0, T, the better of T2 and CT on the tuning workload (T2 here until tuning picks), K, K_ewma. With 5 arms over 2 slots the last round's empty slot runs an unscored C0 filler.",
  "cell": "large-glm-slow-heavy",
  "plan": "BENCH_PLAN draft 4 (freeze commit to fill)",
  "seed": 20261010,
@@ -15,9 +15,16 @@
  },
  "capacities": {
   "gpu_kv_bytes": "4G",
-  "cpu_bytes": "28G"
+  "cpu_bytes": "28G",
+  "disk_bytes": "140G"
  },
  "hard_cap_s": 13500,
+ "kv_chunk_bytes": 2097152,
+ "live_scoring": {
+  "side_file": "/root/phase_r/measured.side.jsonl",
+  "ckpt": "/root/dwell/model.safetensors",
+  "calib": "/root/dwell/config.json"
+ },
  "cgroup": {
   "arm_rss_bytes": {
    "C0": "24G",
@@ -25,7 +32,8 @@
    "K": "26G",
    "K_ewma": "26G",
    "T2": "25G"
-  }
+  },
+  "sidecar_rss_bytes": "3G"
  },
  "io_max": {
   "rbps": "450M",

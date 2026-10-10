@@ -22,7 +22,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cgroup import parse_io_stat, parse_kv, parse_pressure  # noqa: E402
 import pagecache  # noqa: E402
 
-STAT_KEYS = ("file", "anon", "shmem", "file_dirty", "file_writeback", "pgmajfault", "workingset_refault_file")
+STAT_KEYS = ("file", "anon", "shmem", "file_mapped", "file_dirty", "file_writeback", "pgmajfault",
+             "workingset_refault_file")
 
 
 def rd(p):

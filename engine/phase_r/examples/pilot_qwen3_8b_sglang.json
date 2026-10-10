@@ -1,0 +1,24 @@
+{
+ "_comment": "PLACEHOLDER numbers for dry runs and tests, not measurements. The SGLang 0.5.21 pilot of Qwen3-8B; a cell may only use a pilot of its own engine (orchestrate.py refuses another). The pilot overwrites every value: arm_rss_bytes per arm label as the peak RSS of that arm's processes beyond its pinned host tier, sidecar_rss_bytes as the live-scoring sidecar's peak RSS (added to arm K's memory.max), prefill_tok_s and wt_offered_write_Bps as SGLang's measured prefill rate and HC-wt's offered L3 write rate at each load.",
+ "model": "Qwen/Qwen3-8B",
+ "engine": "sglang",
+ "kv_bytes_per_token": 147456,
+ "arm_rss_bytes": {
+  "C0": 12884901888,
+  "HC-wt": 12884901888,
+  "HC-sel": 12884901888,
+  "K": 13958643712,
+  "K_ewma": 13958643712
+ },
+ "sidecar_rss_bytes": 2147483648,
+ "loads": {
+  "heavy": {
+   "prefill_tok_s": 20000.0,
+   "wt_offered_write_Bps": 600000000.0
+  },
+  "light": {
+   "prefill_tok_s": 24000.0,
+   "wt_offered_write_Bps": 220000000.0
+  }
+ }
+}
