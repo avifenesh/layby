@@ -15,7 +15,7 @@
 #      Qwen3-8B bf16: 36 layers x 8 KV heads x 128 x 2 x 2 bytes), PAGE (page size, default 64),
 #      TREE_CORE (default python for every arm: the park backend needs the Python TreeCore, so the
 #      baselines use it too), SERVE_ARGS (extra sglang serve args), PORT (default 30000),
-#      PARK_PORT (default 8765), WINDOW (replay --window seconds; unset: whole workload).
+#      PARK_PORT (default 8765), HARD_CAP (replay --hard-cap seconds; unset: no cap).
 # The plugin loads only in arm K (SGLANG_PLUGINS=park; other arms SGLANG_PLUGINS=none).
 # The server runs in its own session (setsid); cleanup kills only that process group.
 set -u
@@ -29,7 +29,7 @@ export SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=${TREE_CORE:-python}
 PORT=${PORT:-30000}; PARK_PORT=${PARK_PORT:-8765}
 TOKENS=$(python3 -c "print(int($KV) // int($BPT))")
 RATIO=$(python3 -c "print(round(int($CPU) / int($KV), 6))")
-WIN=${WINDOW:+--window $WINDOW}
+WIN=${HARD_CAP:+--hard-cap $HARD_CAP}
 for arm in "$@"; do
   storage=""; park=""; client=""; plugins=none
   case ${arm%%.*} in

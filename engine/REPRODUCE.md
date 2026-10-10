@@ -19,6 +19,10 @@ Workloads are in `workloads/`, with bytes, sha256, source pools and licenses per
 (`python scripts/verify_manifest.py` checks them; `box_run.sh` runs the check first). The private replay used in the
 paper (the author's own sessions) is not shipped.
 
+The runs below were made at tag `v1.0.0`, whose `replay.py --window` stopped every session at the window (`WINDOW`).
+Check out `v1.0.0` to rerun them as published. Later commits run every session to completion under `--hard-cap`
+(`HARD_CAP` in the scripts), with unserved turns censored, and analyze with `engine/analyze_phase_r.py`.
+
 Paths. Every script takes its locations from environment variables and falls back to the values the rounds used:
 `LAYBY_ROOT` (this repo; default the checkout the script lives in), `REPLAY` (the workload file; default
 `$HOME/replay.json`), `OUT` (outputs; default `$HOME/out` for the Qwen3-8B boxes, `$DATA/out` for the Nebius VM),

@@ -25,7 +25,7 @@
 #      directory, default the script's own), REPO (the layby repo root, default ENGINE_DIR/..), SERVE_ARGS (extra
 #      vllm serve args), OFF_EXTRA (extra kv_connector_extra_config entries, each starting with a comma), MAXLEN
 #      (default 40960), BOOT_WAIT (5 s polls, default 180), REPLAY_TIMEOUT (s, default 5400), VOCAB (replay token
-#      ids, default 150000), WINDOW (replay --window seconds), PORT (default 8000), PARK_PORT (hint port, default
+#      ids, default 150000), HARD_CAP (replay --hard-cap seconds), PORT (default 8000), PARK_PORT (hint port, default
 #      8765). The server runs in its own session (setsid); cleanup kills only that process group.
 set -u
 W=$1; O=$2; KV=$3; CPU=$4; DISK=$5; shift 5
@@ -82,7 +82,7 @@ for arm in "$@"; do
     timeout ${REPLAY_TIMEOUT:-5400} $VENV/bin/python $ENGINE_DIR/smoke_restore.py --url http://127.0.0.1:$PORT --model $MODEL \
       --vocab ${VOCAB:-150000} ${SMOKE_ARGS:-} > $O/$arm.client.log 2>&1
   else
-  timeout ${REPLAY_TIMEOUT:-5400} $VENV/bin/python $ENGINE_DIR/replay.py $W $O/$arm.jsonl --url http://127.0.0.1:$PORT --cpu-hint $src --prefetch $src --model $MODEL --vocab ${VOCAB:-150000} ${WINDOW:+--window $WINDOW} $client > $O/$arm.client.log 2>&1
+  timeout ${REPLAY_TIMEOUT:-5400} $VENV/bin/python $ENGINE_DIR/replay.py $W $O/$arm.jsonl --url http://127.0.0.1:$PORT --cpu-hint $src --prefetch $src --model $MODEL --vocab ${VOCAB:-150000} ${HARD_CAP:+--hard-cap $HARD_CAP} $client > $O/$arm.client.log 2>&1
   fi
   rc=$?
   case ${arm%%.*} in K|K0|KW|KD|SM) curl -sf localhost:$PARK_PORT/live > $O/$arm.park_live.json
