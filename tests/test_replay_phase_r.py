@@ -206,3 +206,52 @@ def test_sidecar_score_endpoint():
     d = asyncio.run(main())
     assert d["key"] == "k1" and d["surv"] == pytest.approx([0.4] * 15)
     assert got == [[{"key": "k1", "surv": pytest.approx([0.4] * 15)}]]
+
+
+def test_open_loop_poisson_arrivals_session_order_and_name(tmp_path):
+    import random
+    import importlib.util
+    port, hport, seen = free_port(), free_port(), []
+    mock_vllm(port, hport, seen)
+    w = write_wl(tmp_path, [dict(id=f"s{k}", pool="p", seed=k, start=500.0, turns=[T(300.0), T(None)])
+                            for k in range(6)])
+    out = tmp_path / "c__K__h1__rate10.jsonl"
+    p, rows = run(w, out, port, hport, ["--open-loop-rate", "10", "--requests", "8", "--seed", "3",
+                                        "--hard-cap", "30"])
+    R = turn_rows(rows)
+    assert len(R) == 8 and not any(r.get("failed") or r.get("censored") for r in R.values())
+    # arrival times: the seed's Poisson process at 10/s, the same in every arm (no arrival dropped here)
+    rng, t, want = random.Random(3), 0.0, []
+    for _ in range(8):
+        t += rng.expovariate(10.0); want.append(round(t, 4))
+    assert sorted(r["arrival"] for r in R.values()) == want
+    assert all(abs(r["sent"] - r["arrival"]) < 0.5 for r in R.values())      # sent on arrival, not after gaps
+    summ = next(r for r in rows if "wall_s" in r)
+    assert (summ["requests"], summ["arrivals_dropped"], summ["open_loop_rate"]) == (8, 0, 10.0)
+    assert summ["wall_s"] < 10                                                   # the 300 s gaps and starts unused
+    # a session's turn 1 goes after its turn 0 finished, on its history
+    bodies = {b["kv_transfer_params"]["park_key"]: b for k, _, b in seen if k == "vllm"}
+    for (sid, i), r in R.items():
+        if i == 1:
+            r0 = R[(sid, 0)]
+            assert r["sent"] >= r0["sent"] + r0["e2e"] - 1e-3
+            assert bodies[f"{sid}-1"]["prompt"][:10] == bodies[f"{sid}-0"]["prompt"] + [7, 8]
+    # the analysis reads it as a sweep point
+    spec = importlib.util.spec_from_file_location("apr", os.path.join(ROOT, "engine", "analyze_phase_r.py"))
+    A = importlib.util.module_from_spec(spec); spec.loader.exec_module(A)
+    sw = A.load_sweeps(str(tmp_path))
+    assert A.sweep_point(sw["c"]["h1"]["K"][10.0])["n"] == 8
+
+
+def test_open_loop_drops_arrivals_when_no_session_is_ready_and_checks_the_name(tmp_path):
+    port, hport, seen = free_port(), free_port(), []
+    mock_vllm(port, hport, seen)
+    w = write_wl(tmp_path, [dict(id="s0", pool="p", seed=1, start=0.0, turns=[T(1.0), T(1.0), T(None)])])
+    _, rows = run(w, tmp_path / "c__K__h1__rate50.jsonl", port, hport,
+                  ["--open-loop-rate", "50", "--requests", "3", "--hard-cap", "30"])
+    R = turn_rows(rows)
+    assert sorted(R) == [("s0", 0), ("s0", 1), ("s0", 2)]                       # one session: strictly in order
+    assert next(r for r in rows if "wall_s" in r)["arrivals_dropped"] > 0        # 50/s while a turn takes ~0.1 s
+    p, _ = run(w, tmp_path / "c__K__h1.jsonl", port, hport, ["--open-loop-rate", "50", "--requests", "3"],
+               check=False)
+    assert p.returncode == 2 and "rate50.jsonl" in p.stderr

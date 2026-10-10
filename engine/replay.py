@@ -27,6 +27,14 @@ written as the JSON token Infinity (Python's json reads it). Scrapes /metrics be
 OUT.env.json beside the output (GPUs, driver, torch and CUDA versions, repo commit, server version; every
 field optional).
 
+Open loop (--open-loop-rate R --requests N [--seed S], H5's throughput sweep): arrivals form a Poisson process at
+R per second from the seed; each arrival sends the next turn of a session whose previous turn has finished (picked
+at random from the seed's second stream; an arrival with no ready session is dropped and counted). Turns of one
+session stay in order and build the same history as in the closed loop; workload gaps and starts are not used.
+The run stops after N sends and waits for the in-flight ones (censored if still in flight at --hard-cap). Rows are
+the same, plus "arrival" (scheduled seconds from the start); the summary adds the rate, requests sent and dropped
+arrivals. The output must be named CELL__ARM__HOST__rate<R>.jsonl, as analyze_phase_r.py reads it.
+
 Health check: before anything is sent, the workload's session and turn counts are printed; with
 --expect-sessions / --expect-turns a mismatch exits with status 2 and sends nothing.
 
@@ -50,6 +58,7 @@ options (--hint, --cpu-hint, --prefetch) are refused. usage holds the turn's met
 Usage: replay.py replay.json OUT.jsonl --url http://127.0.0.1:8000 --hint none|gbm|oracle
        [--model Qwen/Qwen3-8B] [--vocab 150000] [--engine vllm|sglang] [--hard-cap SECONDS]
        [--expect-sessions N --expect-turns M] [--park-hints v6 [--side-file SIDE.jsonl --sidecar URL]]
+       [--open-loop-rate R --requests N [--seed 0]]
 """
 import argparse, asyncio, json, os, random, subprocess, sys, time
 import aiohttp
@@ -75,6 +84,9 @@ ap.add_argument("--hard-cap", type=float, help="seconds from the start; turns no
 ap.add_argument("--turn-timeout", type=float, default=3600.0, help="seconds per request before the turn fails")
 ap.add_argument("--expect-sessions", type=int, help="health check: exact session count of the workload")
 ap.add_argument("--expect-turns", type=int, help="health check: exact turn count of the workload")
+ap.add_argument("--open-loop-rate", type=float, help="open loop: Poisson arrivals at this many requests per second")
+ap.add_argument("--requests", type=int, help="open loop: requests to send")
+ap.add_argument("--seed", type=int, default=0, help="open loop: arrival and session-pick seed")
 ap.add_argument("--model", default="Qwen/Qwen3-8B")
 ap.add_argument("--vocab", type=int, default=150000)
 a = ap.parse_args()
@@ -84,6 +96,21 @@ if bool(a.side_file) != bool(a.sidecar):
     ap.error("--side-file and --sidecar go together")
 if a.side_file and not a.park_hints:
     ap.error("live scoring needs --park-hints NAME (the precomputed curve it is compared with)")
+if a.open_loop_rate is not None:
+    if a.open_loop_rate <= 0 or not a.requests or a.requests <= 0:
+        ap.error("--open-loop-rate needs a positive rate and --requests N")
+    if a.prefetch != "none":
+        ap.error("--prefetch uses the closed loop's gaps; not with --open-loop-rate")
+    _parts = os.path.basename(a.out)[:-6].split("__") if a.out.endswith(".jsonl") else []
+    try:
+        _ok = len(_parts) == 4 and all(_parts) and _parts[3].startswith("rate") and float(_parts[3][4:]) == a.open_loop_rate
+    except ValueError:
+        _ok = False
+    if not _ok:
+        ap.error(f"open-loop output must be named CELL__ARM__HOST__rate{a.open_loop_rate:g}.jsonl "
+                 "(analyze_phase_r.py reads the rate from the name)")
+elif a.requests is not None:
+    ap.error("--requests is for --open-loop-rate")
 
 W = json.load(open(a.workload))
 
@@ -311,51 +338,107 @@ def meta_of(s, i):
                 prev_gap=p["gap_after"] if p else None)
 
 
+async def serve_turn(http, s, st, i, extra=None):
+    """Send turn i of session s on the session's state st (rng, history) and write its row. Returns True when
+    served. A failed turn writes a failed row; its new tokens stay in the history, it adds no output."""
+    t = s["turns"][i]
+    st["history"] = st["history"] + toks(st["rng"], t["new_tokens"])
+    history = st["history"]
+    hint = "none" if a.hint == "none" else t[f"hint_{a.hint}"]
+    try:
+        try:
+            out_ids, m = await turn(http, i, t, history, hint, f"{s['id']}-{i}")
+        except aiohttp.ClientConnectionError:  # a dropped keep-alive connection: resend once, flag the row
+            out_ids, m = await turn(http, i, t, history, hint, f"{s['id']}-{i}")
+            m["retried"] = 1
+        if m["ttft"] is None:
+            raise RuntimeError("stream ended without a token")
+    except Exception as e:  # a failed turn: recorded as infinite TTFT, the session goes on
+        err = f"HTTP {e.status} {e.message}" if isinstance(e, aiohttp.ClientResponseError) else repr(e)
+        emit(dict(meta_of(s, i), prompt_tokens=len(history), out_tokens=0, hint=hint, ttft=INF, e2e=INF,
+                  failed=True, error=err[:300], sent=None, concurrency=None, **(extra or {})))
+        counts["failed"] += 1
+        return False
+    st["history"] = history + out_ids
+    if a.park_hints and t["gap_after"] is not None:
+        post_hint(http, s, i, t)
+    emit(dict(meta_of(s, i), prompt_tokens=len(history), out_tokens=len(out_ids), hint=hint,
+              prev_hint=(s["turns"][i - 1][f"hint_{a.hint}"] if i and a.hint != "none" else "none"), **m,
+              **(extra or {})))
+    counts["served"] += 1
+    return True
+
+
 async def run_session(http, s):
-    rng = random.Random(s["seed"])
+    st = dict(rng=random.Random(s["seed"]), history=[])
     progress[s["id"]] = 0
     await asyncio.sleep(s["start"])
-    history = []
     for i, t in enumerate(s["turns"]):
-        history = history + toks(rng, t["new_tokens"])
-        hint = "none" if a.hint == "none" else t[f"hint_{a.hint}"]
-        try:
-            try:
-                out_ids, m = await turn(http, i, t, history, hint, f"{s['id']}-{i}")
-            except aiohttp.ClientConnectionError:  # a dropped keep-alive connection: resend once, flag the row
-                out_ids, m = await turn(http, i, t, history, hint, f"{s['id']}-{i}")
-                m["retried"] = 1
-            if m["ttft"] is None:
-                raise RuntimeError("stream ended without a token")
-        except Exception as e:  # a failed turn: recorded as infinite TTFT, the session goes on
-            err = f"HTTP {e.status} {e.message}" if isinstance(e, aiohttp.ClientResponseError) else repr(e)
-            emit(dict(meta_of(s, i), prompt_tokens=len(history), out_tokens=0, hint=hint, ttft=INF, e2e=INF,
-                      failed=True, error=err[:300], sent=None, concurrency=None))
-            counts["failed"] += 1
-            progress[s["id"]] = i + 1
-            if t["gap_after"] is None:
-                break
-            await asyncio.sleep(t["gap_after"])
-            continue
-        history = history + out_ids
-        if a.park_hints and t["gap_after"] is not None:
-            post_hint(http, s, i, t)
-        rec = dict(meta_of(s, i), prompt_tokens=len(history) - len(out_ids), out_tokens=len(out_ids), hint=hint,
-                   prev_hint=(s["turns"][i - 1][f"hint_{a.hint}"] if i and a.hint != "none" else "none"), **m)
-        emit(rec)
-        counts["served"] += 1
+        served = await serve_turn(http, s, st, i)
         progress[s["id"]] = i + 1
         if t["gap_after"] is None:
             break
-        w = warm_at(t)
+        w = warm_at(t) if served else None
         if w is not None and w < t["gap_after"]:
             await asyncio.sleep(w)
             eta = eta_of(t)
-            asyncio.create_task(warm(http, list(history), None if eta is None else (-1.0 if eta < 0 else max(eta - w, 0.5))))
+            asyncio.create_task(warm(http, list(st["history"]), None if eta is None else (-1.0 if eta < 0 else max(eta - w, 0.5))))
             emit(dict(session=s["id"], turn=i, warm_at=w))
             await asyncio.sleep(t["gap_after"] - w)
         else:
             await asyncio.sleep(t["gap_after"])
+
+
+async def open_loop(http):
+    """Open loop: arrivals form a Poisson process at --open-loop-rate from --seed (the same arrival times in every
+    arm); each arrival sends the next turn of a session that is ready (its previous turn finished, turns left),
+    picked at random from a second stream of the same seed. An arrival with no ready session is dropped and
+    counted. Stops after --requests sends, then waits for the in-flight ones (up to the hard cap; still in flight
+    at the cap: censored). Gaps and session starts of the workload are not used."""
+    arr, pick = random.Random(a.seed), random.Random(a.seed + 1)
+    st = {s["id"]: dict(rng=random.Random(s["seed"]), history=[], next=0, busy=False) for s in W["sessions"]}
+    tasks, inflight_turns = set(), {}
+    sent = dropped = 0
+    t_arr = 0.0
+
+    async def one(s, i):
+        try:
+            await serve_turn(http, s, st[s["id"]], i, extra=dict(arrival=round(t_arr_of[(s["id"], i)], 4)))
+        finally:
+            st[s["id"]]["busy"] = False
+            inflight_turns.pop((s["id"], i), None)
+
+    t_arr_of = {}
+    while sent < a.requests:
+        t_arr += arr.expovariate(a.open_loop_rate)
+        if a.hard_cap is not None and t_arr > a.hard_cap:
+            break
+        delay = t_zero + t_arr - time.time()
+        if delay > 0:
+            await asyncio.sleep(delay)
+        ready = [s for s in W["sessions"] if not st[s["id"]]["busy"] and st[s["id"]]["next"] < len(s["turns"])]
+        if not ready:
+            if all(not v["busy"] for v in st.values()):
+                break                                     # the workload is used up
+            dropped += 1
+            continue
+        s = pick.choice(ready)
+        i = st[s["id"]]["next"]
+        st[s["id"]].update(next=i + 1, busy=True)
+        t_arr_of[(s["id"], i)] = t_arr
+        inflight_turns[(s["id"], i)] = s
+        task = asyncio.create_task(one(s, i))
+        tasks.add(task)
+        sent += 1
+    left = None if a.hard_cap is None else max(a.hard_cap - (time.time() - t_zero), 0.0)
+    done, pending = await asyncio.wait(tasks, timeout=left) if tasks else (set(), set())
+    for t in pending:
+        t.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+    for (sid, i), s in list(inflight_turns.items()):
+        emit(dict(meta_of(s, i), ttft=INF, e2e=INF, censored=True, arrival=round(t_arr_of[(sid, i)], 4)))
+        counts["censored"] += 1
+    return dict(open_loop_rate=a.open_loop_rate, requests=sent, arrivals_dropped=dropped), bool(pending)
 
 
 def censor_rest():
@@ -431,20 +514,25 @@ async def main():
         await scrape(http, "before")
         t_zero = time.time()
         conc_series.append((0.0, 0))
-        tasks = [asyncio.create_task(run_session(http, s)) for s in W["sessions"]]
-        done, pending = await asyncio.wait(tasks, timeout=a.hard_cap)
-        for t in pending:
-            t.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
-        for t in done:
-            if not t.cancelled() and t.exception() is not None:   # a replay bug, not a failed turn: say so loudly
-                print("session task error:", repr(t.exception())[:300], file=sys.stderr)
-        censor_rest()
+        extra = {}
+        if a.open_loop_rate:
+            extra, cap_hit = await open_loop(http)
+        else:
+            tasks = [asyncio.create_task(run_session(http, s)) for s in W["sessions"]]
+            done, pending = await asyncio.wait(tasks, timeout=a.hard_cap)
+            for t in pending:
+                t.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            for t in done:
+                if not t.cancelled() and t.exception() is not None:   # a replay bug, not a failed turn: say so loudly
+                    print("session task error:", repr(t.exception())[:300], file=sys.stderr)
+            censor_rest()
+            cap_hit = bool(pending)
         wall = time.time() - t_zero
         if hint_tasks:
             await asyncio.gather(*list(hint_tasks))   # hints of the last served turns
         emit({"concurrency_series": conc_series})
-        emit(dict(wall_s=wall, hard_cap=a.hard_cap, cap_hit=bool(pending), **counts))
+        emit(dict(wall_s=wall, hard_cap=a.hard_cap, cap_hit=cap_hit, **counts, **extra))
         await scrape(http, "after")
 
 asyncio.run(main())
