@@ -290,3 +290,45 @@ def test_control_curves_are_posted_and_a_missing_one_stops_the_run(tmp_path):
     w = write_wl(tmp_path, [dict(id="s0", pool="p", seed=1, start=0.0, turns=turns)])
     p, _ = run(w, tmp_path / "o2.jsonl", port, hport, ["--park-hints", "ewma"], check=False)
     assert p.returncode == 2 and "1 turns with a wait lack surv_ewma" in p.stderr and not seen
+
+
+def test_open_loop_requests_in_flight_at_the_cap_are_written_censored(tmp_path):
+    # a request hanging at the hard cap is cancelled; it must still get a censored row (before the fix the cancel
+    # path dropped it from the in-flight set, so the request vanished from the output)
+    port, hport, seen = free_port(), free_port(), []
+    mock_vllm(port, hport, seen, behave={"s0-0": "hang", "s1-0": "hang"})
+    w = write_wl(tmp_path, [dict(id=f"s{k}", pool="p", seed=k, start=0.0, turns=[T(0.1), T(None)]) for k in range(4)])
+    _, rows = run(w, tmp_path / "c__K__h1__rate20.jsonl", port, hport,
+                  ["--open-loop-rate", "20", "--requests", "4", "--seed", "1", "--hard-cap", "3"])
+    R = turn_rows(rows)
+    summ = next(r for r in rows if "wall_s" in r)
+    assert summ["requests"] == len(R)                                  # every request sent has a row
+    sent = {b["kv_transfer_params"]["park_key"] for k, _, b in seen if k == "vllm"}
+    hung = sent & {"s0-0", "s1-0"}
+    assert hung                                                         # the seed sends at least one hanging turn
+    for key in hung:
+        sid = key.split("-")[0]
+        assert R[(sid, 0)]["censored"] and R[(sid, 0)]["ttft"] == float("inf")
+    assert summ["censored"] == len(hung) and summ["cap_hit"] and summ["wall_s"] < 10
+
+
+def test_keep_cuts_the_history_before_the_new_tokens(tmp_path):
+    # context compaction: a turn with keep restarts its prompt from the first keep tokens of the history
+    port, hport, seen = free_port(), free_port(), []
+    mock_vllm(port, hport, seen)
+    turns = [T(0.1), dict(T(0.1), keep=4), dict(T(None), keep=0)]
+    w = write_wl(tmp_path, [dict(id="s0", pool="p", seed=1, start=0.0, turns=turns)])
+    run(w, tmp_path / "o.jsonl", port, hport)
+    b = {x["kv_transfer_params"]["park_key"]: x["prompt"] for k, _, x in seen if k == "vllm"}
+    assert len(b["s0-0"]) == 8
+    assert len(b["s0-1"]) == 4 + 8 and b["s0-1"][:4] == b["s0-0"][:4]       # 4 kept, then turn 1's 8 new tokens
+    assert len(b["s0-2"]) == 8                                               # keep 0: only its new tokens
+
+
+def test_lost_connection_is_flagged_conn_error(tmp_path):
+    # no server on the port: every turn fails on the connection, and the row says so (the harness counts these)
+    port, hport = free_port(), free_port()
+    w = write_wl(tmp_path, [dict(id="s0", pool="p", seed=1, start=0.0, turns=[T(0.1), T(None)])])
+    _, rows = run(w, tmp_path / "o.jsonl", port, hport)
+    R = turn_rows(rows)
+    assert all(r["failed"] and r.get("conn_error") for r in R.values()) and len(R) == 2

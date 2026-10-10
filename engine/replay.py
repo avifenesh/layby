@@ -3,7 +3,9 @@
 server (native /generate, --engine sglang).
 
 Each session sends its turns in order. Turn i's prompt is the full token history: earlier prompts,
-the model's own outputs (returned token ids), and the new tokens of this turn. The next turn is sent
+the model's own outputs (returned token ids), and the new tokens of this turn. A turn with `keep` set first cuts
+the history to its first `keep` tokens (0 when the oldest history is truncated under a context cap, the prefix
+length when a client compacts or edits its context), so only that prefix stays reusable. The next turn is sent
 `gap_after` seconds after this turn finishes, so waits caused by the server delay the session the
 way they would a real agent. Output length is fixed per turn (ignore_eos). The move/stay hint for
 the idle period after a turn rides on that turn's request as vllm_xargs.park_hint.
@@ -18,6 +20,8 @@ error on a turn writes the turn as failed ({"failed": true, "ttft": Infinity, "e
 goes on: the next turn is sent gap_after seconds after the failure. The failed turn's new tokens stay in the
 history (the client sent them); its output does not exist, so nothing is appended for it, and no park hint is
 posted for it (no response ended). A dropped keep-alive connection is resent once first (row flag "retried").
+A failure that is a lost connection to the server (connection refused or reset, server disconnected, a truncated
+stream) also carries "conn_error": true: the harness reads it as a sign of a dead engine (health.py).
 
 Records per turn: session, turn, kind, tool and prog (when the workload has them), the previous turn's kind,
 tool and gap, prompt tokens, hint, TTFT, end-to-end time, send time, and concurrency (requests in flight at
@@ -31,7 +35,8 @@ Open loop (--open-loop-rate R --requests N [--seed S], H5's throughput sweep): a
 R per second from the seed; each arrival sends the next turn of a session whose previous turn has finished (picked
 at random from the seed's second stream; an arrival with no ready session is dropped and counted). Turns of one
 session stay in order and build the same history as in the closed loop; workload gaps and starts are not used.
-The run stops after N sends and waits for the in-flight ones (censored if still in flight at --hard-cap). Rows are
+The run stops after N sends and waits for the in-flight ones (still in flight at --hard-cap: cancelled and written as
+censored, so every request sent has a row). Rows are
 the same, plus "arrival" (scheduled seconds from the start); the summary adds the rate, requests sent and dropped
 arrivals. The output must be named CELL__ARM__HOST__rate<R>.jsonl, as analyze_phase_r.py reads it.
 
@@ -373,10 +378,16 @@ def meta_of(s, i):
                 prev_gap=p["gap_after"] if p else None)
 
 
+# a lost connection to the server, not an answer from it: refused or reset, disconnected mid-stream, truncated payload
+CONN_ERRORS = (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError, ConnectionError)
+
+
 async def serve_turn(http, s, st, i, extra=None):
     """Send turn i of session s on the session's state st (rng, history) and write its row. Returns True when
     served. A failed turn writes a failed row; its new tokens stay in the history, it adds no output."""
     t = s["turns"][i]
+    if t.get("keep") is not None:  # the context was cut: keep only this many leading history tokens
+        st["history"] = st["history"][: t["keep"]]
     st["history"] = st["history"] + toks(st["rng"], t["new_tokens"])
     history = st["history"]
     hint = "none" if a.hint == "none" else t[f"hint_{a.hint}"]
@@ -391,8 +402,9 @@ async def serve_turn(http, s, st, i, extra=None):
             raise RuntimeError("stream ended without a token")
     except Exception as e:  # a failed turn: recorded as infinite TTFT, the session goes on
         err = f"HTTP {e.status} {e.message}" if isinstance(e, aiohttp.ClientResponseError) else repr(e)
+        conn = {"conn_error": True} if isinstance(e, CONN_ERRORS) else {}
         emit(dict(meta_of(s, i), prompt_tokens=len(history), out_tokens=0, hint=hint, ttft=INF, e2e=INF,
-                  failed=True, error=err[:300], sent=None, concurrency=None, **(extra or {})))
+                  failed=True, error=err[:300], sent=None, concurrency=None, **conn, **(extra or {})))
         counts["failed"] += 1
         return False
     st["history"] = history + out_ids
@@ -438,11 +450,11 @@ async def open_loop(http):
     t_arr = 0.0
 
     async def one(s, i):
-        try:
-            await serve_turn(http, s, st[s["id"]], i, extra=dict(arrival=round(t_arr_of[(s["id"], i)], 4)))
-        finally:
-            st[s["id"]]["busy"] = False
-            inflight_turns.pop((s["id"], i), None)
+        # serve_turn writes a row for every outcome but cancellation (CancelledError is not an Exception): a request
+        # cancelled at the hard cap stays in inflight_turns and is written as censored below
+        await serve_turn(http, s, st[s["id"]], i, extra=dict(arrival=round(t_arr_of[(s["id"], i)], 4)))
+        st[s["id"]]["busy"] = False
+        inflight_turns.pop((s["id"], i), None)
 
     t_arr_of = {}
     while sent < a.requests:
