@@ -83,6 +83,11 @@ ap.add_argument("--gap-cap", type=float, default=300.0)
 ap.add_argument("--min-turns", type=int, default=6)
 ap.add_argument("--min-turns-chat", type=int, default=4)
 ap.add_argument("--seed", type=int, default=0)
+ap.add_argument("--extra", action="append", default=[],
+                help="MODEL:NAME:LIVE_FACTOR: another workload from the measured partition at LIVE_FACTOR x the "
+                     "model's live sessions (LIVE_FACTORp: until peak live KV reaches that multiple of the measured "
+                     "workload's), disjoint from the measured workload and every earlier extra of that "
+                     "model (they run as separate arms on one host), e.g. qwen3_8b:light:0.5")
 ap.add_argument("--used-report", help="used_sessions.py report (per use: refs, sessions) to copy into the manifests")
 a = ap.parse_args()
 os.makedirs(a.out, exist_ok=True)
@@ -254,10 +259,12 @@ def cut(M, T, limit):
     return out, length, len(out) < len(T)
 
 
-def assemble(M, name, items, duration, build_turns, src_of):
+def assemble(M, name, items, duration, build_turns, src_of, live=1.0, skip=frozenset(), peak=None):
     rng = np.random.default_rng(abs(hash_int(name)) % 2**32)
-    sessions, refs, target, total = [], [], M["live"] * duration, 0.0
+    sessions, refs, target, total = [], [], M["live"] * live * duration, 0.0
     for k, (src, sess, unit, g) in enumerate(items):
+        if (src, sess) in skip:
+            continue
         full = build_turns(M, g)
         T, L, was_cut = cut(M, full, duration)
         if len(T) < 3:
@@ -272,7 +279,10 @@ def assemble(M, name, items, duration, build_turns, src_of):
         sessions.append(dict(id=sid, pool=src, seed=1000 + len(sessions), start=start, turns=turns,
                              _src_session=sess, _unit=unit, _len=L, _cut=was_cut, _turns_src=len(full), _why=why))
         total += L
-        if total >= target:
+        if peak is not None:
+            if load(sessions, M, duration)["peak_live_kv_tokens"] >= peak:
+                break
+        elif total >= target:
             break
     return sessions, refs, total
 
@@ -341,6 +351,24 @@ for M in models:
         name = f"{M['name']}.{p}"
         S, R, _ = assemble(M, name, items, a.duration, turns_feat, None)
         built[name] = write(M, name, S, R, dict(duration=a.duration, partition=p))
+        if p == "measured":
+            taken = {(x["pool"], x["_src_session"]) for x in S}
+            for e in a.extra:
+                mn, suffix, f = e.split(":")
+                if mn != M["name"]:
+                    continue
+                nm = f"{M['name']}.{suffix}"
+                pk = None
+                if f.endswith("p"):     # a multiple of the measured workload's peak live KV
+                    pk = float(f[:-1]) * built[name]["load"]["peak_live_kv_tokens"]
+                S2, R2, _ = assemble(M, nm, items, a.duration, turns_feat, None, live=1.0 if pk else float(f),
+                                     skip=frozenset(taken), peak=pk)
+                man = write(M, nm, S2, R2, dict(duration=a.duration, partition=p))
+                man["live_factor" if pk is None else "peak_kv_factor"] = float(f.rstrip("p"))
+                built[nm] = man
+                new = {(x["pool"], x["_src_session"]) for x in S2}
+                assert not (new & taken)
+                taken |= new
         if p == "tuning":
             for d in a.stages:
                 nm = f"{M['name']}.tuning_{int(d / 60)}min"
