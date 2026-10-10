@@ -16,6 +16,11 @@ of the chunks this tier wrote.
 Config (secondary_tiers entry):
   {"type": "ParkFsTier", "module_path": "layby.vllm.fs_tier", "root_dir": ..., "n_read_threads": 16,
    "n_write_threads": 16}
+
+Arm PT (pilot only): "write_all": true writes every chunk the CPU tier stores, as vLLM's own fs tier does in arm T,
+with no cost rule (run it beside the stock OffloadingConnector and LRU). It compares this tier's I/O path (its
+in-memory index for lookups, its dedup of chunks on disk or in flight, its link telemetry) with the native one. The
+default (false) leaves the tier as above.
 """
 import dataclasses
 import itertools
@@ -57,8 +62,9 @@ class ParkFsTier(FileSystemTierManager):
     late_jobs = 0
     dedup_jobs = 0
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, write_all=False, **kwargs):
         super().__init__(*args, **kwargs)
+        self._write_all = bool(write_all)   # arm PT: every stored chunk, no rule
         self._on_disk = set()           # chunks whose write completed
         self._inflight = set()          # chunks being written
         self._writing = {}              # store job id -> its keys
@@ -131,7 +137,7 @@ class ParkFsTier(FileSystemTierManager):
         return RequestOffloadingContext()
 
     def submit_store(self, job_metadata) -> None:
-        if _parked(job_metadata.req_context) or _through(job_metadata.req_context):
+        if _parked(job_metadata.req_context) or _through(job_metadata.req_context) or getattr(self, "_write_all", False):
             # write only chunks not on disk and not being written: a request-level tier gets every chunk of
             # the request again on each turn (vLLM cascades the chunks already in the CPU tier), which
             # rewrote whole contexts per turn and saturated the disk. The parent releases the job's chunks
