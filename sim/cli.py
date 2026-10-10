@@ -1,7 +1,8 @@
 """returnbench: run placement policies on ReturnBench pools in the engine simulator.
 
   returnbench eval [--rules C0 wt cost ...] [--cells POOL:N ...] [--workloads 8] [--seeds 3]
-                   [--disk 0.5 1.5 3] [--policy NAME=module:Class ...] [--pools DIR] [--out rows.jsonl]
+                   [--disk 0.5 1.5 3] [--policy NAME=module:Class ...] [--pools DIR] [--km KM.json]
+                   [--out rows.jsonl]
   returnbench table rows.jsonl [--cells] [--ref wt]
 
 eval runs the 33-cell reference set unless --cells is given, prints the summary, and appends one JSON
@@ -48,6 +49,8 @@ def main(argv=None):
     e.add_argument("--curve", default="v6", help="survival curve field surv_NAME the curve-driven rules read")
     e.add_argument("--window", type=float, help="run length in seconds (no send after it)")
     e.add_argument("--pools", help="directory of pools to read instead of bench/pools (sets RETURNBENCH_POOLS)")
+    e.add_argument("--km", help="per-kind KM curves (python -m layby.curves fit-km) for cost_km and cost_ewma[_aALPHA] "
+                   "(sets RETURNBENCH_KM)")
     e.add_argument("--procs", type=int, default=8); e.add_argument("--out")
     e.add_argument("--ref", default="wt"); e.add_argument("--per-cell", action="store_true")
     t = sub.add_parser("table", help="summarize rows written by eval")
@@ -57,10 +60,12 @@ def main(argv=None):
     if a.cmd == "eval":
         if a.pools:
             os.environ["RETURNBENCH_POOLS"] = E.POOLS = os.path.abspath(a.pools)   # workers read it at import
+        if a.km:
+            os.environ["RETURNBENCH_KM"] = os.path.abspath(a.km)
         extra = [x for x in a.policy]
         names = [E.register(x) for x in extra]
         rules = ["C0"] + [r for r in a.rules + names if r != "C0"]
-        bad = [r for r in rules if r not in E.RULES]
+        bad = [r for r in rules if not E.rule_known(r)]
         if bad:
             ap.error(f"unknown rules {bad}; known: {list(E.RULES)}")
         cells = [(c.rsplit(":", 1)[0], int(c.rsplit(":", 1)[1])) for c in a.cells] if a.cells else E.REFERENCE

@@ -40,6 +40,13 @@ Health check: before anything is sent, the workload's session and turn counts ar
 
 Park hints (--park-hints NAME): each turn is tagged with park_key "SESSION-TURN" and, when it ends, the turn's
 precomputed curve surv_NAME from the workload is posted to the adapter's hint port, as a sidecar would.
+The curve names: v6 (Layby-Dwell), km and ewma (the K_km and K_ewma controls: surv_km and surv_ewma, added to the
+workload by layby.curves annotate). Before anything is sent, the turns with a wait but no surv_NAME are counted; more
+than 1% of them (any at all for km and ewma, which annotate gives every such turn) exits with status 2.
+Continuum (--continuum, arm CT, vLLM only): each turn carries kv_transfer_params park_key "SESSION-TURN", park_kind
+(the turn's kind: "tool" when its response ends in a tool call), park_tool (the workload's tool name for the call
+after this response) and park_last (true on the session's last turn), as layby.vllm.continuum reads them. No curve is
+posted. Not with --park-hints.
 Live scoring (--side-file PATH --sidecar URL, with --park-hints NAME): when a turn ends, the turn's real
 server-view state is read from the side file and sent to the sidecar's POST URL/park/score, which scores it
 with the frozen model, sends the curve to the adapter itself and returns it; the replay does not post the
@@ -57,7 +64,8 @@ options (--hint, --cpu-hint, --prefetch) are refused. usage holds the turn's met
 
 Usage: replay.py replay.json OUT.jsonl --url http://127.0.0.1:8000 --hint none|gbm|oracle
        [--model Qwen/Qwen3-8B] [--vocab 150000] [--engine vllm|sglang] [--hard-cap SECONDS]
-       [--expect-sessions N --expect-turns M] [--park-hints v6 [--side-file SIDE.jsonl --sidecar URL]]
+       [--expect-sessions N --expect-turns M] [--park-hints v6|km|ewma [--side-file SIDE.jsonl --sidecar URL]]
+       [--continuum]
        [--open-loop-rate R --requests N [--seed 0]]
 """
 import argparse, asyncio, json, os, random, subprocess, sys, time
@@ -77,6 +85,8 @@ ap.add_argument("--reload-gbps", type=float, default=20.0)
 ap.add_argument("--park-hints", help="curve name: tag each turn with kv_transfer_params.park_key and, when it ends, "
                 "POST its surv_NAME curve to the park adapter's hint port (park.vllm), as a sidecar would")
 ap.add_argument("--park-port", type=int, default=8765)
+ap.add_argument("--continuum", action="store_true", help="arm CT: send park_key, park_kind, park_tool and park_last "
+                "in kv_transfer_params (layby.vllm.continuum); vLLM only")
 ap.add_argument("--side-file", help="live scoring: JSONL of per-turn server-view states, keyed by session and turn")
 ap.add_argument("--sidecar", help="live scoring: the sidecar's base URL (POST URL/park/score)")
 ap.add_argument("--engine", default="vllm", choices=["vllm", "sglang"])
@@ -92,6 +102,8 @@ ap.add_argument("--vocab", type=int, default=150000)
 a = ap.parse_args()
 if a.engine == "sglang" and (a.hint != "none" or a.cpu_hint != "none" or a.prefetch != "none"):
     ap.error("--hint, --cpu-hint and --prefetch are vLLM-only; SGLang takes --park-hints")
+if a.continuum and (a.engine != "vllm" or a.park_hints):
+    ap.error("--continuum is the vLLM CT arm: not with --engine sglang nor with --park-hints")
 if bool(a.side_file) != bool(a.sidecar):
     ap.error("--side-file and --sidecar go together")
 if a.side_file and not a.park_hints:
@@ -128,6 +140,22 @@ def health_check():
 
 
 N_SESSIONS, N_TURNS = health_check()
+STRICT_CURVES = ("km", "ewma")         # layby.curves annotate gives every turn with a wait its curve
+
+
+def curve_check():
+    """With --park-hints NAME: turns with a wait (the ones a curve is posted for) that lack surv_NAME. Over 1% of
+    them (any for km and ewma) stops the run before anything is sent: a missing curve would be posted as 0.5."""
+    need = [t for s in W["sessions"] for t in s["turns"] if t.get("gap_after") is not None]
+    miss = sum(f"surv_{a.park_hints}" not in t for t in need)
+    print(f"curves surv_{a.park_hints}: {len(need) - miss} of {len(need)} turns with a wait", flush=True)
+    if miss and (a.park_hints in STRICT_CURVES or miss > 0.01 * len(need)):
+        print(f"HEALTH CHECK FAILED: {miss} turns with a wait lack surv_{a.park_hints}", file=sys.stderr, flush=True)
+        sys.exit(2)
+
+
+if a.park_hints:
+    curve_check()
 
 
 def load_side(path):
@@ -172,21 +200,26 @@ def _conc(delta):
     return inflight
 
 
-async def turn(sess, i, t, history, hint, park_key=None):
+async def turn(sess, i, t, history, hint, park_key=None, last=False):
     """One request; counts itself in flight from send to end (cancellation included)."""
     conc = _conc(+1)
     try:
         if a.engine == "sglang":
             out_ids, m = await turn_sglang(sess, t, history, park_key)
         else:
-            out_ids, m = await turn_vllm(sess, t, history, hint, park_key)
+            out_ids, m = await turn_vllm(sess, t, history, hint, park_key, last)
     finally:
         _conc(-1)
     m["concurrency"] = conc
     return out_ids, m
 
 
-async def turn_vllm(sess, t, history, hint, park_key=None):
+def ct_params(t, park_key, last):
+    """What layby.vllm.continuum reads per request (arm CT)."""
+    return {"park_key": park_key, "park_kind": t["kind"], "park_tool": t.get("tool"), "park_last": bool(last)}
+
+
+async def turn_vllm(sess, t, history, hint, park_key=None, last=False):
     body = {"model": a.model, "prompt": history, "max_tokens": t["out_len"], "ignore_eos": True,
             "temperature": 0.0, "stream": True, "return_token_ids": True,
             "stream_options": {"include_usage": True}}
@@ -197,6 +230,8 @@ async def turn_vllm(sess, t, history, hint, park_key=None):
         body["kv_transfer_params"] = {"park_eta": eta, "park_disk": bool(eta < 0)}
     if a.park_hints:
         body["kv_transfer_params"] = {"park_key": park_key}
+    if a.continuum:
+        body["kv_transfer_params"] = ct_params(t, park_key, last)
     t0 = time.time()
     ttft, out_ids, usage = None, [], None
     async with sess.post(f"{a.url}/v1/completions", json=body, timeout=aiohttp.ClientTimeout(total=a.turn_timeout)) as r:
@@ -345,11 +380,12 @@ async def serve_turn(http, s, st, i, extra=None):
     st["history"] = st["history"] + toks(st["rng"], t["new_tokens"])
     history = st["history"]
     hint = "none" if a.hint == "none" else t[f"hint_{a.hint}"]
+    last = i == len(s["turns"]) - 1 or t.get("gap_after") is None
     try:
         try:
-            out_ids, m = await turn(http, i, t, history, hint, f"{s['id']}-{i}")
+            out_ids, m = await turn(http, i, t, history, hint, f"{s['id']}-{i}", last)
         except aiohttp.ClientConnectionError:  # a dropped keep-alive connection: resend once, flag the row
-            out_ids, m = await turn(http, i, t, history, hint, f"{s['id']}-{i}")
+            out_ids, m = await turn(http, i, t, history, hint, f"{s['id']}-{i}", last)
             m["retried"] = 1
         if m["ttft"] is None:
             raise RuntimeError("stream ended without a token")

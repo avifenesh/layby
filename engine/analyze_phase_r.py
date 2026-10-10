@@ -49,7 +49,8 @@ every pair, and listed under invalid_runs.
 
 Open-loop sweeps (H5 throughput half): runs named CELL__ARM__HOST__rate<R>.jsonl. Per (cell, arm, host): every
 request's TTFT; a rate is sustainable when the served p95 is under the cell's SLO (spec "slo": {cell: seconds})
-and at most 1% of requests failed or were censored; the peak sustainable rate is found by linear interpolation
+and at most 1% of the offered arrivals failed, were censored or were dropped (an arrival that found no session ready
+to send, the summary's arrivals_dropped: offered load the server did not take); the peak sustainable rate is found by linear interpolation
 between the last sustainable rate and the next one. Per pair: per-host ratios, geometric mean, a bootstrap over
 hosts (the repeats) and the t bounds.
 
@@ -528,10 +529,14 @@ BAD_MAX = 0.01            # a rate is sustainable only with at most 1% failed or
 
 def sweep_point(run):
     """One open-loop run at a fixed rate: p95 TTFT over served requests (every row: open-loop requests do not
-    resume a session) and the share of failed or censored requests."""
+    resume a session) and the share of offered arrivals that were not served: failed or censored requests plus the
+    arrivals the replay dropped (no session ready), over requests sent plus dropped."""
     T = list(run["turns"].values())
     served = [t["ttft"] for t in T if t["status"] == "served"]
-    return dict(n=len(T), p95=quantile(served, .95), bad_frac=(len(T) - len(served)) / len(T) if T else 1.0)
+    dropped = int((run.get("summary") or {}).get("arrivals_dropped") or 0)
+    offered = len(T) + dropped
+    return dict(n=len(T), dropped=dropped, p95=quantile(served, .95),
+                bad_frac=(offered - len(served)) / offered if offered else 1.0)
 
 
 def peak_rate(points, slo):

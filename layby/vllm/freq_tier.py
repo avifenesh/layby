@@ -56,6 +56,7 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 _CAP = 1 << 62      # KVBM's i64 saturating multiply, kept in range
+STATS_EVERY_S = 60.0   # the counts go to the server log this often (chunks admitted to disk: the T2 write count)
 
 
 class FrequencyFilter:
@@ -118,6 +119,7 @@ class FreqFsTier(FileSystemTierManager):
         self._inflight = set()           # chunks in a write job
         self._writing = {}               # store job id -> its keys
         self.stats = dict(sighted=0, admitted=0, held=0, skipped_on_disk=0, jobs_written=0, jobs_noio=0)
+        self._stats_t = time.monotonic()   # last stats log line (the pilot's write-count audit reads them)
 
     def on_new_request(self, req_context) -> RequestOffloadingContext:
         if self.count_mode == "request":
@@ -126,6 +128,9 @@ class FreqFsTier(FileSystemTierManager):
 
     def submit_store(self, job_metadata) -> None:
         now = time.monotonic()
+        if now - self._stats_t >= STATS_EVERY_S:
+            self._stats_t = now
+            logger.info("FreqFsTier stats: %s", self.stats)
         keys = list(job_metadata.keys)
         keep = []
         for i, k in enumerate(keys):

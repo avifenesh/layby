@@ -244,6 +244,16 @@ def test_peak_rate_interpolates_and_flags_the_grid_edges():
     assert A.peak_rate(pts({1: 1.5, 2: 2.0}), 1.0)["peak"] is None
 
 
+def test_dropped_arrivals_count_as_not_served(tmp_path):
+    # 99 served of 99 sent, but 2 arrivals found no session ready: 2 of 101 offered not served, over the 1% bound
+    p = tmp_path / "c__K__h1__rate5.jsonl"
+    write(p, [row(f"q{i}", 0, 0.1) for i in range(99)] +
+          [dict(wall_s=20.0, served=99, failed=0, censored=0, open_loop_rate=5.0, requests=99, arrivals_dropped=2)])
+    pt = A.sweep_point(A.load_run(str(p)))
+    assert (pt["n"], pt["dropped"]) == (99, 2) and pt["bad_frac"] == pytest.approx(2 / 101)
+    assert A.peak_rate({1.0: dict(pt, bad_frac=0.0), 5.0: pt}, 1.0)["peak"] < 5.0
+
+
 def test_throughput_sweep_end_to_end(tmp_path):
     f = {"h1": 1.02, "h2": 0.98, "h3": 1.0}
     for h, fh in f.items():

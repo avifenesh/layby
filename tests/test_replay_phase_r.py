@@ -255,3 +255,38 @@ def test_open_loop_drops_arrivals_when_no_session_is_ready_and_checks_the_name(t
     p, _ = run(w, tmp_path / "c__K__h1.jsonl", port, hport, ["--open-loop-rate", "50", "--requests", "3"],
                check=False)
     assert p.returncode == 2 and "rate50.jsonl" in p.stderr
+
+
+def test_continuum_params_ride_on_every_request(tmp_path):
+    # arm CT: layby.vllm.continuum reads park_key, park_kind, park_tool and park_last; no curve is posted
+    port, hport, seen = free_port(), free_port(), []
+    mock_vllm(port, hport, seen)
+    w = write_wl(tmp_path, [dict(id="s0", pool="p", seed=1, start=0.0,
+                                 turns=[T(0.1, "bash"), T(0.1, kind="human"), T(None, "edit")])])
+    cmd = [sys.executable, REPLAY, str(w), str(tmp_path / "o.jsonl"), "--url", f"http://127.0.0.1:{port}",
+           "--continuum"]
+    subprocess.run(cmd, check=True, timeout=60, capture_output=True, text=True)
+    got = [b["kv_transfer_params"] for k, _, b in seen if k == "vllm"]
+    assert got == [dict(park_key="s0-0", park_kind="tool", park_tool="bash", park_last=False),
+                   dict(park_key="s0-1", park_kind="human", park_tool=None, park_last=False),
+                   dict(park_key="s0-2", park_kind="tool", park_tool="edit", park_last=True)]
+    assert not [x for x in seen if x[0] == "hint"]
+    p = subprocess.run(cmd + ["--park-hints", "v6"], timeout=60, capture_output=True, text=True)
+    assert p.returncode == 2 and "--continuum" in p.stderr
+
+
+def test_control_curves_are_posted_and_a_missing_one_stops_the_run(tmp_path):
+    # --park-hints km|ewma posts the turn's surv_km / surv_ewma (layby.curves annotate); a turn with a wait and no
+    # such curve stops the run before anything is sent (it would be posted as 0.5)
+    port, hport, seen = free_port(), free_port(), []
+    mock_vllm(port, hport, seen)
+    turns = [dict(T(0.1), surv_ewma=[0.3] * 15), dict(T(0.1), surv_ewma=[0.2] * 15), T(None)]
+    w = write_wl(tmp_path, [dict(id="s0", pool="p", seed=1, start=0.0, turns=turns)])
+    p, _ = run(w, tmp_path / "o.jsonl", port, hport, ["--park-hints", "ewma"])
+    assert "surv_ewma: 2 of 2" in p.stdout
+    assert [(b["key"], b["surv"][0]) for k, _, b in seen if k == "hint"] == [("s0-0", 0.3), ("s0-1", 0.2)]
+    seen.clear()
+    del turns[1]["surv_ewma"]
+    w = write_wl(tmp_path, [dict(id="s0", pool="p", seed=1, start=0.0, turns=turns)])
+    p, _ = run(w, tmp_path / "o2.jsonl", port, hport, ["--park-hints", "ewma"], check=False)
+    assert p.returncode == 2 and "1 turns with a wait lack surv_ewma" in p.stderr and not seen

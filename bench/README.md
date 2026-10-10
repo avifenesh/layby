@@ -100,7 +100,8 @@ Sources, versions and licenses: [bench/LICENSES.md](LICENSES.md).
 | `c_nopark`, `c_disk`, `o_disk` | Ablations of the cost rule and the oracle over option subsets. |
 | `wt2` | Frequency-gated write-through: a prefix goes to disk only once it has been reused (access count 2), as SGLang HiCache `write_through_selective` and NVIDIA Dynamo KVBM's frequency filter do. |
 | `cost_noprice`, `cost_noext`, `cost_noW`, `cost_noQ` | Ablations of the cost rule: one cost term set to zero (the CPU tier's holding price, the delays a restore causes others, the disk write's delay, the admission wait before the KV lookup). |
-| `cost_km`, `cost_kmpool`, `cost_kmsrc` | Controls with no learned model: the cost rule on a Kaplan-Meier curve per wait kind, one pooled curve, or one per source and kind. The shipped pools do not carry these curves; fit them on data outside the evaluated sessions, add them to each turn as `surv_km`, `surv_kmpool`, `surv_kmsrc` and pass `--pools DIR`. |
+| `cost_km`, `cost_kmpool`, `cost_kmsrc` | Controls with no learned model: the cost rule on a Kaplan-Meier curve per wait kind, one pooled curve, or one per source and kind. The shipped pools do not carry these curves. For `cost_km`, fit the per-kind curves on data outside the evaluated sessions (`python -m layby.curves fit-km`) and pass `--km KM.json`: the curves come from `layby/curves.py`, the code that annotates the engine workloads for arm K_km. Without `--km`, and for `cost_kmpool` and `cost_kmsrc`, add the curves to each turn as `surv_km`, `surv_kmpool`, `surv_kmsrc` and pass `--pools DIR`. |
+| `cost_ewma`, `cost_ewma_a<alpha>` | The K_ewma control: the cost rule on an exponential curve whose mean is the exponentially weighted mean (weight alpha, default 0.5) of the session's own earlier waits of the same kind, the per-kind KM curve before two such waits (`layby/curves.py`, as on the engine). Needs `--km KM.json`. |
 
 ## Reference results
 

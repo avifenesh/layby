@@ -37,7 +37,9 @@ commands.log (every command, its kind: root, gpu or plain); OUT/runs.jsonl index
 with canned probe and GPU values (the cell's "dry_run" section can set them), so a cell file can be walked end to end
 on any machine.
 
-The cell file format is documented in engine/phase_r/examples/cell_main_vllm_slow_heavy.json.
+The cell file format is documented in engine/phase_r/examples/cell_main_vllm_slow_heavy.json. hard_cap_s (optional)
+becomes the runner's HARD_CAP (replay --hard-cap: 3x C0's pilot duration in the plan). Arm codes are checked against the
+runner's (ARM_CODES); CT needs CT_ETA in its env, T2 takes T2_MIN_HITS, T2_DECAY_S and T2_COUNT.
 """
 import argparse
 import json
@@ -59,6 +61,10 @@ EXIT_OK, EXIT_ESCALATE, EXIT_HOST_FAULT, EXIT_CONFIG, EXIT_PREFLIGHT = 0, 2, 3, 
 HOST_CG_EXEC = os.path.join(HERE, "cg_exec.sh")   # probes run on the host; the engine's copy is under layby_root
 RUNNERS = {"vllm": "engine/run_arms.sh", "sglang": "engine/run_arms_sglang.sh"}
 WIPES = ("fstrim", "mkfs", "ram")
+# the runners' arm codes (a repeat suffix ".N" allowed); the docstrings of run_arms.sh and run_arms_sglang.sh say
+# what each one runs
+ARM_CODES = {"vllm": {"C0", "T", "T2", "LM", "LMR", "LMS", "CT", "PT", "K", "K_km", "K_ewma", "K0", "KW", "KD", "SM"},
+             "sglang": {"C0", "T", "K", "K_km", "K_ewma"}}
 
 
 # ---------------------------------------------------------------- cell spec
@@ -110,6 +116,12 @@ def load_cell(path, aa=None):
     for a in c["arms"]:
         a.setdefault("code", a["label"])
         a.setdefault("env", {})
+        check_arm(c, a)
+    cap = c.get("hard_cap_s")
+    if cap is not None:
+        rt = float((c["runner"].get("env") or {}).get("REPLAY_TIMEOUT", 5400))
+        if rt < float(cap) + 300:
+            raise ValueError(f"runner env REPLAY_TIMEOUT {rt:g} must exceed hard_cap_s {cap} by 300 s")
     if aa:
         src = [a for a in c["arms"] if a["label"] == aa]
         if not src:
@@ -127,6 +139,25 @@ def load_cell(path, aa=None):
     for a in c["arms"]:   # every arm has its own RSS before anything runs
         arm_rss(c, a)
     return c
+
+
+def check_arm(c, a):
+    """The arm's code is one the cell's runner knows, and the settings its configuration needs are there."""
+    code = a["code"].split(".")[0]
+    if code not in ARM_CODES[c["engine"]]:
+        raise ValueError(f"arm {a['label']}: code {a['code']!r} unknown to the {c['engine']} runner "
+                         f"({sorted(ARM_CODES[c['engine']])})")
+    env = dict(c["runner"].get("env") or {}, **a["env"])
+    if code == "CT":
+        if "CT_ETA" not in env:
+            raise ValueError(f"arm {a['label']}: CT needs env CT_ETA (layby.continuum.memoryfulness of the workload)")
+        if not 0.0 <= float(env["CT_ETA"]) <= 1.0:
+            raise ValueError(f"arm {a['label']}: CT_ETA {env['CT_ETA']} outside [0, 1]")
+    if code == "T2":
+        if env.get("T2_COUNT", "request") not in ("request", "store"):
+            raise ValueError(f"arm {a['label']}: T2_COUNT must be request or store")
+        if int(env.get("T2_MIN_HITS", 2)) < 1 or float(env.get("T2_DECAY_S", 600)) < 0:
+            raise ValueError(f"arm {a['label']}: T2_MIN_HITS >= 1 and T2_DECAY_S >= 0")
 
 
 def arm_by_label(c):
@@ -182,6 +213,8 @@ def arm_env(c, slot, arm, cgpath):
            "PORT": str(slot["port"]), "PARK_PORT": str(slot["park_port"]), "CUDA_VISIBLE_DEVICES": str(slot["cuda"]),
            "PYTHONHASHSEED": "0", "SERVER_WRAP": f"{layby_path(c, 'engine/phase_r/cg_exec.sh')} {cgpath}",
            "ARM_HOOK": layby_path(c, "engine/phase_r/arm_hook.sh")}
+    if c.get("hard_cap_s") is not None:
+        env["HARD_CAP"] = str(c["hard_cap_s"])
     env.update({k: str(v) for k, v in (r.get("env") or {}).items()})
     env.update({k: str(v) for k, v in (slot.get("env") or {}).items()})
     env.update({k: str(v) for k, v in arm["env"].items()})

@@ -15,7 +15,9 @@
 #      Qwen3-8B bf16: 36 layers x 8 KV heads x 128 x 2 x 2 bytes), PAGE (page size, default 64),
 #      TREE_CORE (default python for every arm: the park backend needs the Python TreeCore, so the
 #      baselines use it too), SERVE_ARGS (extra sglang serve args), PORT (default 30000),
-#      PARK_PORT (default 8765), HARD_CAP (replay --hard-cap seconds; unset: no cap).
+#      PARK_PORT (default 8765), HARD_CAP (replay --hard-cap seconds; unset: no cap), REPLAY_TIMEOUT (s, default 5400;
+#      must exceed HARD_CAP by 300 s, as the cap writes the censored rows), BOOT_WAIT (5 s polls, default 180).
+#      Arms K_km and K_ewma: arm K fed the control curves surv_km and surv_ewma (layby.curves annotate).
 #      Phase R (engine/phase_r/orchestrate.py): SERVER_WRAP (a command prefix for the server, e.g.
 #      "phase_r/cg_exec.sh CGROUP"), ARM_HOOK (called as "ARM_HOOK EVENT ARM OUTDIR" with replay_start once the server
 #      is healthy and replay_end after the replay), PARK_HINTS (the curve arm K posts, default v6), WRITE_POLICY
@@ -35,14 +37,19 @@ PORT=${PORT:-30000}; PARK_PORT=${PARK_PORT:-8765}
 TOKENS=$(python3 -c "print(int($KV) // int($BPT))")
 RATIO=$(python3 -c "print(round(int($CPU) / int($KV), 6))")
 WIN=${HARD_CAP:+--hard-cap $HARD_CAP}
+RT=${REPLAY_TIMEOUT:-5400}
+if [ -n "${HARD_CAP:-}" ] && [ "$(python3 -c "print(int(float('$RT') >= float('$HARD_CAP') + 300))")" != 1 ]; then
+  echo "REPLAY_TIMEOUT $RT must exceed HARD_CAP $HARD_CAP by 300 s"; exit 2
+fi
 for arm in "$@"; do
   storage=""; park=""; client=""; plugins=none
   case ${arm%%.*} in
     C0) ;;
     T) storage="--hicache-storage-backend file" ;;
-    K) storage="--hicache-storage-backend file"; plugins=park
+    K|K_km|K_ewma) storage="--hicache-storage-backend file"; plugins=park
        park="--radix-cache-backend park --radix-eviction-policy park --radix-eviction-policy-config {\"port\":$PARK_PORT}"
-       client="--park-hints ${PARK_HINTS:-v6} --park-port $PARK_PORT" ;;
+       case ${arm%%.*} in K_km) hints=km ;; K_ewma) hints=ewma ;; *) hints=${PARK_HINTS:-v6} ;; esac
+       client="--park-hints $hints --park-port $PARK_PORT" ;;
     *) echo "unknown arm $arm"; continue ;;
   esac
   rm -rf $DISK; mkdir -p $DISK
@@ -53,10 +60,10 @@ for arm in "$@"; do
     --enable-hierarchical-cache --hicache-ratio $RATIO --hicache-write-policy ${WRITE_POLICY:-write_through} \
     $storage $park ${SERVE_ARGS:-} > $O/$arm.server.log 2>&1 &
   SP=$!
-  for i in $(seq 1 180); do curl -sf localhost:$PORT/health >/dev/null && break; kill -0 $SP 2>/dev/null || break; sleep 5; done
+  for i in $(seq 1 ${BOOT_WAIT:-180}); do curl -sf localhost:$PORT/health >/dev/null && break; kill -0 $SP 2>/dev/null || break; sleep 5; done
   curl -sf localhost:$PORT/health >/dev/null || { echo "server failed"; tail -30 $O/$arm.server.log; kill -9 -- -$SP 2>/dev/null; wait $SP 2>/dev/null; continue; }
   [ -n "${ARM_HOOK:-}" ] && $ARM_HOOK replay_start "$arm" "$O"
-  timeout 5400 $VENV/bin/python $ENGINE_DIR/replay.py $W $O/$arm.jsonl --engine sglang --url http://127.0.0.1:$PORT \
+  timeout $RT $VENV/bin/python $ENGINE_DIR/replay.py $W $O/$arm.jsonl --engine sglang --url http://127.0.0.1:$PORT \
     --model $MODEL $client $WIN > $O/$arm.client.log 2>&1
   rc=$?
   [ -n "${ARM_HOOK:-}" ] && $ARM_HOOK replay_end "$arm" "$O"

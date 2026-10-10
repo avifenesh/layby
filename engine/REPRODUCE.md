@@ -10,7 +10,11 @@ Arms (run_arms.sh, run_arms_sglang.sh):
 |---|---|
 | C0 | stock engine, CPU tier only, no disk, LRU |
 | T | stock engine, CPU tier plus a disk tier written through, LRU |
+| T2 | T with frequency-gated disk writes: a chunk goes to disk on its n-th sighting (`T2_MIN_HITS`, `T2_DECAY_S`, `T2_COUNT`; vLLM only) |
+| CT | Continuum's GPU time-to-live pin after tool calls, CPU tier as C0, no disk (`CT_ETA` required; vLLM only) |
+| PT | T through Layby's own file tier, every chunk written, no rule (pilot only; vLLM only) |
 | K | Layby: the cost rule in the engine, curves posted per turn |
+| K_km, K_ewma | K fed the no-model control curves `surv_km` and `surv_ewma` (`python -m layby.curves annotate`) |
 | K0 | the Layby adapter with no curves (the rule never runs): the adapter's own overhead |
 | KW | K in write-through mode (vLLM only) |
 | KD | K with write-back on CPU eviction (vLLM only; a negative result, see the README) |
@@ -140,6 +144,8 @@ w by hand). SGLang arms need `engine/phase_r/sglang/hicache_fadvise.patch` (HiCa
 after each write and read); `apply_patch.sh PYTHON apply` installs it and the orchestrator checks it before every arm.
 
 Runner hooks the harness uses (unset, the runners behave as before): `SERVER_WRAP` (command prefix for the server),
-`ARM_HOOK` (replay_start and replay_end markers), `PARK_HINTS` (arm K's curve), `WRITE_POLICY` (SGLang).
+`ARM_HOOK` (replay_start and replay_end markers), `PARK_HINTS` (arm K's curve), `WRITE_POLICY` (SGLang). Arm settings:
+`EVICTION` (CPU-tier eviction of the arms on vLLM's own policy), `FS_THREADS` (every disk tier's I/O threads), the T2
+and CT settings above. A cell's `hard_cap_s` becomes `HARD_CAP`; `REPLAY_TIMEOUT` must exceed it by 300 s.
 
 Tests (CPU only, no root): `python3 -m unittest discover -s engine/phase_r/tests -p 'test_*.py'`.

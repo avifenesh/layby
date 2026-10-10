@@ -72,6 +72,41 @@ finally:
     os.rmdir(d)
 print("curves ok: KM per kind, EWMA of the session's own earlier waits of the same kind, annotate")
 
+# --- 5. the simulator's controls get the engine's curves ------------------------------------------------------
+import sim.eval_pop as E
+
+assert E.rule_known("cost_ewma") and E.rule_known("cost_ewma_a0.3") and not E.rule_known("cost_ewma_a2")
+os.environ.pop("RETURNBENCH_KM", None)
+try:
+    E.make_rule("cost_ewma", {"sessions": copy.deepcopy(sessions)}, "v6")
+    raise AssertionError("cost_ewma without KM curves must fail")
+except ValueError:
+    pass
+fd, kmp = tempfile.mkstemp(suffix=".json", dir=os.path.expanduser("~/.cache"))
+try:
+    with os.fdopen(fd, "w") as f:
+        json.dump(K, f)
+    os.environ["RETURNBENCH_KM"] = kmp
+    for alpha, name in ((0.3, "cost_ewma_a0.3"), (0.5, "cost_ewma"), (None, "cost_km")):
+        Ws, Wa = {"sessions": copy.deepcopy(sessions)}, {"sessions": copy.deepcopy(sessions)}
+        rule = E.make_rule(name, Ws, "v6")
+        annotate(Wa, K, alpha=alpha or 0.5)              # what the engine workload carries (layby.curves annotate)
+        field = "surv_km" if alpha is None else "surv_ewma"
+        n = 0
+        for ss, sa in zip(Ws["sessions"], Wa["sessions"]):
+            for ts, ta in zip(ss["turns"], sa["turns"]):
+                if field in ta:
+                    assert ts[f"surv_{rule.name}"] == ta[field], (name, ts, ta)
+                    assert np.allclose(rule.curve(ts), interp_surv(np.asarray(ta[field]), TG))
+                    n += 1
+                else:
+                    assert f"surv_{rule.name}" not in ts
+        assert n == 6, (name, n)
+finally:
+    os.environ.pop("RETURNBENCH_KM", None)
+    os.unlink(kmp)
+print("sim ok: cost_km and cost_ewma[_aALPHA] read the curves layby.curves annotate gives the engine workload")
+
 # --- 4. into the unchanged rule -------------------------------------------------------------------------------
 from types import SimpleNamespace as NS
 import layby.vllm.connector as PCm

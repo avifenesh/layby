@@ -59,7 +59,8 @@ class DryRun(unittest.TestCase):
                        "--out", self.out, "--dry-run"])
         self.assertEqual(rc, orchestrate.EXIT_OK, out[-2000:])
         r = self.runs()
-        self.assertEqual(sorted(x["label"] for x in r), sorted(["C0", "T", "LM", "K", "K_ewma", "K_km"]))
+        arms = ["C0", "T", "T2", "LM", "CT", "K", "K_ewma", "K_km"]          # the plan's headline cell set
+        self.assertEqual(sorted(x["label"] for x in r), sorted(arms))
         self.assertTrue(all(x["valid"] and x["dry_run"] for x in r))
         lines = out.splitlines()
         self.assertTrue(all(ln.startswith("DRY ") for ln in lines if ln.strip()), [ln for ln in lines if not ln.startswith("DRY")][:3])
@@ -71,12 +72,16 @@ class DryRun(unittest.TestCase):
         self.assertEqual(sum("/io.max" in ln for ln in lines), n + 1)
         self.assertEqual(sum("bash /root/layby/engine/run_arms.sh" in ln for ln in lines), n)
         self.assertTrue(any("SERVER_WRAP=/root/layby/engine/phase_r/cg_exec.sh /sys/fs/cgroup/layby/" in ln for ln in lines))
-        self.assertTrue(any("PARK_HINTS=ewma" in ln for ln in lines))
+        cmd = {ln.split(" > ")[0].split()[-1]: ln for ln in lines if "bash /root/layby/engine/run_arms.sh" in ln}
+        self.assertEqual(sorted(cmd), sorted(arms))
+        self.assertIn("CT_ETA=0.83", cmd["CT"])
+        self.assertIn("T2_MIN_HITS=2", cmd["T2"])
+        self.assertTrue(all("HARD_CAP=9000" in ln and "REPLAY_TIMEOUT=10800" in ln for ln in cmd.values()))
         # the order is the seeded one, and positions are logged
         b = load_json(os.path.join(self.out, "main-vllm-slow-heavy", "h1", "r2", "a1", "block.json"))
         import order
         self.assertEqual([r[0][1] for r in b["rounds"]],
-                         order.arm_order(["C0", "T", "LM", "K", "K_ewma", "K_km"], 20261010, "main-vllm-slow-heavy", 2))
+                         order.arm_order(arms, 20261010, "main-vllm-slow-heavy", 2))
         self.assertEqual(b["regime"]["A"]["regime"], "slow")
         self.assertEqual(b["next"], "done")
         # root and GPU actions are tagged so a reader of commands.log sees what needs privileges
@@ -96,6 +101,7 @@ class DryRun(unittest.TestCase):
         G, M = 1 << 30, 1 << 20
         pinned, slack = 28 * G, 256 * M
         self.assertEqual(got, {"C0": pinned + 12 * G + slack, "T": pinned + 12 * G + 512 * M + slack,
+                               "T2": pinned + 12 * G + 512 * M + slack, "CT": pinned + 12 * G + slack,
                                "LM": pinned + (11 + 3) * G + slack,       # vLLM engine plus its LMCache server
                                "K": pinned + 13 * G + slack, "K_ewma": pinned + 13 * G + slack,
                                "K_km": pinned + 13 * G + slack})
@@ -163,11 +169,10 @@ class DryRun(unittest.TestCase):
                        self.out, "--dry-run"])
         self.assertEqual(rc, orchestrate.EXIT_OK)
         r = self.runs()
-        self.assertEqual(sorted(x["label"] for x in r), ["C0", "K", "K_ewma", "T"])
+        self.assertEqual(sorted(x["label"] for x in r), ["C0", "K", "K_ewma", "T", "T2"])
         self.assertEqual({x["slot"] for x in r}, {"A", "B"})
         b = load_json(os.path.join(self.out, "large-glm-slow-heavy", "n1", "r1", "a1", "block.json"))
-        self.assertEqual(len(b["rounds"]), 2)
-        self.assertTrue(all(len(rd) == 2 for rd in b["rounds"]))
+        self.assertEqual([len(rd) for rd in b["rounds"]], [2, 2, 1])       # 5 arms over 2 slots
         self.assertIn("CUDA_VISIBLE_DEVICES=4,5,6,7", out)
         self.assertIn("cpuset.mems", out)
 
@@ -185,13 +190,23 @@ class DryRun(unittest.TestCase):
     def test_plan_command(self):
         rc, out = run(["plan", "--cell", self.cell("cell_glm_slow_heavy_2slot.json"), "--repeat", "2"])
         self.assertEqual(rc, 0)
-        self.assertEqual(len(out.strip().splitlines()), 2)
+        self.assertEqual(len(out.strip().splitlines()), 3)
 
     def test_bad_spec(self):
         p = self.cell("cell_main_vllm_slow_heavy.json", arms=[{"label": "K.x"}])
         self.assertEqual(run(["plan", "--cell", p])[0], orchestrate.EXIT_CONFIG)
         p = self.cell("cell_main_vllm_slow_heavy.json", io_max=None)
         self.assertEqual(run(["plan", "--cell", p])[0], orchestrate.EXIT_CONFIG)
+        # arm codes the runner does not know, CT without its eta, a T2 count mode neither system has, a replay
+        # timeout that would kill the replay before the hard cap writes its censored rows
+        for arms, extra in (([{"label": "X", "code": "T3"}], {}), ([{"label": "HC", "code": "T2"}], {"engine": "sglang"}),
+                            ([{"label": "CT", "code": "CT"}], {}),
+                            ([{"label": "T2", "code": "T2", "env": {"T2_COUNT": "block"}}], {}),
+                            ([{"label": "C0", "code": "C0"}], {"hard_cap_s": 10600})):
+            p = self.cell("cell_main_vllm_slow_heavy.json", arms=arms, **extra)
+            self.assertEqual(run(["plan", "--cell", p])[0], orchestrate.EXIT_CONFIG, (arms, extra))
+        p = self.cell("cell_main_vllm_slow_heavy.json", arms=[{"label": "C0", "code": "C0.2"}])   # a repeat suffix
+        self.assertEqual(run(["plan", "--cell", p])[0], 0)
 
 
 if __name__ == "__main__":
