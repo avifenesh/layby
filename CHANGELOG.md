@@ -5,6 +5,9 @@ was built from. The archive DOI is copied here, into `CITATION.cff` and into the
 
 ## 1.0.0 (2026-10-10)
 
+Archive: [10.5281/zenodo.23285214](https://doi.org/10.5281/zenodo.23285214) (all versions:
+[10.5281/zenodo.23285213](https://doi.org/10.5281/zenodo.23285213)).
+
 The release the paper describes:
 
 - The cost rule (`layby/rule.py`), live estimators and the in-process profiler (`layby/live.py`, `layby/prof.py`).

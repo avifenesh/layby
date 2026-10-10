@@ -6,6 +6,14 @@ repository-code: "https://github.com/avifenesh/layby"
 url: "https://github.com/avifenesh/layby"
 license: Apache-2.0
 version: "1.0.0"
+doi: "10.5281/zenodo.23285213"
+identifiers:
+  - type: doi
+    value: "10.5281/zenodo.23285213"
+    description: "All versions"
+  - type: doi
+    value: "10.5281/zenodo.23285214"
+    description: "v1.0.0"
 date-released: "2026-10-10"
 keywords:
   - LLM serving
