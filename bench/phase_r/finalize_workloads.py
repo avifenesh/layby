@@ -77,7 +77,7 @@ for M in models:
               longest_request_bytes=k["longest_request_bytes"], gpu_request_bytes=k.get("gpu_request_bytes"),
               gpu_request_source=k.get("gpu_request_source"), gpu_request_check=k.get("gpu_request_check"), P_bytes=P, P_grow_tokens=meas["peak_live_kv_tokens"],
               gpu_kv_bytes_plan=int(0.15 * P), gpu_kv_floor_bytes=floor, gpu_kv_bytes=gpu, gpu_kv_floored=gpu == floor,
-              cpu_bytes=int(0.4 * P), service_model=dict(c0=M["c0"], tpot=M["tpot"], b_per_1k_prompt=M["b"],
+              cpu_bytes=int(0.4 * P) // 4096 * 4096, service_model=dict(c0=M["c0"], tpot=M["tpot"], b_per_1k_prompt=M["b"],
                                                           inflight=M["inflight"], status=M["service_assumption"]["status"]))
     caps["models"][M["name"]] = mc
     for n in names:

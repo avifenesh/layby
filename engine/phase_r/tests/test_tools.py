@@ -19,6 +19,20 @@ from common import GiB, MiB, Runner, parse_size  # noqa: E402
 SCRATCH = os.environ.get("LAYBY_TEST_DIR", os.path.expanduser("~/.cache/layby-phase-r-test"))
 
 
+class CpuTier(unittest.TestCase):
+    def test_cpu_tier_must_be_page_aligned(self):
+        # 2026-10-11 pilot: LMCache 0.5.5's NIXL L2 adapter fails at startup (prepXferDlist NIXL_ERR_NOT_FOUND) when
+        # the L1 size is not a whole number of pages; Qwen's cpu_bytes 26793659596 (3,276 B past a page) killed arm LM
+        # before any request. The cell is refused before any arm instead.
+        import orchestrate
+        def cell(cpu):
+            return {"capacities": {"cpu_bytes": str(cpu)}, "runner": {"env": {}}, "slots": [{}],
+                    "arms": [{"label": "C0", "code": "C0", "env": {}}, {"label": "LM", "code": "LM", "env": {}}]}
+        with self.assertRaises(ValueError):
+            orchestrate.check_cpu_tiers(cell(26793659596))
+        self.assertEqual(set(orchestrate.check_cpu_tiers(cell(26793656320)).values()), {26793656320})
+
+
 class Cgroup(unittest.TestCase):
     def test_budget(self):
         # pinned 28 GiB + RSS 12 GiB + 256 MiB; the RAM tier adds its size

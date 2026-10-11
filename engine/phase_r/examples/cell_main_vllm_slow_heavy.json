@@ -9,7 +9,7 @@
  "load": "heavy",
  "pilot": "pilot_qwen3_8b_vllm.json",
  "workload": {"path": "/root/phase_r/measured.json", "sessions": 28, "turns": 1133, "sha256": null},
- "capacities": {"gpu_kv_bytes": "10047622348", "cpu_bytes": "26793659596", "disk_bytes": "346861102694"},
+ "capacities": {"gpu_kv_bytes": "10047622348", "cpu_bytes": "26793656320", "disk_bytes": "346861102694"},
  "hard_cap_s": 9000,
  "cgroup": {"slack_bytes": "256M"},
  "io_max": {"rbps": "450M", "wbps": "450M"},

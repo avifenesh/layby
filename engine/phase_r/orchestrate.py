@@ -210,6 +210,10 @@ def check_cpu_tiers(c):
     """Every arm's CPU tier is capacities.cpu_bytes exactly: no env overrides cpu_bytes_to_use, and LMCache's L1
     (a float of GiB) gives back the same bytes. Returns {label: bytes}."""
     cpu = parse_size(c["capacities"]["cpu_bytes"])
+    if cpu % cgroup.PAGE:
+        # LMCache's NIXL L2 adapter fails at startup on an L1 that is not whole pages (NIXL_ERR_NOT_FOUND), and the
+        # CPU tier is the same bytes in every arm
+        raise ValueError(f"capacities.cpu_bytes {cpu} is not a whole number of {cgroup.PAGE} B pages")
     envs = [c["runner"].get("env") or {}] + [s.get("env") or {} for s in c["slots"]] + [a["env"] for a in c["arms"]]
     for e in envs:
         if "cpu_bytes_to_use" in str(e.get("OFF_EXTRA", "")):
