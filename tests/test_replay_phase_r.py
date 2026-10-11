@@ -350,7 +350,7 @@ def test_lost_connection_is_flagged_conn_error(tmp_path):
     assert all(r["failed"] and r.get("conn_error") for r in R.values()) and len(R) == 2
 
 
-def mock_vllm_disk(port, seen, disk_turns, corrupt=()):
+def mock_vllm_disk(port, seen, disk_turns, corrupt=(), probe_reads=False):
     """vLLM with a disk tier: a request whose park_key is in disk_turns reads the disk (the /metrics counter
     vllm:kv_offload_tiering_read_bytes rises while it runs); a cold request (cache_salt) answers with the same ids,
     or other ids when its prompt belongs to a turn in corrupt."""
@@ -369,8 +369,10 @@ def mock_vllm_disk(port, seen, disk_turns, corrupt=()):
             return web.json_response({"choices": [{"token_ids": ids}]})
         key = (b.get("kv_transfer_params") or {}).get("park_key")
         prompts[tuple(b["prompt"])] = key
-        if key in disk_turns:
+        if key in disk_turns or (probe_reads and key is None):   # probe_reads: a request with no park_key reads
             state["read"] += 1e6
+        if not b.get("stream"):
+            return web.json_response({"choices": [{"token_ids": [7 + i for i in range(n)]}]})
         resp = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
         await resp.prepare(req)
         for i in range(n):
@@ -417,3 +419,30 @@ def test_verify_disk_compares_disk_restored_turns_with_a_cold_recompute(tmp_path
     live = {"counts": {"ins": 1, "park": 2}, "disk": {"written_jobs": 3, "chunks_on_disk": 3}}
     assert check_k_disk.check(rows, live)["verdict"] == verdict
     assert check_k_disk.check(rows, dict(live, counts={"ins": 0, "park": 0}))["verdict"] == "FAIL"
+
+
+def test_verify_disk_probes_sessions_after_the_run_when_no_turn_ran_alone(tmp_path):
+    # 2026-10-11 pilot-qwen-kdisk: at 15 requests in flight no turn after the first few ran alone, so the in-run
+    # probe never fired (0 verified, the check failed on the workload, not on K). After the replay, with nothing in
+    # flight, each session's final context is resent, oldest-finished first; one that reads the disk tier is
+    # compared with a cold recompute. The probe rows carry no ttft, so no turn analysis counts them.
+    port, hport, seen = free_port(), free_port(), []
+    app, happ = mock_vllm_disk(port, seen, disk_turns=set(), probe_reads=True)
+    serve({port: app, hport: happ})
+    turns = [T(0.0), T(0.0), T(None)]
+    w = write_wl(tmp_path, [dict(id="s0", pool="p", seed=1, start=0.0, turns=turns),
+                            dict(id="s1", pool="p", seed=2, start=0.0, turns=turns)])
+    _, rows = run(w, tmp_path / "o.jsonl", port, hport, extra=("--verify-disk", "5"))
+    R = turn_rows(rows)
+    assert not any("verify" in r for r in R.values())                 # no turn read the disk in the run
+    ends = [r for r in rows if r.get("verify_end")]
+    assert sorted(r["session"] for r in ends) == ["s0", "s1"] and all("ttft" not in r for r in ends)
+    assert all(r["verify"]["identical"] and r["verify"]["disk_read_bytes"] == 1e6 for r in ends)
+    hist = {b["kv_transfer_params"]["park_key"]: b["prompt"] for b in seen
+            if (b.get("kv_transfer_params") or {}).get("park_key")}
+    probes = [b for b in seen if not b.get("cache_salt") and not b.get("kv_transfer_params")]
+    assert len(probes) == 2 and all(len(b["prompt"]) == len(hist["s0-2"]) + 2 for b in probes)   # final context
+    sys.path.insert(0, os.path.join(ROOT, "engine", "phase_r"))
+    import check_k_disk
+    live = {"counts": {"ins": 1, "park": 2}, "disk": {"written_jobs": 3, "chunks_on_disk": 3}}
+    assert check_k_disk.check(rows, live)["verdict"] == "PASS"

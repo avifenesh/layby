@@ -66,7 +66,12 @@ other request in flight and during which the engine's disk tier was read (/metri
 vllm:kv_offload_tiering_read_bytes rose), the same prompt is sent again under a fresh cache_salt, so no GPU, CPU or
 disk prefix can match, and the row gets {"verify": {"disk_read_bytes", "ext_hits", "cached_tokens", "out_tokens",
 "identical", "first_diff"}}: identical is whether the restored turn's greedy output equals that cold recompute (the
-compat check's test). The probe adds its own request and its KV to the tiers; it is for pilots only.
+compat check's test). Under load a turn rarely runs alone, so when the replay is over (after the summary row and the
+"after" scrape, nothing in flight) the probe goes on with each session's final context (its last served turn's prompt
+and output), oldest-finished first, until N are verified: the context is resent (no park key, so no hint follows it)
+and, when the disk tier was read for it, compared with a cold recompute of the same tokens; the row is {"verify_end":
+true, "session", "verify": {...}} and carries no ttft, so no turn analysis counts it. The probes add their own
+requests and KV to the tiers; they are for pilots only.
 
 SGLang (--engine sglang): /generate with input_ids and sampling_params (max_new_tokens, ignore_eos,
 temperature 0), streamed for TTFT; the output token ids come from the stream (cumulative by default,
@@ -212,6 +217,7 @@ def eta_of(t):
 
 sends = 0                              # requests sent so far (a turn ran alone if this did not move during it)
 verified = 0                           # --verify-disk probes done
+finals = {}                            # session -> (end time, context, out_len) of its last served turn
 
 
 def _conc(delta):
@@ -438,6 +444,35 @@ async def cold_output(http, history, n):
         _conc(-1)
 
 
+async def verify_after_run(http):
+    """--verify-disk after the replay: each session's final context alone, oldest-finished first, until N turns are
+    verified; a context whose resend read the disk tier is compared with a cold recompute."""
+    for sid, (_, history, n) in sorted(finals.items(), key=lambda kv: kv[1][0]):
+        if verified >= a.verify_disk:
+            break
+        before = await tier_counters(http)
+        body = {"model": a.model, "prompt": history, "max_tokens": n, "ignore_eos": True, "temperature": 0.0,
+                "return_token_ids": True}
+        try:
+            async with http.post(f"{a.url}/v1/completions", json=body,
+                                 timeout=aiohttp.ClientTimeout(total=a.turn_timeout)) as r:
+                r.raise_for_status()
+                out_ids = (await r.json(content_type=None))["choices"][0].get("token_ids") or []
+        except Exception as e:  # noqa: BLE001
+            emit({"verify_end": True, "session": sid, "error": repr(e)[:300]})
+            continue
+        after = await tier_counters(http)
+        rd = None if before is None or after is None else after[TIER_READ] - before[TIER_READ]
+        if not rd:
+            emit({"verify_end": True, "session": sid, "disk_read_bytes": rd, "skipped": "no disk read"})
+            continue
+        ref = await cold_output(http, history, n)
+        emit({"verify_end": True, "session": sid, "prompt_tokens": len(history),
+              "verify": dict(disk_read_bytes=rd, ext_hits=after[EXT_HITS] - before[EXT_HITS], out_tokens=len(out_ids),
+                             identical=ref == out_ids,
+                             first_diff=next((k for k, (x, y) in enumerate(zip(out_ids, ref or [])) if x != y), None))})
+
+
 # a lost connection to the server, not an answer from it: refused or reset, disconnected mid-stream, truncated payload
 CONN_ERRORS = (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError, ConnectionError)
 
@@ -471,6 +506,7 @@ async def serve_turn(http, s, st, i, extra=None):
         counts["failed"] += 1
         return False
     st["history"] = history + out_ids
+    finals[s["id"]] = (time.time(), st["history"], t["out_len"])   # the session's latest served context
     if a.park_hints and t["gap_after"] is not None:
         post_hint(http, s, i, t)
     if before is not None and sends == sends0 + 1 and inflight == 0 and verified < a.verify_disk:
@@ -659,5 +695,7 @@ async def main():
         emit({"concurrency_series": conc_series})
         emit(dict(wall_s=wall, hard_cap=a.hard_cap, cap_hit=cap_hit, **counts, **extra))
         await scrape(http, "after")
+        if a.verify_disk and verified < a.verify_disk:
+            await verify_after_run(http)
 
 asyncio.run(main())
