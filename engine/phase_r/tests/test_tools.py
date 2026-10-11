@@ -25,6 +25,24 @@ class Cgroup(unittest.TestCase):
         self.assertEqual(cgroup.budget(28 * GiB, 12 * GiB), 40 * GiB + 256 * MiB)
         self.assertEqual(cgroup.budget(28 * GiB, 12 * GiB, ram_tier_bytes=64 * GiB), 104 * GiB + 256 * MiB)
 
+    def test_budget_is_a_whole_number_of_pages(self):
+        # the kernel rounds memory.max down to a page and the read-back check compares exactly: the 2026-10-11 pilot
+        # (cpu_bytes 26793659596, not page aligned) failed every arm's health check on "memory.max 61421830144 !=
+        # 61421833420"
+        b = cgroup.budget(26793659596, 32 * GiB)
+        self.assertEqual(b % 4096, 0)
+        self.assertTrue(26793659596 + 32 * GiB + 256 * MiB <= b < 26793659596 + 32 * GiB + 256 * MiB + 4096)
+
+    def test_verify_reads_the_kernels_io_max_format(self):
+        # the kernel prints rbps, wbps, riops and wiops; only rbps and wbps are set, and they are what is compared
+        class R:
+            dry = False
+            def read(self, path, fake=None):
+                return {"memory.max": f"{41 * GiB}\n", "cpuset.cpus.effective": "2-25\n",
+                        "io.max": "253:32 rbps=1000000000 wbps=max riops=max wiops=max\n"}[os.path.basename(path)]
+        self.assertEqual(cgroup.verify(R(), "/x", 41 * GiB, "2-25", [("253:32", 1000000000, None)]), [])
+        self.assertTrue(cgroup.verify(R(), "/x", 41 * GiB, "2-25", [("253:32", 900000000, None)]))
+
     def test_io_max_line(self):
         self.assertEqual(cgroup.io_max_line("259:1", 450 * MiB, 450 * MiB), "259:1 rbps=471859200 wbps=471859200")
         self.assertEqual(cgroup.io_max_line("8:0", None, 1000), "8:0 rbps=max wbps=1000")

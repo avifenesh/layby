@@ -107,12 +107,13 @@ class DryRun(unittest.TestCase):
                 got[ln.rsplit("/", 2)[-2].rsplit(".", 1)[-1]] = int(w[w.index("echo") + 1])
         G, M = 1 << 30, 1 << 20
         pinned, slack = example_size("cell_main_vllm_slow_heavy.json", "cpu_bytes"), 256 * M
-        self.assertEqual(got, {"C0": pinned + 12 * G + slack, "T": pinned + 12 * G + 512 * M + slack,
-                               "T2": pinned + 12 * G + 512 * M + slack, "CT": pinned + 12 * G + slack,
-                               "LM": pinned + (11 + 3) * G + slack,       # vLLM engine plus its LMCache server
-                               "K": pinned + (13 + 2) * G + slack,        # engine plus the live-scoring sidecar
-                               "K_ewma": pinned + 13 * G + slack,
-                               "K_km": pinned + 13 * G + slack})
+        pg = lambda b: -(-b // 4096) * 4096   # noqa: E731  (memory.max is a whole number of pages)
+        self.assertEqual(got, {"C0": pg(pinned + 12 * G + slack), "T": pg(pinned + 12 * G + 512 * M + slack),
+                               "T2": pg(pinned + 12 * G + 512 * M + slack), "CT": pg(pinned + 12 * G + slack),
+                               "LM": pg(pinned + (11 + 3) * G + slack),       # vLLM engine plus its LMCache server
+                               "K": pg(pinned + (13 + 2) * G + slack),        # engine plus the live-scoring sidecar
+                               "K_ewma": pg(pinned + 13 * G + slack),
+                               "K_km": pg(pinned + 13 * G + slack)})
         lm = [x for x in self.runs() if x["label"] == "LM"][0]
         env = load_json(os.path.join(lm["dir"], lm["prefix"] + ".harness_env.json"))
         self.assertEqual(env["rss"], {"vllm": 11 * G, "lmcache_server": 3 * G})
@@ -138,7 +139,7 @@ class DryRun(unittest.TestCase):
         rc, out = run(["run", "--cell", p, "--aa", "C0", "--host", "h1", "--out", self.out, "--dry-run"])
         self.assertEqual(rc, orchestrate.EXIT_OK)
         cpu = example_size("cell_main_vllm_slow_heavy.json", "cpu_bytes")
-        self.assertIn(f"echo {cpu + 12 * (1 << 30) + (256 << 20)} > /sys/fs/cgroup/layby/"
+        self.assertIn(f"echo {-(-(cpu + 12 * (1 << 30) + (256 << 20)) // 4096) * 4096} > /sys/fs/cgroup/layby/"
                       "main-vllm-slow-heavy-AA.r1a1.A.C0_aa1/memory.max", out)
 
     def test_regime_mismatch_stops_before_any_arm(self):
@@ -216,7 +217,7 @@ class DryRun(unittest.TestCase):
         self.assertIn("apply_patch.sh /root/.venv-sglang/bin/python check fdatasync", out)
         self.assertIn("WRITE_POLICY=write_through_selective", out)
         # memory.max carries the RAM tier: the pinned CPU tier + 12 GiB RSS + 256 MiB + the RAM tier
-        self.assertIn(f"echo {cpu + 12 * (1 << 30) + (256 << 20) + ram} > /sys/fs/cgroup/layby/", out)
+        self.assertIn(f"echo {-(-(cpu + 12 * (1 << 30) + (256 << 20) + ram) // 4096) * 4096} > /sys/fs/cgroup/layby/", out)
 
     def test_k_scores_live_and_needs_its_inputs(self):
         rc, out = run(["run", "--cell", self.cell("cell_main_vllm_slow_heavy.json"), "--host", "h1", "--out", self.out,

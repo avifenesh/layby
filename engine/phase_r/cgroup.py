@@ -27,9 +27,14 @@ SLACK = 256 * MiB
 CONTROLLERS = ("cpu", "cpuset", "io", "memory")
 
 
+PAGE = 4096
+
+
 def budget(pinned_bytes, rss_bytes, slack=SLACK, ram_tier_bytes=0):
-    """memory.max for one engine: pinned tiers + measured RSS + page-cache allowance (+ RAM tier, fast regime)."""
-    return int(pinned_bytes) + int(rss_bytes) + int(slack) + int(ram_tier_bytes)
+    """memory.max for one engine: pinned tiers + measured RSS + page-cache allowance (+ RAM tier, fast regime),
+    rounded up to a whole page (the kernel rounds memory.max down to a page; verify() reads it back exactly)."""
+    b = int(pinned_bytes) + int(rss_bytes) + int(slack) + int(ram_tier_bytes)
+    return -(-b // PAGE) * PAGE
 
 
 def path_of(name, root=CG_ROOT):
@@ -115,8 +120,14 @@ def verify(runner, p, mem_max, cpus, io=None):
     want_io = {mm: io_max_line(mm, r, w) for mm, r, w in io or []}
     text = runner.read(os.path.join(p, "io.max"), fake="\n".join(want_io.values()))
     lines = {ln.split()[0]: ln.strip() for ln in text.splitlines() if ln.strip()}
+
+    def rw(line):   # the kernel also prints riops and wiops; rbps and wbps are the limits set here
+        kv = dict(x.split("=", 1) for x in line.split()[1:] if "=" in x)
+        return kv.get("rbps", "max"), kv.get("wbps", "max")
     for mm, line in want_io.items():
-        if lines.get(mm) != line and not (line.endswith("rbps=max wbps=max") and mm not in lines):
+        if mm in lines and rw(lines[mm]) == rw(line):
+            continue
+        if not (line.endswith("rbps=max wbps=max") and mm not in lines):
             bad.append(f"io.max {lines.get(mm)} != {line}")
     return bad
 
