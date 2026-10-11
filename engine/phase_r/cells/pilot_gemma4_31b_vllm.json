@@ -1,0 +1,31 @@
+{
+ "_comment": "PLACEHOLDER values for the dry runs until the pilot measures them (engine/phase_r/examples/pilot_qwen3_8b_vllm.json documents each field). kv_bytes_per_token: the tier's measured bytes per token (compat micro.json tier_measured, arm T); prefill_tok_s: compat c8 prefill at 8,192 tokens; wt_offered_write_Bps: that prefill rate x kv_bytes_per_token (write-through at full prefill); RSS: 16 GiB per vLLM arm, LMCache 15 + 4 GiB, sidecar 3 GiB, guesses.",
+ "model": "google/gemma-4-31B-it",
+ "engine": "vllm",
+ "kv_bytes_per_token": 131714,
+ "arm_rss_bytes": {
+  "C0": 17179869184,
+  "T": 17179869184,
+  "T2": 17179869184,
+  "PT": 17179869184,
+  "CT": 17179869184,
+  "K": 17179869184,
+  "K_ewma": 17179869184,
+  "K_km": 17179869184,
+  "LM": {
+   "vllm": 16106127360,
+   "lmcache_server": 4294967296
+  }
+ },
+ "sidecar_rss_bytes": 3221225472,
+ "loads": {
+  "heavy": {
+   "prefill_tok_s": 6515.2,
+   "wt_offered_write_Bps": 858143053
+  },
+  "light": {
+   "prefill_tok_s": 6515.2,
+   "wt_offered_write_Bps": 858143053
+  }
+ }
+}

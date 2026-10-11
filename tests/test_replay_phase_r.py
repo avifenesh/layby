@@ -332,3 +332,72 @@ def test_lost_connection_is_flagged_conn_error(tmp_path):
     _, rows = run(w, tmp_path / "o.jsonl", port, hport)
     R = turn_rows(rows)
     assert all(r["failed"] and r.get("conn_error") for r in R.values()) and len(R) == 2
+
+
+def mock_vllm_disk(port, seen, disk_turns, corrupt=()):
+    """vLLM with a disk tier: a request whose park_key is in disk_turns reads the disk (the /metrics counter
+    vllm:kv_offload_tiering_read_bytes rises while it runs); a cold request (cache_salt) answers with the same ids,
+    or other ids when its prompt belongs to a turn in corrupt."""
+    state = dict(read=0.0)
+    prompts = {}
+
+    async def completions(req):
+        b = await req.json()
+        seen.append(b)
+        n = b["max_tokens"]
+        if b.get("cache_salt"):
+            key = prompts.get(tuple(b["prompt"]))
+            ids = [7 + i for i in range(n)]
+            if key in corrupt:
+                ids[1] = 999
+            return web.json_response({"choices": [{"token_ids": ids}]})
+        key = (b.get("kv_transfer_params") or {}).get("park_key")
+        prompts[tuple(b["prompt"])] = key
+        if key in disk_turns:
+            state["read"] += 1e6
+        resp = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await resp.prepare(req)
+        for i in range(n):
+            await asyncio.sleep(0.02)
+            await resp.write(f"data: {json.dumps({'choices': [{'token_ids': [7 + i]}]})}\n\n".encode())
+        await resp.write(f"data: {json.dumps({'choices': [], 'usage': {'prompt_tokens': len(b['prompt'])}})}\n\n".encode())
+        await resp.write(b"data: [DONE]\n\n")
+        return resp
+
+    async def metrics(req):
+        return web.Response(text=f'vllm:kv_offload_tiering_read_bytes_total{{tier="1"}} {state["read"]}\n'
+                                 f"vllm:external_prefix_cache_hits_total 0\n")
+
+    async def hint(req):
+        return web.json_response({"queued": 1})
+
+    app = web.Application()
+    app.router.add_post("/v1/completions", completions)
+    app.router.add_get("/metrics", metrics)
+    happ = web.Application()
+    happ.router.add_post("/hint", hint)
+    return app, happ
+
+
+@pytest.mark.parametrize("corrupt,verdict", [((), "PASS"), (("s0-2",), "FAIL")])
+def test_verify_disk_compares_disk_restored_turns_with_a_cold_recompute(tmp_path, corrupt, verdict):
+    # K disk-path pilot: only turns that read the disk tier are re-sent cold (with a cache_salt); the row records
+    # whether the output matched, and check_k_disk.py passes only when every verified turn is identical
+    port, hport, seen = free_port(), free_port(), []
+    app, happ = mock_vllm_disk(port, seen, disk_turns={"s0-1", "s0-2"}, corrupt=corrupt)
+    serve({port: app, hport: happ})
+    turns = [T(0.05), T(0.05), T(0.05), T(None)]
+    w = write_wl(tmp_path, [dict(id="s0", pool="p", seed=1, start=0.0, turns=turns)])
+    _, rows = run(w, tmp_path / "o.jsonl", port, hport, extra=("--verify-disk", "5"))
+    R = turn_rows(rows)
+    assert "verify" not in R[("s0", 0)] and "verify" not in R[("s0", 3)]
+    v1, v2 = R[("s0", 1)]["verify"], R[("s0", 2)]["verify"]
+    assert v1["identical"] and v1["disk_read_bytes"] == 1e6 and v1["first_diff"] is None
+    assert v2["identical"] == (not corrupt) and v2["first_diff"] == (1 if corrupt else None)
+    salted = [b for b in seen if b.get("cache_salt")]
+    assert len(salted) == 2 and len({b["cache_salt"] for b in salted}) == 2
+    sys.path.insert(0, os.path.join(ROOT, "engine", "phase_r"))
+    import check_k_disk
+    live = {"counts": {"ins": 1, "park": 2}, "disk": {"written_jobs": 3, "chunks_on_disk": 3}}
+    assert check_k_disk.check(rows, live)["verdict"] == verdict
+    assert check_k_disk.check(rows, dict(live, counts={"ins": 0, "park": 0}))["verdict"] == "FAIL"

@@ -61,6 +61,13 @@ precomputed curve posted as before and is flagged ("live_missing" / "live_error"
 per turn: {"session": workload session id, "turn": i, "state": server-view state (JSON string or object),
 "kind": "tool"|"human" (optional, defaults to the turn's kind)}.
 
+Disk-restore check (--verify-disk N, vLLM closed loop; the K disk-path pilot): for up to N turns that ran with no
+other request in flight and during which the engine's disk tier was read (/metrics
+vllm:kv_offload_tiering_read_bytes rose), the same prompt is sent again under a fresh cache_salt, so no GPU, CPU or
+disk prefix can match, and the row gets {"verify": {"disk_read_bytes", "ext_hits", "cached_tokens", "out_tokens",
+"identical", "first_diff"}}: identical is whether the restored turn's greedy output equals that cold recompute (the
+compat check's test). The probe adds its own request and its KV to the tiers; it is for pilots only.
+
 SGLang (--engine sglang): /generate with input_ids and sampling_params (max_new_tokens, ignore_eos,
 temperature 0), streamed for TTFT; the output token ids come from the stream (cumulative by default,
 incremental with --incremental-streaming-output, both handled). --park-hints tags each turn with
@@ -102,6 +109,9 @@ ap.add_argument("--expect-turns", type=int, help="health check: exact turn count
 ap.add_argument("--open-loop-rate", type=float, help="open loop: Poisson arrivals at this many requests per second")
 ap.add_argument("--requests", type=int, help="open loop: requests to send")
 ap.add_argument("--seed", type=int, default=0, help="open loop: arrival and session-pick seed")
+ap.add_argument("--verify-disk", type=int, default=0, metavar="N",
+                help="vLLM closed loop: for up to N turns that ran alone and read the disk tier, resend the prompt "
+                     "cold (fresh cache_salt) and record whether the greedy output is identical")
 ap.add_argument("--model", default="Qwen/Qwen3-8B")
 ap.add_argument("--vocab", type=int, default=150000)
 a = ap.parse_args()
@@ -128,6 +138,8 @@ if a.open_loop_rate is not None:
                  "(analyze_phase_r.py reads the rate from the name)")
 elif a.requests is not None:
     ap.error("--requests is for --open-loop-rate")
+if a.verify_disk and (a.engine != "vllm" or a.open_loop_rate is not None):
+    ap.error("--verify-disk is for the vLLM closed loop")
 
 W = json.load(open(a.workload))
 
@@ -198,9 +210,14 @@ def eta_of(t):
     return t[f"eta_{a.cpu_hint}"]
 
 
+sends = 0                              # requests sent so far (a turn ran alone if this did not move during it)
+verified = 0                           # --verify-disk probes done
+
+
 def _conc(delta):
-    global inflight
+    global inflight, sends
     inflight += delta
+    sends += delta > 0
     conc_series.append((round(time.time() - t_zero, 3), inflight))
     return inflight
 
@@ -378,6 +395,49 @@ def meta_of(s, i):
                 prev_gap=p["gap_after"] if p else None)
 
 
+TIER_READ = "vllm:kv_offload_tiering_read_bytes"     # bytes the tiering manager read from its secondary (disk) tier
+EXT_HITS = "vllm:external_prefix_cache_hits"
+
+
+async def tier_counters(http, names=(TIER_READ, EXT_HITS)):
+    """Sum of each Prometheus counter in names (every label set, with or without the _total suffix), or None."""
+    try:
+        async with http.get(f"{a.url}/metrics", timeout=aiohttp.ClientTimeout(total=30)) as r:
+            txt = await r.text()
+    except Exception:  # noqa: BLE001
+        return None
+    got = dict.fromkeys(names, 0.0)
+    for line in txt.splitlines():
+        if line.startswith("#"):
+            continue
+        name = line.split("{", 1)[0].split(" ", 1)[0]
+        base = name[:-6] if name.endswith("_total") else name
+        if base in got:
+            try:
+                got[base] += float(line.rsplit(" ", 1)[1])
+            except ValueError:
+                pass
+    return got
+
+
+async def cold_output(http, history, n):
+    """The no-cache reference: the same prompt under a fresh cache_salt (no GPU, CPU or disk prefix can match),
+    greedy, n tokens. Counted in flight like a turn."""
+    global verified
+    verified += 1
+    body = {"model": a.model, "prompt": history, "max_tokens": n, "ignore_eos": True, "temperature": 0.0,
+            "return_token_ids": True, "cache_salt": f"verify-{verified}-{time.time()}"}
+    _conc(+1)
+    try:
+        async with http.post(f"{a.url}/v1/completions", json=body,
+                             timeout=aiohttp.ClientTimeout(total=a.turn_timeout)) as r:
+            r.raise_for_status()
+            ch = (await r.json(content_type=None))["choices"][0]
+            return ch.get("token_ids")
+    finally:
+        _conc(-1)
+
+
 # a lost connection to the server, not an answer from it: refused or reset, disconnected mid-stream, truncated payload
 CONN_ERRORS = (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError, ConnectionError)
 
@@ -392,6 +452,9 @@ async def serve_turn(http, s, st, i, extra=None):
     history = st["history"]
     hint = "none" if a.hint == "none" else t[f"hint_{a.hint}"]
     last = i == len(s["turns"]) - 1 or t.get("gap_after") is None
+    probe = bool(a.verify_disk) and verified < a.verify_disk and inflight == 0
+    before = await tier_counters(http) if probe else None
+    sends0 = sends
     try:
         try:
             out_ids, m = await turn(http, i, t, history, hint, f"{s['id']}-{i}", last)
@@ -410,6 +473,15 @@ async def serve_turn(http, s, st, i, extra=None):
     st["history"] = history + out_ids
     if a.park_hints and t["gap_after"] is not None:
         post_hint(http, s, i, t)
+    if before is not None and sends == sends0 + 1 and inflight == 0 and verified < a.verify_disk:
+        after = await tier_counters(http)
+        rd = None if after is None else after[TIER_READ] - before[TIER_READ]
+        if rd and sends == sends0 + 1:      # this turn alone read the disk tier: compare with a cold recompute
+            ref = await cold_output(http, history, t["out_len"])
+            m["verify"] = dict(disk_read_bytes=rd, ext_hits=after[EXT_HITS] - before[EXT_HITS],
+                               cached_tokens=((m.get("usage") or {}).get("prompt_tokens_details") or {}).get("cached_tokens"),
+                               out_tokens=len(out_ids), identical=ref == out_ids,
+                               first_diff=next((k for k, (x, y) in enumerate(zip(out_ids, ref or [])) if x != y), None))
     emit(dict(meta_of(s, i), prompt_tokens=len(history), out_tokens=len(out_ids), hint=hint,
               prev_hint=(s["turns"][i - 1][f"hint_{a.hint}"] if i and a.hint != "none" else "none"), **m,
               **(extra or {})))

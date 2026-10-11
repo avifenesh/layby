@@ -114,3 +114,28 @@ budget during prefill, so the floor is 2.2x the session KV at the cap). Heavy P 
 65.6 GB, Gemma 4 183.4 GB. Gemma's prefill is measured too (b1 4,447 tok/s at 23K, Triton attention: C0 and B x3.82);
 both TPOTs remain estimates. CT_ETA is the measured memoryfulness of each workload; where it is 0.0 (floored), CT's
 TTL uses the reload cost alone (T x eta + R = R).
+
+## surv_v6, GPU floors, cells (2026-10-11, after the compat check)
+
+surv_v6: `attach_surv_v6.py` joins each workload's side rows to `pool_all.surv_v6.parquet` (Layby-Dwell v6 @101cc44,
+sidecar scorer, bf16; receipt `surv_v6_receipt.json`, copied next to the workloads) by feat_ref, after checking the
+receipt's sha256 of the pool side file and scores and that every joined row's server-view state and kind equal the
+pool's. 33,796 turns with a wait got a curve; 0 public turns without one; the 2,247 cc-traces turns have no text and
+stay null. `NAME.side.jsonl` (mode 600) is the live sidecar's input. Sanity (`surv_v6.json`): tool P(T > 60 s)
+0.02 to 0.06 predicted vs 0.01 to 0.05 observed; human 0.71 to 0.81 vs 0.60 to 0.79; human P(T > 300 s) 0.40 to 0.47
+vs 0.25 to 0.37: the workloads keep a session only up to its first wait that never returned, so long waits are
+under-represented against the model's (non-returns included) prediction.
+
+GPU KV floor with a connector: vLLM 0.31.0 keeps the hybrid KV manager on with OffloadingConnector (SupportsHMA), so a
+sliding group holds window + in-flight tokens per request. One 131,072-token request needs 9,541 blocks x 2,621,440 B =
+25.01 GB on Gemma 4 and 174 x 51,380,224 B = 8.94 GB on Qwen3.8, with or without a connector; the formula reproduces
+every compat log figure (49,895 and 301,887 tokens, num_gpu_blocks 21,975, concurrency 2.303218 and 6.810345). vLLM's
+"GPU KV cache size: N tokens" is concurrency x max_model_len, so pool / N (430 KB/token for Gemma) is not a
+reservation. No re-size: Gemma GPU KV 27.81 GB (1.11x a 131K request, above 20 GiB) = 0.15 P, Qwen 10.05 GB (1.12x).
+Recorded in models_phase_r.json and capacities.json (gpu_request_check).
+
+Cells (`make_cells.py`, engine/phase_r/cells): qwen and gemma slow heavy, slow light, medium heavy; pilots slow (every
+arm plus PT, for RSS), medium (C0 T K) and kdisk (`kdisk_workload.py`: the pilot workload cut at 20 minutes, CPU tier
+1.5x the largest session, 0.21 (Qwen) and 0.12 (Gemma) of the peak live tier bytes; pass: `check_k_disk.py`, with
+replay `--verify-disk` comparing disk-restored turns against a cold recompute). Medium carries a PLACEHOLDER io.max
+read cap of 1 GB/s: at the NRD disk's nominal 2 GiB/s the compat inputs classify both models fast.

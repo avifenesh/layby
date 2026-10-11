@@ -75,7 +75,7 @@ for M in models:
               window_bytes_per_token=k["window_bytes_per_token"], window_bytes_per_session_max=k["window_bytes_per_session_max"],
               state_block_tokens=k.get("state_block_tokens"), state_block_source=k.get("state_block_source"),
               longest_request_bytes=k["longest_request_bytes"], gpu_request_bytes=k.get("gpu_request_bytes"),
-              gpu_request_source=k.get("gpu_request_source"), P_bytes=P, P_grow_tokens=meas["peak_live_kv_tokens"],
+              gpu_request_source=k.get("gpu_request_source"), gpu_request_check=k.get("gpu_request_check"), P_bytes=P, P_grow_tokens=meas["peak_live_kv_tokens"],
               gpu_kv_bytes_plan=int(0.15 * P), gpu_kv_floor_bytes=floor, gpu_kv_bytes=gpu, gpu_kv_floored=gpu == floor,
               cpu_bytes=int(0.4 * P), service_model=dict(c0=M["c0"], tpot=M["tpot"], b_per_1k_prompt=M["b"],
                                                           inflight=M["inflight"], status=M["service_assumption"]["status"]))
@@ -96,13 +96,14 @@ for M in models:
         if k["state_bytes_per_session"]:
             wc.update(state_snapshots=L["state_snapshots"], state_blocks=L["state_blocks"])
         caps["workloads"][n] = wc
-        put_json(p, W)
+        put_json(p, W)       # surv_v6 already attached (attach_surv_v6.py) stays in W and its manifest record is kept
         man = mans[n]
         man["bytes"], man["sha256"] = os.path.getsize(p), sha(p)
+        v6 = (man.get("curves") or {}).get("surv_v6")
         man["curves"] = dict(surv_km=f"layby.curves annotate, bench/phase_r/km_public_train.json sha256 {km_sha}",
                              surv_ewma=f"alpha {a.alpha} (chosen in the simulator on the tuning workloads, 2026-10-10)",
                              turns_with_curves=r["turns"], ewma_from_own_waits=r["ewma_own"],
-                             surv_v6="null until scored from the side file (GPU)")
+                             surv_v6=v6 if isinstance(v6, dict) else "null until scored from the side file (GPU)")
         man["ct_eta"] = eta
         man["capacities"] = dict(model=mc, workload=wc)
         put_json(os.path.join(a.dir, f"{n}.manifest.json"), man, indent=1)

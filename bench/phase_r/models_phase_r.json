@@ -26,6 +26,16 @@
     "conv_state_bytes_per_layer": 61440,
     "ssm_dtype": "float32",
     "max_position_embeddings": 262144
+   },
+   "gpu_request_check": {
+    "exact_bytes": 8940158976,
+    "blocks": 174,
+    "block_bytes": 51380224,
+    "formula": "cdiv(131072, 784) = 168 attention blocks + 3 mamba groups x 2 blocks = 174 blocks x 51,380,224 B (16 layers x 784 tokens x 4 KV heads x 256 x K,V x 2 B)",
+    "connector": "same with a KV connector: OffloadingConnector (and ParkConnector, its subclass) implements SupportsHMA, so vLLM 0.31.0 keeps the hybrid KV manager on; no compat log says 'Turning off hybrid kv cache manager'",
+    "reproduces": "compat logs: 8 GiB pool = 167 blocks / 59 (40,960 tokens) = 2.83x, 115,937 tokens; boot 1,185 blocks / 174 = 6.810345x (cache_config kv_cache_max_concurrency 6.810344827586207), 892,645 tokens",
+    "note": "vLLM's 'GPU KV cache size: N tokens' is max concurrency x max_model_len, so pool bytes / N (about 74 KB/token here) is not a per-token reservation; the 1.1x floor at gpu_kv_bytes 10,047,622,348 B = 195 blocks is 1.12x one 131,072-token request",
+    "checked": "2026-10-11, vllm/v1/kv_cache_interface.py and v1/core/kv_cache_utils.py of vLLM 0.31.0"
    }
   },
   "c0": 1.2235,
@@ -89,6 +99,16 @@
     "sliding_head_dim": 256,
     "sliding_window": 1024,
     "max_position_embeddings": 262144
+   },
+   "gpu_request_check": {
+    "exact_bytes": 25011159040,
+    "blocks": 9541,
+    "block_bytes": 2621440,
+    "formula": "5 sliding groups x (cdiv(min(1023 + max_in_flight_tokens 2 x 8192, L), 16) + 1) = 5 x 1,089 blocks + global group cdiv(131072, 32) = 4,096 blocks = 9,541 blocks x 2,621,440 B (10 layers x 16 tokens x 16 KV heads x 256 x K,V x 2 B; the global group's 32-token page has the same bytes)",
+    "connector": "same with a KV connector: OffloadingConnector (and ParkConnector, its subclass) implements SupportsHMA, so vLLM 0.31.0 keeps the hybrid KV manager on and the sliding groups stay capped at window + in-flight tokens; no compat log says 'Turning off hybrid kv cache manager'",
+    "reproduces": "compat logs: 40,960 tokens need 6,725 blocks = 16.418 GiB (logged 16.42 GiB); 20 GiB pool = 8,192 blocks = 1.218x, 49,895 tokens (logged 1.22x, 49,895); boot num_gpu_blocks 21,975 / 9,541 = 2.303218x (logged 2.303217692065821), 301,887 tokens",
+    "note": "vLLM's 'GPU KV cache size: N tokens' is max concurrency x max_model_len, so pool bytes / N (about 430 KB/token) is not a per-token reservation; one 131,072-token request needs 23.29 GiB with or without a connector, and gpu_kv_bytes 27,811,393,536 B = 10,609 blocks is 1.112x it (above the 20 GiB the compat reruns used at 40,960)",
+    "checked": "2026-10-11, vllm/v1/kv_cache_interface.py and v1/core/kv_cache_utils.py of vLLM 0.31.0"
    }
   },
   "c0": 2.4786,

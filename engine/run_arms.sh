@@ -60,7 +60,8 @@
 #      the sidecar's own choice: cuda when present), SIDECAR_WAIT (5 s polls, default 60). EVICTION (the CPU-tier
 #      eviction of the arms on vLLM's
 #      own policy, C0 T T2 CT PT: lru or arc, default lru), FS_THREADS (read and write threads of every disk tier,
-#      default 16). REPLAY_TIMEOUT must exceed HARD_CAP by 300 s (the cap writes the censored rows).
+#      default 16). REPLAY_TIMEOUT must exceed HARD_CAP by 300 s (the cap writes the censored rows). REPLAY_EXTRA
+#      (extra replay.py arguments for every arm, e.g. "--verify-disk 20" in the K disk-path pilot).
 set -u
 W=$1; O=$2; KV=$3; CPU=$4; DISK=$5; shift 5
 MODEL=${MODEL:-Qwen/Qwen3-8B}
@@ -177,7 +178,7 @@ for arm in "$@"; do
     timeout $RT $VENV/bin/python $ENGINE_DIR/smoke_restore.py --url http://127.0.0.1:$PORT --model $MODEL \
       --vocab ${VOCAB:-150000} ${SMOKE_ARGS:-} > $O/$arm.client.log 2>&1
   else
-  timeout $RT $VENV/bin/python $ENGINE_DIR/replay.py $W $O/$arm.jsonl --url http://127.0.0.1:$PORT --cpu-hint $src --prefetch $src --model $MODEL --vocab ${VOCAB:-150000} ${HARD_CAP:+--hard-cap $HARD_CAP} $client > $O/$arm.client.log 2>&1
+  timeout $RT $VENV/bin/python $ENGINE_DIR/replay.py $W $O/$arm.jsonl --url http://127.0.0.1:$PORT --cpu-hint $src --prefetch $src --model $MODEL --vocab ${VOCAB:-150000} ${HARD_CAP:+--hard-cap $HARD_CAP} $client ${REPLAY_EXTRA:-} > $O/$arm.client.log 2>&1
   fi
   rc=$?
   dead=$(alive $SP "$LMP" "$SCP")
