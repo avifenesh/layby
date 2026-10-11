@@ -46,7 +46,7 @@ from layby.rule import TG, decide, interp_surv, recompute_cost
 from layby.vllm import server
 from layby.vllm.state import STATE
 
-logger = init_logger(__name__)
+logger = init_logger("vllm." + __name__)   # under vLLM's handler: a module name outside "vllm" prints nothing
 _failed: set = set()
 
 

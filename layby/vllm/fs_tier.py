@@ -33,7 +33,7 @@ from layby.live import PROBE_BYTES, probe_disk
 from layby.vllm.state import STATE
 from vllm.logger import init_logger
 
-logger = init_logger(__name__)
+logger = init_logger("vllm." + __name__)   # under vLLM's handler: a module name outside "vllm" prints nothing
 
 LATE_TTL = 30.0   # seconds a late write keeps waiting for a chunk the CPU tier has not stored yet
 

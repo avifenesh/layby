@@ -53,7 +53,7 @@ from vllm.v1.kv_offload.tiering.base import RequestOffloadingContext
 from vllm.v1.kv_offload.tiering.fs.manager import FileSystemTierManager
 from vllm.logger import init_logger
 
-logger = init_logger(__name__)
+logger = init_logger("vllm." + __name__)   # under vLLM's handler: a module name outside "vllm" prints nothing
 
 _CAP = 1 << 62      # KVBM's i64 saturating multiply, kept in range
 STATS_EVERY_S = 60.0   # the counts go to the server log this often (chunks admitted to disk: the T2 write count)

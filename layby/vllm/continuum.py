@@ -67,7 +67,7 @@ from vllm.logger import init_logger
 from layby.continuum import ContinuumTTL
 from layby.live import Speeds
 
-logger = init_logger(__name__)
+logger = init_logger("vllm." + __name__)   # under vLLM's handler: a module name outside "vllm" prints nothing
 _failed: set = set()
 
 
