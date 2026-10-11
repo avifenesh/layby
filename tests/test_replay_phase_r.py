@@ -59,6 +59,8 @@ def mock_vllm(port, hint_port, seen, behave=None, sidecar_port=None, live=None):
             await asyncio.sleep(60)
         resp = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
         await resp.prepare(req)
+        if b.get("return_token_ids"):   # vLLM's first chunk echoes the prompt ids: one SSE line as long as the prompt
+            await resp.write(f"data: {json.dumps({'choices': [{'text': '', 'prompt_token_ids': b['prompt']}]})}\n\n".encode())
         for i in range(b["max_tokens"]):
             await asyncio.sleep(0.05)
             await resp.write(f"data: {json.dumps({'choices': [{'token_ids': [7 + i]}]})}\n\n".encode())
@@ -145,6 +147,20 @@ def test_failed_turn_continues_cap_censors_concurrency_and_tools(tmp_path):
     summ = next(r for r in rows if "wall_s" in r)
     assert (summ["served"], summ["failed"], summ["censored"], summ["cap_hit"]) == (3, 1, 2, True)
     assert summ["wall_s"] < 6                                     # the cap cut the 60 s hang
+
+
+def test_long_prompt_is_served_although_its_echoed_ids_exceed_the_default_line_limit(tmp_path):
+    """A 131K-token prompt echoed as ids is one SSE line of about 1 MB, above aiohttp's default 512 KiB line limit
+    (2 x read_bufsize): the turn must be served, not failed with LineTooLong (2026-10-11 pilot: every turn above about
+    85K tokens failed)."""
+    port, hport, seen = free_port(), free_port(), []
+    mock_vllm(port, hport, seen)
+    big = dict(new_tokens=131000, out_len=2, kind="tool", ctx=131000, gap_after=None, tool=None, surv_v6=[0.5] * 15)
+    w = write_wl(tmp_path, [dict(id="s0", pool="p", seed=1, start=0.0, turns=[big])])
+    p, rows = run(w, tmp_path / "o.jsonl", port, hport, ["--vocab", "150000"])
+    R = turn_rows(rows)
+    assert not R[("s0", 0)].get("failed"), R[("s0", 0)].get("error")
+    assert R[("s0", 0)]["out_tokens"] == 2 and R[("s0", 0)]["ttft"] < 30
 
 
 def test_health_check_mismatch_sends_nothing(tmp_path):

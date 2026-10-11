@@ -626,10 +626,15 @@ async def write_env(http):
         print("env.json not written:", repr(e)[:200], file=sys.stderr)
 
 
+READ_BUFSIZE = 1 << 24   # lines up to 32 MiB
+
+
 async def main():
     global t_zero
     conn = aiohttp.TCPConnector(limit=0)
-    async with aiohttp.ClientSession(connector=conn) as http:
+    # vLLM's first stream chunk echoes the prompt's token ids (return_token_ids): one SSE line of up to about 1 MB at
+    # 131K tokens. aiohttp caps a line at 2 x read_bufsize (512 KiB by default) and fails the turn with LineTooLong.
+    async with aiohttp.ClientSession(connector=conn, read_bufsize=READ_BUFSIZE) as http:
         await write_env(http)
         await scrape(http, "before")
         t_zero = time.time()
