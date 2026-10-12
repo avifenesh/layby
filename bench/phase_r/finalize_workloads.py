@@ -10,7 +10,8 @@ Capacities per model, from its measured workload's P (BENCH_PLAN section 5, draf
 the engine needs for one request at the context cap, kv.gpu_request_bytes, so the engine can start), CPU tier 0.55 P
 minus the GPU KV (GPU + CPU = 0.55 P, the original 0.15 + 0.40), at least 0.05 P and at least 1.5 max-length contexts
 at the tier's measured bytes per token (sim_sizing.cpu_min_bytes; a disk restore is staged through the CPU tier). Per workload: disk tier
-1.2 x unique KV at turn ends (one recurrent state and the window's new tokens per turn end; the coordinator's
+1.2 x max(1, the model's measured disk_write_factor: bytes the tier wrote per unique KV byte in pilot 2's T arms) x
+unique KV at turn ends (one recurrent state and the window's new tokens per turn end; the coordinator's
 2026-10-11 decision); disk_bytes_upper is 1.2 x the builder's upper bound (the sliding layers' KV of every token, a
 recurrent state at every KV block boundary), for a check against the bytes the engines write in the pilot.
 
@@ -105,7 +106,7 @@ for M in models:
         ub = L["unique_kv_bytes"]
         wc = dict(model=M["name"], sessions=L["sessions"], turns=L["turns"], peak_live_kv_bytes=L["peak_live_kv_bytes"],
                   peak_live_kv_grow_tokens=L["peak_live_kv_tokens"], peak_over_model_P=round(L["peak_live_kv_bytes"] / P, 3),
-                  unique_kv_grow_tokens=L["unique_kv_tokens"], unique_kv_bytes=ub, disk_bytes=int(1.2 * ub),
+                  unique_kv_grow_tokens=L["unique_kv_tokens"], unique_kv_bytes=ub, disk_bytes=int(1.2 * max(1.0, k.get("disk_write_factor", 1.0)) * ub),
                   unique_kv_bytes_upper=L["unique_kv_bytes_upper"], disk_bytes_upper=int(1.2 * L["unique_kv_bytes_upper"]),
                   est_makespan_s=L["est_makespan_s"], run_to_completion=L.get("run_to_completion", False),
                   ct_eta=eta, est_mean_inflight=L["est_mean_inflight"])

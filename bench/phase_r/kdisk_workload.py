@@ -144,7 +144,7 @@ def main():
                  peak_live_kv_bytes=int(P), peak_live_tokens=int(peak_tokens), peak_live_tier_bytes=int(tier_peak),
                  unique_kv_tokens=int(uniq), unique_kv_bytes=int(ub), est_makespan_s=round(max(ends), 0),
                  est_mean_inflight=round(busy / max(ends), 3))
-    capacities = dict(gpu_kv_bytes=caps["gpu_kv_bytes"], cpu_bytes=int(cpu), disk_bytes=int(1.2 * ub),
+    capacities = dict(gpu_kv_bytes=caps["gpu_kv_bytes"], cpu_bytes=int(cpu), disk_bytes=int(1.2 * max(1.0, M["kv"].get("disk_write_factor", 1.0)) * ub),
                       cpu_over_peak_tier_bytes=round(share, 4), cpu_over_largest_session=a.cpu_sessions,
                       tier_bytes_per_token=a.tier_bytes_per_token, chunk_bytes=a.chunk_bytes)
     print(json.dumps(dict(stats, capacities=capacities)), flush=True)

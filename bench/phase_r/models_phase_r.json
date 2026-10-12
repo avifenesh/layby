@@ -39,7 +39,9 @@
    },
    "tier_bytes_per_token": 72472,
    "tier_chunk_bytes": 51380224,
-   "tier_source": "pilot 1 micro tier_measured (vLLM 0.31.0 CPU tier bytes per token; chunk = the tier's block)"
+   "tier_source": "pilot 1 micro tier_measured (vLLM 0.31.0 CPU tier bytes per token; chunk = the tier's block)",
+   "disk_write_factor": 0.8816,
+   "disk_write_factor_source": "pilot 2 job 16 (T, qwen38_27b.pilot, network_ssd): 39,768,297,434 B for 45,108,494,336 B; job 17 (NRD): 39,408,635,866 B"
   },
   "c0": 1.2235,
   "tpot": 0.02836,
@@ -131,7 +133,9 @@
    },
    "tier_bytes_per_token": 131714,
    "tier_chunk_bytes": 2621440,
-   "tier_source": "pilot 1 micro tier_measured (vLLM 0.31.0 CPU tier bytes per token; chunk = the tier's block)"
+   "tier_source": "pilot 1 micro tier_measured (vLLM 0.31.0 CPU tier bytes per token; chunk = the tier's block)",
+   "disk_write_factor": 1.2665,
+   "disk_write_factor_source": "pilot 2 job 19 (T, gemma4_31b.kdisk): tier reached 148,423,315,476 B for 117,164,851,200 B of unique KV at turn ends"
   },
   "c0": 2.4786,
   "tpot": 0.03421,
