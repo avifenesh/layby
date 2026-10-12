@@ -33,6 +33,25 @@ class CpuTier(unittest.TestCase):
         self.assertEqual(set(orchestrate.check_cpu_tiers(cell(26793656320)).values()), {26793656320})
 
 
+class KDiskReference(unittest.TestCase):
+    def test_stock_reference_criterion(self):
+        # 2026-10-11 pilot: Gemma 4 K restored 20 contexts from disk, 18 identical to a cold recompute; stock vLLM's
+        # own batched-prefix control gave 18 of 20 too. Draft 6: with a stock reference (arm T, same probe) K fails
+        # only when it differs more often than stock (one-sided Fisher exact p < 0.05).
+        import check_k_disk
+        live = {"counts": {"ins": 44, "park": 137}, "disk": {"written_jobs": 134, "chunks_on_disk": 60694}}
+
+        def rows(n, differ):
+            return [{"verify": {"identical": i >= differ, "first_diff": 116 if i < differ else None}} for i in range(n)]
+        self.assertEqual(check_k_disk.check(rows(20, 2), live)["verdict"], "FAIL")
+        r = check_k_disk.check(rows(20, 2), live, reference=rows(20, 2))
+        self.assertEqual(r["verdict"], "PASS")
+        self.assertNotIn("outputs_identical", r["checks"])
+        self.assertEqual(check_k_disk.check(rows(20, 8), live, reference=rows(20, 0))["verdict"], "FAIL")
+        self.assertEqual(check_k_disk.check(rows(20, 0), live, reference=[])["verdict"], "FAIL")
+        self.assertAlmostEqual(check_k_disk.fisher_greater(2, 20, 2, 20), 0.6975, places=3)   # 1 - P(X <= 1), X ~ H(40, 4, 20)
+
+
 class Cgroup(unittest.TestCase):
     def test_budget(self):
         # pinned 28 GiB + RSS 12 GiB + 256 MiB; the RAM tier adds its size
