@@ -63,7 +63,7 @@ def params(base, kp=1.0, kd=1.0, until=None):
     p = Params(gpu_tokens=base["gpu_tokens"], cpu_tokens=base["cpu_tokens"], budget=BUDGET, max_seqs=MAX_SEQS,
                t0=base["t0"] * kd, bw=base["bw"] / kd, f0=base["f0"] * kp, att=base["att"],
                cpu_gbps=base["cpu_gbps"], kib=base["tier_bpt"] / 1024.0, hbm_kib=base["grow_bpt"] / 1024.0,
-               req_tokens=base["req_tokens"], until=until)
+               req_tokens=base["req_tokens"], req_tokens_prefill=base.get("req_tokens_prefill"), until=until)
     return p
 
 
@@ -134,17 +134,24 @@ def main():
     ap.add_argument("--tier-bpt", type=float, required=True)
     ap.add_argument("--req-bytes", type=float, required=True, help="GPU KV a running request holds beyond its "
                     "growing KV: the recurrent state (Qwen) or the sliding window at its maximum (Gemma)")
+    ap.add_argument("--req-prefill-bytes", type=float, help="GPU KV a request holds beyond its growing KV while "
+                    "its prefill runs (sim_sizing.req_reserve_tokens; default: --req-bytes)")
+    ap.add_argument("--budget", type=int, default=BUDGET, help="--max-num-batched-tokens of the runs")
+    ap.add_argument("--max-seqs", type=int, default=MAX_SEQS, help="--max-num-seqs of the runs")
     ap.add_argument("--cpu-gbps", type=float, required=True)
     ap.add_argument("--run", action="append", required=True, help="LABEL=ROWS.jsonl:CAP_S (CAP_S 0: uncapped)")
     ap.add_argument("--kp", default="0.8,0.9,1.0,1.1,1.2,1.3,1.45,1.6")
     ap.add_argument("--kd", default="0.75,1.0,1.5,2.0")
     ap.add_argument("--procs", type=int, default=4)
     a = ap.parse_args()
+    globals().update(BUDGET=a.budget, MAX_SEQS=a.max_seqs)   # the runs' engine settings (forked workers inherit them)
 
     W = json.load(open(a.workload))
     mt = micro_terms(json.load(open(a.micro)), a.grow_bpt)
     base = dict(mt, gpu_tokens=int(a.gpu_bytes // a.grow_bpt), cpu_tokens=int(a.cpu_bytes // a.tier_bpt),
-                req_tokens=int(round(a.req_bytes / a.grow_bpt)), cpu_gbps=a.cpu_gbps, tier_bpt=a.tier_bpt,
+                req_tokens=int(round(a.req_bytes / a.grow_bpt)),
+                req_tokens_prefill=None if a.req_prefill_bytes is None else int(round(a.req_prefill_bytes / a.grow_bpt)),
+                cpu_gbps=a.cpu_gbps, tier_bpt=a.tier_bpt,
                 grow_bpt=a.grow_bpt)
     runs = []
     for r in a.run:

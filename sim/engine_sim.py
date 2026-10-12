@@ -58,6 +58,10 @@ class Params:
         self.max_seqs = None        # max running requests, as --max-num-seqs (None: no cap)
         self.req_tokens = 0         # GPU KV a running request holds beyond its tokens, in tokens (a recurrent
                                     # state, a sliding window: bench/phase_r/fit_service.py)
+        self.req_tokens_prefill = None  # the same while its prefill runs (None: req_tokens). vLLM 0.31.0 gives a
+                                    # prefilling request the window plus two in-flight chunks in every sliding
+                                    # group, and a Mamba request one checkpoint block per group more
+                                    # (bench/phase_r/sim_sizing.req_reserve_tokens)
         self.until = None           # stop the simulation at this time (a hard cap; unfinished turns are not in out)
         self.__dict__.update(kw)
 
@@ -196,7 +200,7 @@ def simulate(W, src, p, rule=None):
         nonlocal alloc, link_cpu, link_disk
         k = r.sess
         own = gpu_idle.get(k, 0)
-        need = r.P + r.O + p.req_tokens
+        need = r.P + r.O + (p.req_tokens if p.req_tokens_prefill is None else p.req_tokens_prefill)
         if not gpu_evict(need - min(own, r.P + r.O), k, now):
             return False
         g = min(r.P, max(own, running_sess.get(k, 0)))
@@ -320,6 +324,9 @@ def simulate(W, src, p, rule=None):
             running_sess[r.sess] = max(running_sess.get(r.sess, 0), r.P - r.rem)
             if r.rem == 0:
                 r.out = 1; r.t_first = now
+                if p.req_tokens_prefill is not None and p.req_tokens_prefill > p.req_tokens:
+                    d = p.req_tokens_prefill - p.req_tokens   # prefill over: back to the decode reserve
+                    alloc -= d; r.alloc -= d
         for r in dec:
             r.out += 1
         for r in [r for r in running if r.rem == 0 and r.out >= r.O]:

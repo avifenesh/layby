@@ -25,6 +25,28 @@ def load_fit(path):
     return dict(path=path, kp=d["fit"]["kp"], kd=d["fit"]["kd"], params=sp, model=d["model"])
 
 
+def req_reserve_bytes(kv, budget, cap):
+    """GPU KV a running request holds beyond its growing KV in vLLM 0.31.0, as (while its prefill runs, while it
+    decodes), bytes. Sliding-window models (Gemma 4: 50 sliding layers in 5 groups of 10, the global layers' group
+    size): each group holds the window plus the tokens in flight, two scheduled steps (async scheduling) of up to
+    `budget` tokens in prefill and of one token in decode: cdiv(window - 1 + in-flight, 16) + 1 blocks per group,
+    capped at the context cap (the formula that reproduces the compat boot logs). Mamba models (Qwen3.8: 48 Gated
+    DeltaNet layers in 3 groups of 16): one state block per group, one more per group while a prefill checkpoints
+    (align mode, MambaManager.get_num_blocks_to_allocate)."""
+    chk = kv["gpu_request_check"]
+    bb = chk["block_bytes"]
+    if kv.get("window_tokens"):
+        a = kv["arch"]
+        groups = a["sliding_layers"] // a["global_layers"]
+        w = kv["window_tokens"]
+        blocks = lambda inflight: math.ceil(min(w - 1 + inflight, cap) / 16) + 1   # noqa: E731
+        return groups * blocks(2 * budget) * bb, groups * blocks(2) * bb
+    if kv.get("state_bytes_per_session"):
+        groups = kv["arch"]["gdn_layers"] // kv["arch"]["full_layers"]
+        return 2 * groups * bb, groups * bb
+    return 0, 0
+
+
 def cpu_min_bytes(kv, cap, sessions=1.5):
     """The CPU tier a disk restore needs: a restore is staged through the CPU tier, so it holds sessions x one
     max-length context at the tier's measured bytes per token, in whole tier chunks (the kdisk rule)."""
