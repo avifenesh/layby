@@ -23,7 +23,7 @@ manifest), MAX_NUM_SEQS on Qwen at most its GPU KV blocks (vLLM's Mamba CUDA gra
 chunk (Qwen 51,380,224 B, Gemma 2,621,440 B), hard_cap_s 1.5 x the workload's projected C0 makespan (manifest
 c0_projection, fit_service.py; replaced by the C0 dry run's makespan once it has run), REPLAY_TIMEOUT the cap + 600 s,
 the runner timeout 1,800 s more. Pilot JSON per model: tier bytes per token and prefill tok/s measured in pilot 1
-(micro, batch 8 at 8,192 tokens), arm RSS from pilot 1's telemetry (peak memory beyond the CPU tier and the page
+(micro, batch 8 at 8,192 tokens; Gemma at its chunk of 1,024 tokens, pilot 2 micro_c1024: derive_chunk.py), arm RSS from pilot 1's telemetry (peak memory beyond the CPU tier and the page
 cache, rounded up with 1.5 GiB or more of headroom), and write-through's offered write rate per load: T's bytes
 written per unique token in pilot 1 (Qwen 1.403, Gemma 1.455 x tier bytes) x the workload's unique tokens / its
 projected C0 makespan (pilot 2's T arms on the fast disk measure it).
@@ -56,8 +56,8 @@ MODELS = {
     "gemma4_31b": dict(
         tag="gemma", hf="google/gemma-4-31B-it",
         serve='--revision 842da3794eaa0b77d5f08bae87a17459d91ff475 --quantization fp8 '
-              '--limit-mm-per-prompt {"image":0,"audio":0,"video":0}',
-        lm_chunk=None, chunk_bytes=2_621_440, tier_bpt=131_714, prefill=6_526.2, kkm_cell=None, mamba=False,
+              '--limit-mm-per-prompt {"image":0,"audio":0,"video":0} --max-num-batched-tokens 1024',
+        lm_chunk=None, chunk_bytes=2_621_440, tier_bpt=131_714, prefill=6_201.4, kkm_cell=None, mamba=False,
         rss=dict(vllm=9 * GiB, k=9 * GiB, sidecar=2 * GiB, lm_vllm=8 * GiB, lm_server=2 * GiB)),
 }
 SLOW_ARMS = ["C0", "T", "T2", "LM", "CT", "K", "K_ewma"]

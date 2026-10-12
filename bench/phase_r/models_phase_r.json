@@ -105,8 +105,8 @@
    "longest_request_bytes": 3523215360,
    "state_block_tokens": null,
    "state_block_source": null,
-   "gpu_request_bytes": 16958095360,
-   "gpu_request_source": "the 131,072 formula (which reproduces every compat log figure) at max_model_len 32,768: 6469 blocks x 2,621,440 B",
+   "gpu_request_bytes": 5214044160,
+   "gpu_request_source": "vLLM 0.31.0 at --max-num-batched-tokens 1024, max_model_len 32768: the formula, and vLLM's own 'Maximum concurrency 3.58x' at an 18,653,904,896 B pool (5.21 GB per request), pilot-2 micro_chunk 2026-10-12",
    "arch": {
     "global_layers": 10,
     "global_kv_heads": 4,
@@ -120,13 +120,13 @@
     "max_position_embeddings": 262144
    },
    "gpu_request_check": {
-    "exact_bytes": 16958095360,
-    "blocks": 6469,
+    "exact_bytes": 5214044160,
+    "blocks": 1989,
     "block_bytes": 2621440,
-    "formula": "5 sliding groups x (cdiv(min(1023 + max_in_flight_tokens 2 x 8192, L), 16) + 1) = 5445 blocks + global group cdiv(32768, 32) = 1024 blocks = 6469 blocks x 2,621,440 B",
+    "formula": "5 sliding groups x (cdiv(min(1023 + max_in_flight_tokens 2 x 1024, L), 16) + 1) = 965 blocks + global group cdiv(32768, 32) = 1024 blocks = 1989 blocks x 2,621,440 B",
     "connector": "same with a KV connector: OffloadingConnector (and ParkConnector, its subclass) implements SupportsHMA, so vLLM 0.31.0 keeps the hybrid KV manager on and the sliding groups stay capped at window + in-flight tokens; no compat log says 'Turning off hybrid kv cache manager'",
     "reproduces": "compat logs: 40,960 tokens need 6,725 blocks = 16.418 GiB (logged 16.42 GiB); 20 GiB pool = 8,192 blocks = 1.218x, 49,895 tokens (logged 1.22x, 49,895); boot num_gpu_blocks 21,975 / 9,541 = 2.303218x (logged 2.303217692065821), 301,887 tokens",
-    "note": "at 32,768 one request needs 15.79 GiB; floor 1.1x = 18.65 GB",
+    "note": "one request 5.21 GB at chunk 1,024; floor 1.1x = 5.74 GB",
     "checked": "2026-10-11, vllm/v1/kv_cache_interface.py and v1/core/kv_cache_utils.py of vLLM 0.31.0"
    },
    "tier_bytes_per_token": 131714,
@@ -179,6 +179,8 @@
     "req_tokens": 10240,
     "cpu_gbps": 56.0
    }
-  }
+  },
+  "max_num_batched_tokens": 1024,
+  "chunk_source": "derive_chunk.py 2026-10-12 (integ df4c0f4): no measured chunk meets GPU KV <= 0.15 P at the drained load; 1,024 is the measured chunk closest to it (0.27 P); prefill b1 -4% (2K), -5% (8K), -0.5% (32K) vs 8,192"
  }
 ]
