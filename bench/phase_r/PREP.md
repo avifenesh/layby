@@ -139,3 +139,43 @@ arm plus PT, for RSS), medium (C0 T K) and kdisk (`kdisk_workload.py`: the pilot
 1.5x the largest session, 0.21 (Qwen) and 0.12 (Gemma) of the peak live tier bytes; pass: `check_k_disk.py`, with
 replay `--verify-disk` comparing disk-restored turns against a cold recompute). Medium carries a PLACEHOLDER io.max
 read cap of 1 GB/s: at the NRD disk's nominal 2 GiB/s the compat inputs classify both models fast.
+
+## Draft 6 re-size: measured service model, KV pressure, throttled slow disk (2026-10-12, after pilot 1)
+
+Service model (`fit_service.py`, outputs in `~/.cache/layby_phase_r/fit/fit_MODEL.json`): the iteration-level
+simulator (`sim/engine_sim.py`) set up as the pilot's C0 arm (chunked prefill 8,192, max_num_seqs 64, GPU KV in tokens
+of growing KV with a per-request reserve: Qwen's recurrent state 2,349 tokens, Gemma's window 10,240 tokens; CPU tier
+at the tier's measured bytes per token; CPU to GPU at the measured 56 GB/s). Prefill and decode terms come from the
+pilot microbenchmark (Qwen F0 92.3 us/token, ATT 0.0137 per 1K tokens of position, T0 18.1 ms, BW 276 GB/s; Gemma
+F0 118 us, ATT 0.0757); scale factors KP (prefill) and KD (decode) are fitted on the C0 runs by grid search on served
+count, resumed-turn TTFT p50 and p95 and makespan. Queueing is not a term: it comes from the scheduler and the KV
+capacity.
+
+| model | KP, KD | run | served (sim / measured) | resumed p50 s | resumed p95 s | makespan s | per-turn TTFT median abs log error; within 2x |
+|---|---|---|---|---|---|---|---|
+| Qwen3.8-27B | 1.00, 0.75 | C0 r2 (uncapped) | 709 / 709 | 90.8 / 88.1 | 142.9 / 144.1 | 6,542 / 6,490 | 0.13; 81% |
+| Qwen3.8-27B | | C0 r9 (cap 3,600 s) | 531 / 537 | 110.7 / 109.0 | 147.2 / 147.4 | - | 0.11; 97% |
+| Gemma 4 31B | 1.00, 1.00 | C0 (cap 3,600 s) | 387 / 405 | 513.9 / 526.3 | 640.9 / 678.6 | - | 0.045; 96% |
+
+The microbenchmark terms alone (KP = KD = 1) give Qwen p50 +16%, p95 +17%, makespan +10%. Every calibration point is
+a saturated run: the fit at low load rests on the microbenchmark terms (KP = 1 on both models). The fit sizes
+workloads only; H6's predictions stay microbenchmark-only.
+
+Load scan (`scan_load.py`, measured partition, sessions in builder order, each cut where its projected C0 end passes
+3,000 s): C0's tiers stop holding the working set between GPU KV / P of 0.22 and 0.19 on Qwen (recompute share 16% to
+66%, resumed TTFT p50 5.8 s to 65 s, mean in flight 5 to 11) and between 0.45 and 0.32 on Gemma (p50 1.6 s to 68 s).
+At GPU KV = 0.15 P (Qwen N 32: p50 106 s, 18 in flight; Gemma N 60: p50 423 s, 49 in flight) C0 recomputes 95% or
+more of its prompt tokens and its TTFT is queueing: KV pressure 0.15 and a drained C0 queue cannot both hold on these
+models (the GPU KV floor of 1.1 x one 131K request fixes P at 7.3 such requests). The coordinator's rule picks the KV
+pressure; a C0 in-flight target of about 3 (Qwen 16 sessions, GPU/P 0.25, p50 4.7 s) would be the drained choice.
+
+Builder (`build_workloads.py --service-fit`): sessions start uniform over 300 s, each is cut at its last turn whose
+projected C0 end is within 3,000 s of the run start (tuning stages: 5/6 of the stage length), and sessions are added
+in partition order until the projected peak live KV reaches 7.333 x the GPU request bytes (the smallest such count;
+where none reaches it, the count with the largest P, flagged `target_reached false`). `kdisk_workload.py
+--service-fit` cuts the pilot workload at 20 minutes of the projection. Side files, surv_v6 (pool scores, 0 public
+turns without a curve), surv_km, surv_ewma, CT_ETA and capacities as before; disjointness checks 0 overlap
+(partitions, seen set, users, K_km pool). The v2 workloads moved to `workloads/archive_v2/`.
+
+Slow disk: network_ssd with io.max 210 MiB/s read and write (r 0.29 Qwen, 0.26 Gemma at the cell prefill rate; 0.34
+and 0.44 at the 32K rate). Cells and the pilot-2 blocks: `make_cells.py` (its docstring).

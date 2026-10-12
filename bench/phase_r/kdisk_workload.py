@@ -16,6 +16,9 @@ idle KV has to go to disk or be recomputed. GPU KV is the model's cell value (ca
 script refuses a cut whose CPU tier holds more than --max-cpu-share of the peak live tier bytes (default 0.25; the
 measured cells hold 0.4 P). Disk tier: 1.2 x unique KV at turn ends, as finalize_workloads.py.
 
+With --service-fit FIT.json (fit_service.py, BENCH_PLAN draft 6) the cut and the timeline come from the fitted C0
+projection (sim_sizing.project at the model's cell capacities, end cap --minutes) instead of the per-turn estimate.
+
 Writes OUT/NAME.json, OUT/NAME.manifest.json (source, cut rule, counts, capacities, sha256) and, from the source's
 side file, OUT/NAME.side.jsonl (mode 600; the live sidecar's input).
 
@@ -60,6 +63,7 @@ def main():
     ap.add_argument("--minutes", type=float, default=20.0)
     ap.add_argument("--cpu-sessions", type=float, default=1.5)
     ap.add_argument("--max-cpu-share", type=float, default=0.25)
+    ap.add_argument("--service-fit", help="FIT.json: cut and time on the fitted C0 projection")
     ap.add_argument("--out")
     a = ap.parse_args()
     out = a.out or os.path.dirname(os.path.abspath(a.src))
@@ -69,8 +73,21 @@ def main():
     k = M["kv"]
     end = a.minutes * 60.0
 
-    sessions = []
-    for s in W["sessions"]:
+    if a.service_fit:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from sim_sizing import load_fit, project
+        sessions, rows, _, _ = project([dict(s) for s in W["sessions"]], load_fit(a.service_fit), end, min_turns=2)
+        E = {(r["session"], r["turn"]): r["t_done"] - r["t_send"] for r in rows}
+        SEND = {(r["session"], r["turn"]): r["t_send"] for r in rows}
+    else:
+        sessions, E, SEND = None, None, None
+
+    def dur(s, i, t):
+        return E[(s["id"], i)] if E is not None else est(M, t["ctx"] - t["out_len"], t["out_len"])
+
+    est_path = sessions is None
+    sessions = [] if est_path else sessions
+    for s in (W["sessions"] if est_path else []):
         tm, keep = s["start"], []
         for t in s["turns"]:
             e = est(M, t["ctx"] - t["out_len"], t["out_len"])
@@ -89,8 +106,9 @@ def main():
     ev, busy, ends, uniq = [], 0.0, [], 0
     for s in sessions:
         tm, curb = s["start"], 0.0
-        for t in s["turns"]:
-            e = est(M, t["ctx"] - t["out_len"], t["out_len"])
+        for i, t in enumerate(s["turns"]):
+            e = dur(s, i, t)
+            tm = SEND[(s["id"], i)] if SEND is not None else tm
             b = kv_bytes(k, t["ctx"])
             ev.append((tm, b - curb)); curb = b
             tm += e + (t["gap_after"] or 0.0)
@@ -103,9 +121,10 @@ def main():
     evt = []
     for s in sessions:
         tm, cur = s["start"], 0
-        for t in s["turns"]:
+        for i, t in enumerate(s["turns"]):
+            tm = SEND[(s["id"], i)] if SEND is not None else tm
             evt.append((tm, t["ctx"] - cur)); cur = t["ctx"]
-            tm += est(M, t["ctx"] - t["out_len"], t["out_len"]) + (t["gap_after"] or 0.0)
+            tm += dur(s, i, t) + (t["gap_after"] or 0.0)
         evt.append((tm, -cur))
     evt.sort()
     peak_tokens = float(np.max(np.cumsum([d for _, d in evt])))
@@ -151,7 +170,9 @@ def main():
     os.replace(sj + ".tmp", sj)
     man = dict(name=a.name, model=W["model"], source=dict(path=os.path.basename(a.src), sha256=sha256(a.src)),
                rule=dict(minutes=a.minutes, min_turns=2, cpu_sessions=a.cpu_sessions, max_cpu_share=a.max_cpu_share,
-                         script="bench/phase_r/kdisk_workload.py"),
+                         script="bench/phase_r/kdisk_workload.py",
+                         timeline=("fitted C0 projection " + os.path.basename(a.service_fit)) if a.service_fit
+                         else "builder estimate"),
                load=stats, capacities=capacities, curve=W.get("curve"),
                side_jsonl=dict(rows=n_side, sha256=sha256(sj)), bytes=os.path.getsize(p), sha256=sha256(p),
                pass_criterion="engine/phase_r/check_k_disk.py: K chose ins or park, wrote chunks, restored from disk "

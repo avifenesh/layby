@@ -43,6 +43,15 @@ per turn end (each turn end is a different prefix state) + the window tokens new
 if an engine stores the sliding layers' KV for every token and a recurrent state at every KV block boundary
 (state_block_tokens, vLLM's mamba "align" prefix caching: ceil((new + output) / block) states per turn, at least one).
 
+With --service-fit NAME=FIT.json (BENCH_PLAN draft 6; fit_service.py: the C0 service model fitted on the pilot's C0
+runs): the sizing runs on projected C0 timelines instead of the per-turn estimate. Sessions start uniform over
+--duration (the 300 s window); each session is cut at its last turn whose projected C0 end (sim_sizing.project: the
+fitted simulator, closed loop, at the workload's own load) is within --end-cap seconds of the run start (tuning stages:
+5/6 of the stage length); sessions are added in partition order until the projected peak live KV reaches the target
+(the smallest such prefix; the projection is redone for each candidate count). The manifest records the projected C0
+makespan, mean requests in flight and resumed-turn TTFT. --dump-candidates DIR writes each partition's ordered
+candidate sessions (full turns, starts drawn as in this mode) for scan_load.py and stops.
+
 Outputs in OUT: NAME.json (engine/replay.py format, content-free, surv_v6 null until the frozen model scores the
 side file), NAME.refs.parquet (key, session, turn, src, source_session, feat_ref: which source boundary each turn
 is; the side-file builder joins text to it), NAME.manifest.json, and pool.json (counts and checks).
@@ -115,7 +124,18 @@ ap.add_argument("--extra", action="append", default=[],
                      "workload's), disjoint from the measured workload and every earlier extra of that "
                      "model (they run as separate arms on one host), e.g. qwen3_8b:light:0.5")
 ap.add_argument("--used-report", help="used_sessions.py report (per use: refs, sessions) to copy into the manifests")
+ap.add_argument("--service-fit", action="append", default=[], help="NAME=FIT.json (fit_service.py): size and cut on "
+                "projected C0 timelines (module docstring)")
+ap.add_argument("--end-cap", type=float, default=3000.0, help="with --service-fit: cut each session where its "
+                "projected C0 end passes this many seconds after the run start")
+ap.add_argument("--dump-candidates", help="with --service-fit: write DIR/MODEL.PARTITION.candidates.json and stop")
 a = ap.parse_args()
+FITS = {}
+if a.service_fit:
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from sim_sizing import load_fit, project, stats
+    FITS = {x.split("=", 1)[0]: load_fit(x.split("=", 1)[1]) for x in a.service_fit}
 os.makedirs(a.out, exist_ok=True)
 
 
@@ -325,6 +345,91 @@ def assemble(M, name, items, duration, build_turns, src_of, live=1.0, skip=froze
     return sessions, refs, total
 
 
+def candidates(M, name, items, window, build_turns, skip=frozenset()):
+    """Ordered candidate sessions with their full turns; starts uniform over the window (drawn per candidate)."""
+    rng = np.random.default_rng(abs(hash_int(name)) % 2**32)
+    out = []
+    for src, sess, unit, g in items:
+        if (src, sess) in skip:
+            continue
+        full = build_turns(M, g)
+        if len(full) < 3:
+            continue
+        T = []
+        for t in full:
+            T.append(t)
+            if t["gap_after"] is None:
+                break
+        T[-1] = dict(T[-1], gap_after=None)
+        out.append(dict(id=f"c{len(out):05d}", pool=src, start=float(rng.uniform(0, window)), turns=T,
+                        _src_session=sess, _unit=unit, _turns_src=len(full)))
+    return out
+
+
+def assemble_sim(M, name, items, window, end_cap, build_turns, peak, skip=frozenset()):
+    """Smallest prefix of the candidates whose projected C0 timeline, cut at end_cap, reaches the peak live KV."""
+    fit = FITS[M["name"]]
+    C = candidates(M, name, items, window, build_turns, skip)
+    memo = {}
+
+    def at(n):
+        if n not in memo:
+            S, rows, info, rounds = project([dict(x) for x in C[:n]], fit, end_cap)
+            memo[n] = (S, rows, rounds, stats(S, rows, M["kv"]))
+        return memo[n]
+
+    key = "peak_live_kv_bytes" if M["kv"] else "peak_live_kv_tokens"
+    # P grows with the session count until C0 saturates; past that the end cap leaves sessions too short to keep
+    # (fewer than 3 turns) and P falls again. Double until P reaches the target or falls, then bisect for the
+    # smallest count that reaches it; when no count reaches it, take the count with the largest P (reported).
+    lo, hi, prev = 0, 4, -1.0
+    while hi < len(C) and at(hi)[3][key] < peak and at(hi)[3][key] > prev:
+        prev = at(hi)[3][key]
+        lo, hi = hi, min(len(C), hi * 2)
+    hi = min(hi, len(C))
+    reached = at(hi)[3][key] >= peak
+    if reached:
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if at(mid)[3][key] >= peak:
+                hi = mid
+            else:
+                lo = mid
+    else:
+        a0, b0 = max(1, lo // 2), hi
+        while b0 - a0 > 2:                       # ternary search on the unimodal P(n)
+            m1, m2 = a0 + (b0 - a0) // 3, b0 - (b0 - a0) // 3
+            if at(m1)[3][key] < at(m2)[3][key]:
+                a0 = m1 + 1
+            else:
+                b0 = m2 - 1 if m2 - 1 >= a0 else m2
+        hi = max(memo, key=lambda n: memo[n][3][key])
+        print(f"{name}: no smallest count reaches {peak / 1e9:.1f} GB; largest projected P "
+              f"{memo[hi][3][key] / 1e9:.1f} GB at {hi} candidates", flush=True)
+    S, rows, rounds, st = at(hi)
+    reached = st[key] >= peak
+    assert S, f"{name}: no session kept"
+    sessions, refs, done = [], [], {}
+    for r in rows:
+        done.setdefault(r["session"], {})[r["turn"]] = (r["t_send"], r["t_done"])
+    for x in S:
+        sid = f"{TAG[x['pool']]}{len(sessions):04d}"
+        d = done[x["id"]]
+        e2e = [d[j][1] - d[j][0] for j in range(len(x["turns"]))]
+        turns = []
+        for i, t in enumerate(x["turns"]):
+            refs.append((f"{sid}:{i}", sid, i, x["pool"], x["_src_session"], t["_ref"]))
+            turns.append({k: v for k, v in t.items() if not k.startswith("_")} | {"surv_v6": None})
+        sessions.append(dict(id=sid, pool=x["pool"], seed=1000 + len(sessions), start=x["start"], turns=turns,
+                             _src_session=x["_src_session"], _unit=x["_unit"], _len=d[len(x["turns"]) - 1][1] - x["start"],
+                             _cut=len(x["turns"]) < x["_turns_src"], _turns_src=x["_turns_src"],
+                             _why=[t["_why"] for t in x["turns"]], _e2e=e2e))
+    proj = dict(st, candidates_used=hi, candidates_available=len(C), projection_rounds=rounds,
+                target_peak_bytes=int(peak), target_reached=bool(reached),
+                fit=os.path.basename(fit["path"]), kp=fit["kp"], kd=fit["kd"], end_cap_s=end_cap, start_window_s=window)
+    return sessions, refs, proj
+
+
 def put(path, write):
     """Write through a temporary name and rename, so a reader never sees a partial file."""
     d, b = os.path.split(path)
@@ -348,8 +453,8 @@ def load(sessions, M, duration, to_completion=False):
     ev, evb, busy = [], [], 0.0
     for s in sessions:
         tm, cur, curb = s["start"], 0, 0.0
-        for t in s["turns"]:
-            e = est(M, t["ctx"] - t["out_len"], t["out_len"])
+        for j, t in enumerate(s["turns"]):
+            e = s["_e2e"][j] if "_e2e" in s else est(M, t["ctx"] - t["out_len"], t["out_len"])
             b = kv_bytes(M, t["ctx"])
             ev.append((tm, t["ctx"] - cur)); evb.append((tm, b - curb)); cur, curb = t["ctx"], b
             tm += e + (t["gap_after"] or 0.0)
@@ -398,7 +503,7 @@ def kv_load(M, sessions, T, peak_b):
                 unique_kv_bytes_upper=int(up), state_snapshots=len(T) if st else 0, state_blocks=nb if st else 0)
 
 
-def write(M, name, sessions, refs, extra):
+def write(M, name, sessions, refs, extra, proj=None):
     W = dict(gap_cap=a.gap_cap, ctx_cap=M["cap"], model=M["name"], retain=a.retain,
              src=f"Layby Phase R {name}", curve="surv_v6 (null until scored from the side file)",
              sessions=[{k: v for k, v in s.items() if not k.startswith("_")} for s in sessions])
@@ -420,8 +525,12 @@ def write(M, name, sessions, refs, extra):
                dict(by="inflight" if "inflight" in M else "live"),
                sessions=[dict(id=s["id"], source=s["pool"], source_session=s["_src_session"], turns=len(s["turns"]),
                               turns_in_source=s["_turns_src"], cut_at_duration=s["_cut"]) for s in sessions])
+    if proj is not None:
+        man["c0_projection"] = proj
+        man["sizing"] = dict(man["sizing"], by="peak live KV bytes on the projected C0 timeline (fit_service.py)",
+                             session_cap_s=None, end_cap_s=proj["end_cap_s"], start_window_s=proj["start_window_s"])
     put_json(os.path.join(a.out, f"{name}.manifest.json"), man, indent=1)
-    print(name, json.dumps(L), flush=True)
+    print(name, json.dumps(L), json.dumps(proj) if proj else "", flush=True)
     return man
 
 
@@ -459,12 +568,27 @@ for M in models:
     LIM = (a.session_cap or float("inf")) if P_heavy else None
     if P_heavy:
         print(M["name"], f"heavy P target {P_heavy / 1e9:.2f} GB", flush=True)
+    SIM = M["name"] in FITS
     for p in PARTS:
         items = [(src, sess, unit, pool[src][sess]) for src, (sess, unit) in
                  interleave([[(s, x) for x in order[p][s]] for s in SRC])]
         name = f"{M['name']}.{p}"
-        S, R, _ = assemble(M, name, items, a.duration, turns_feat, None, peak=P_heavy, limit=LIM)
-        built[name] = write(M, name, S, R, dict(duration=a.duration, partition=p, to_completion=bool(P_heavy)))
+        if SIM and a.dump_candidates:
+            os.makedirs(a.dump_candidates, exist_ok=True)
+            C = candidates(M, name, items, a.duration, turns_feat)
+            put_json(os.path.join(a.dump_candidates, f"{name}.candidates.json"),
+                     dict(model=M["name"], partition=p, kv=M["kv"], window=a.duration,
+                          sessions=[{k: v for k, v in x.items() if k in ("id", "pool", "start", "_src_session")} |
+                                    {"turns": [{k: v for k, v in t.items() if not k.startswith("_")} for t in x["turns"]]}
+                                    for x in C]))
+            print("candidates", name, len(C), flush=True)
+            continue
+        if SIM:
+            S, R, proj = assemble_sim(M, name, items, a.duration, a.end_cap, turns_feat, P_heavy)
+            built[name] = write(M, name, S, R, dict(duration=a.duration, partition=p, to_completion=True), proj)
+        else:
+            S, R, _ = assemble(M, name, items, a.duration, turns_feat, None, peak=P_heavy, limit=LIM)
+            built[name] = write(M, name, S, R, dict(duration=a.duration, partition=p, to_completion=bool(P_heavy)))
         if p == "measured":
             taken = {(x["pool"], x["_src_session"]) for x in S}
             for e in a.extra:
@@ -475,9 +599,13 @@ for M in models:
                 pk = None
                 if f.endswith("p"):     # a multiple of the measured workload's peak live KV
                     pk = float(f[:-1]) * built[name]["load"]["peak_live_kv_bytes" if M["kv"] else "peak_live_kv_tokens"]
-                S2, R2, _ = assemble(M, nm, items, a.duration, turns_feat, None, live=1.0 if pk else float(f),
-                                     skip=frozenset(taken), peak=pk, limit=LIM)
-                man = write(M, nm, S2, R2, dict(duration=a.duration, partition=p, to_completion=bool(P_heavy)))
+                if SIM:
+                    S2, R2, proj = assemble_sim(M, nm, items, a.duration, a.end_cap, turns_feat, pk, skip=frozenset(taken))
+                    man = write(M, nm, S2, R2, dict(duration=a.duration, partition=p, to_completion=True), proj)
+                else:
+                    S2, R2, _ = assemble(M, nm, items, a.duration, turns_feat, None, live=1.0 if pk else float(f),
+                                         skip=frozenset(taken), peak=pk, limit=LIM)
+                    man = write(M, nm, S2, R2, dict(duration=a.duration, partition=p, to_completion=bool(P_heavy)))
                 man["live_factor" if pk is None else "peak_kv_factor"] = float(f.rstrip("p"))
                 built[nm] = man
                 new = {(x["pool"], x["_src_session"]) for x in S2}
@@ -486,16 +614,28 @@ for M in models:
         if p == "tuning":
             for d in a.stages:
                 nm = f"{M['name']}.tuning_{int(d / 60)}min"
-                S2, R2, _ = assemble(M, nm, items, d, turns_feat, None, peak=P_heavy)
-                built[nm] = write(M, nm, S2, R2, dict(duration=d, partition=p))
+                if SIM:
+                    S2, R2, proj = assemble_sim(M, nm, items, a.duration, d * 5 / 6, turns_feat, P_heavy)
+                    built[nm] = write(M, nm, S2, R2, dict(duration=a.duration, partition=p, to_completion=True), proj)
+                else:
+                    S2, R2, _ = assemble(M, nm, items, d, turns_feat, None, peak=P_heavy)
+                    built[nm] = write(M, nm, S2, R2, dict(duration=d, partition=p))
+    if a.dump_candidates:
+        continue
     if cc is not None:
         items = sorted(((h01("order", "cc_traces", tr), tr, g) for tr, g in cc.groupby("trace")), key=lambda x: x[0])
         items = [("cc_traces", tr, tr, g) for _, tr, g in items]
         name = f"{M['name']}.heldout_cc"
-        S, R, _ = assemble(M, name, items, a.duration, turns_cc, None, peak=P_heavy, limit=LIM)
-        built[name] = write(M, name, S, R, dict(duration=a.duration, partition="heldout_cc", to_completion=bool(P_heavy)))
+        if SIM:
+            S, R, proj = assemble_sim(M, name, items, a.duration, a.end_cap, turns_cc, P_heavy)
+            built[name] = write(M, name, S, R, dict(duration=a.duration, partition="heldout_cc", to_completion=True), proj)
+        else:
+            S, R, _ = assemble(M, name, items, a.duration, turns_cc, None, peak=P_heavy, limit=LIM)
+            built[name] = write(M, name, S, R, dict(duration=a.duration, partition="heldout_cc", to_completion=bool(P_heavy)))
 
 # ---------------------------------------------------------------- checks
+if a.dump_candidates:
+    raise SystemExit(0)
 chk = {}
 by_part = {}
 for name, man in built.items():
