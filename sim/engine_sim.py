@@ -58,10 +58,13 @@ class Params:
         self.max_seqs = None        # max running requests, as --max-num-seqs (None: no cap)
         self.req_tokens = 0         # GPU KV a running request holds beyond its tokens, in tokens (a recurrent
                                     # state, a sliding window: bench/phase_r/fit_service.py)
-        self.req_tokens_prefill = None  # the same while its prefill runs (None: req_tokens). vLLM 0.31.0 gives a
-                                    # prefilling request the window plus two in-flight chunks in every sliding
-                                    # group, and a Mamba request one checkpoint block per group more
-                                    # (bench/phase_r/sim_sizing.req_reserve_tokens)
+        self.req_tokens_prefill = None  # the same while its prefill runs (None: req_tokens): a Mamba request's
+                                    # checkpoint block per group (bench/phase_r/sim_sizing.req_reserve_bytes)
+        self.win_groups = 0         # sliding-window groups (vLLM 0.31.0): while a request prefills, each group
+        self.win_lead = 0           # holds cdiv(win_lead + in-flight tokens, win_block) + 1 pages, in-flight =
+        self.win_block = 16         # min(its prompt tokens not on the GPU, two chunks); win_lead = window - 1,
+        self.win_page_tokens = 0    # win_page_tokens = page bytes / growing bytes per token; replaces
+                                    # req_tokens_prefill when win_groups > 0
         self.until = None           # stop the simulation at this time (a hard cap; unfinished turns are not in out)
         self.__dict__.update(kw)
 
@@ -195,12 +198,19 @@ def simulate(W, src, p, rule=None):
             r = Req(i, j, H[i] + t["new_tokens"], t["out_len"], False, e, now, t["kind"])
         waiting.append(r)
 
+    def prefill_reserve(todo):
+        """GPU KV beyond its tokens a request holds while `todo` prompt tokens are left to prefill."""
+        if p.win_groups:
+            fl = min(max(todo, 1), 2 * p.budget)
+            return max(p.req_tokens, p.win_groups * (-(-(p.win_lead + fl) // p.win_block) + 1) * p.win_page_tokens)
+        return p.req_tokens if p.req_tokens_prefill is None else p.req_tokens_prefill
+
     def admit(r, now):
         """Prefix lookup and KV allocation at the moment the scheduler takes the request."""
         nonlocal alloc, link_cpu, link_disk
         k = r.sess
         own = gpu_idle.get(k, 0)
-        need = r.P + r.O + (p.req_tokens if p.req_tokens_prefill is None else p.req_tokens_prefill)
+        need = r.P + r.O + prefill_reserve(r.P - min(own, r.P))
         if not gpu_evict(need - min(own, r.P + r.O), k, now):
             return False
         g = min(r.P, max(own, running_sess.get(k, 0)))
@@ -324,8 +334,8 @@ def simulate(W, src, p, rule=None):
             running_sess[r.sess] = max(running_sess.get(r.sess, 0), r.P - r.rem)
             if r.rem == 0:
                 r.out = 1; r.t_first = now
-                if p.req_tokens_prefill is not None and p.req_tokens_prefill > p.req_tokens:
-                    d = p.req_tokens_prefill - p.req_tokens   # prefill over: back to the decode reserve
+                d = r.alloc - (r.P + r.O + p.req_tokens)   # prefill over: back to the decode reserve
+                if d > 0:
                     alloc -= d; r.alloc -= d
         for r in dec:
             r.out += 1

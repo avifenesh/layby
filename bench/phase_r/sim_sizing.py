@@ -47,6 +47,24 @@ def req_reserve_bytes(kv, budget, cap):
     return 0, 0
 
 
+def sim_reserve_params(kv):
+    """engine_sim.Params for the reserve above, in growing tokens: the decode reserve, Mamba's prefill reserve, and the
+    sliding-window terms the simulator evaluates per request (its in-flight prompt tokens, at most two chunks)."""
+    g = kv["grow_bytes_per_token"]
+    bb = kv["gpu_request_check"]["block_bytes"]
+    if kv.get("window_tokens"):
+        a = kv["arch"]
+        groups = a["sliding_layers"] // a["global_layers"]
+        return dict(req_tokens=int(round(groups * (math.ceil((kv["window_tokens"] + 1) / 16) + 1) * bb / g)),
+                    req_tokens_prefill=None, win_groups=groups, win_lead=kv["window_tokens"] - 1, win_block=16,
+                    win_page_tokens=int(round(bb / g)))
+    if kv.get("state_bytes_per_session"):
+        groups = kv["arch"]["gdn_layers"] // kv["arch"]["full_layers"]
+        return dict(req_tokens=int(round(groups * bb / g)), req_tokens_prefill=int(round(2 * groups * bb / g)),
+                    win_groups=0)
+    return dict(req_tokens=0, req_tokens_prefill=None, win_groups=0)
+
+
 def cpu_min_bytes(kv, cap, sessions=1.5):
     """The CPU tier a disk restore needs: a restore is staged through the CPU tier, so it holds sessions x one
     max-length context at the tier's measured bytes per token, in whole tier chunks (the kdisk rule)."""

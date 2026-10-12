@@ -24,7 +24,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fit_service  # noqa: E402
-from sim_sizing import cpu_min_bytes, load_fit, project_at_rule, req_reserve_bytes  # noqa: E402
+from sim_sizing import cpu_min_bytes, load_fit, project_at_rule, req_reserve_bytes, sim_reserve_params  # noqa: E402
 
 
 def drained(C, fit, kv, floor, rule, target, end_cap):
@@ -87,7 +87,7 @@ def main():
         req = glob + pf
         floor = 1.1 * req
         sp = dict(base["params"], budget=c, t0=mt["t0"] * kd, bw=mt["bw"] / kd, f0=mt["f0"] * kp, att=mt["att"],
-                  req_tokens=int(round(dc / g)), req_tokens_prefill=int(round(pf / g)))
+                  **sim_reserve_params(kv))
         fit = dict(base, params=sp)
         print(f"C {c}: request {req / 1e9:.2f} GB, floor {floor / 1e9:.2f} GB, prefill b1 at 32K "
               f"{json.load(open(path))['prefill'].get('32000', {}).get('b1_tok_s')}", flush=True)

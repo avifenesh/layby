@@ -63,7 +63,9 @@ def params(base, kp=1.0, kd=1.0, until=None):
     p = Params(gpu_tokens=base["gpu_tokens"], cpu_tokens=base["cpu_tokens"], budget=BUDGET, max_seqs=MAX_SEQS,
                t0=base["t0"] * kd, bw=base["bw"] / kd, f0=base["f0"] * kp, att=base["att"],
                cpu_gbps=base["cpu_gbps"], kib=base["tier_bpt"] / 1024.0, hbm_kib=base["grow_bpt"] / 1024.0,
-               req_tokens=base["req_tokens"], req_tokens_prefill=base.get("req_tokens_prefill"), until=until)
+               req_tokens=base["req_tokens"], req_tokens_prefill=base.get("req_tokens_prefill"),
+               **{k: base[k] for k in ("win_groups", "win_lead", "win_block", "win_page_tokens") if k in base},
+               until=until)
     return p
 
 
@@ -136,6 +138,8 @@ def main():
                     "growing KV: the recurrent state (Qwen) or the sliding window at its maximum (Gemma)")
     ap.add_argument("--req-prefill-bytes", type=float, help="GPU KV a request holds beyond its growing KV while "
                     "its prefill runs (sim_sizing.req_reserve_tokens; default: --req-bytes)")
+    ap.add_argument("--models", help="models_phase_r.json: the GPU reserve from the model's kv spec "
+                    "(sim_sizing.sim_reserve_params; replaces --req-bytes and --req-prefill-bytes)")
     ap.add_argument("--budget", type=int, default=BUDGET, help="--max-num-batched-tokens of the runs")
     ap.add_argument("--max-seqs", type=int, default=MAX_SEQS, help="--max-num-seqs of the runs")
     ap.add_argument("--cpu-gbps", type=float, required=True)
@@ -153,6 +157,10 @@ def main():
                 req_tokens_prefill=None if a.req_prefill_bytes is None else int(round(a.req_prefill_bytes / a.grow_bpt)),
                 cpu_gbps=a.cpu_gbps, tier_bpt=a.tier_bpt,
                 grow_bpt=a.grow_bpt)
+    if a.models:
+        from sim_sizing import sim_reserve_params
+        kv = next(m for m in json.load(open(a.models)) if m["name"] == a.model)["kv"]
+        base.update(sim_reserve_params(kv))
     runs = []
     for r in a.run:
         lab, rest = r.split("=", 1)
