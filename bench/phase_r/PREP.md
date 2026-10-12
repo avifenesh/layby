@@ -179,3 +179,21 @@ turns without a curve), surv_km, surv_ewma, CT_ETA and capacities as before; dis
 
 Slow disk: network_ssd with io.max 210 MiB/s read and write (r 0.29 Qwen, 0.26 Gemma at the cell prefill rate; 0.34
 and 0.44 at the 32K rate). Cells and the pilot-2 blocks: `make_cells.py` (its docstring).
+
+### Drained load (coordinator and owner, 2026-10-12, replaces the KV-pressure sizing above)
+
+`build_workloads.py --size-by-inflight 3`: the measured workload takes the session count whose projected C0 mean
+requests in flight is closest to 3, each count projected at the capacities of its own P (a fixed point,
+`sim_sizing.project_at_rule`); every other workload is sized to that P (extras to their multiple) at those capacities.
+Capacities (`finalize_workloads.py`): GPU KV max(1.1x the GPU KV for one 131K request, 0.15 P), CPU tier 0.55 P minus GPU
+KV (GPU + CPU = 0.55 P, the original 0.15 + 0.40), at least 0.05 P.
+
+| model | sessions / turns | P GB | GPU share | CPU share | C0 in flight | C0 resumed p50 s | C0 recompute share |
+|---|---|---|---|---|---|---|---|
+| Qwen3.8-27B | 9 / 399 | 24.6 | 0.40 (floor) | 0.15 | 2.8 | 7.4 | 0.39 |
+| Gemma 4 31B | 9 / 411 | 38.6 | 0.71 (floor) | 0.05 (floor; total 0.76) | 2.8 | 0.3 | 0.05 |
+
+The next count up (10 sessions) gives 4.2 in flight on both (Qwen p50 27 s, recompute 0.76). Every target P was
+reached. kdisk workloads come from the KV-pressure pilot workloads (`workloads/archive_v3`): the drained pilot
+workload cannot put a 1.5x-largest-session CPU tier under pressure. The KV-pressure workloads are in
+`workloads/archive_v3`, the v2 ones in `archive_v2`.

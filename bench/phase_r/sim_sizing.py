@@ -2,6 +2,9 @@
 candidate workload. Used by build_workloads.py --service-fit to cut sessions where their projected C0 end passes the
 run's end cap and to size by peak live KV on the projected timeline, and by scan_load.py to choose the load.
 
+The drained-load rule (build_workloads.py --size-by-inflight) sizes the measured workload by C0's mean requests in
+flight, with the capacities a function of its own peak live KV (capacities(); a fixed point, project_at_rule()).
+
 A session is a dict with id, start and turns (the replay format); turns carry new_tokens, out_len, ctx, gap_after,
 keep. The projection is closed loop: a turn is sent when the previous one ends plus its recorded gap."""
 import json
@@ -22,10 +25,24 @@ def load_fit(path):
     return dict(path=path, kp=d["fit"]["kp"], kd=d["fit"]["kd"], params=sp, model=d["model"])
 
 
-def run_c0(sessions, fit, until=None):
-    """Simulated C0 replay; rows per served turn (session, turn, ttft, t_send, t_first, t_done, P, hit, ext, queue)."""
+def capacities(P, gpu_floor, gpu_share=0.15, fast_total=0.55, cpu_floor=0.05):
+    """BENCH_PLAN draft 6 capacity rule: GPU KV max(the engine's floor, gpu_share x P); CPU tier fast_total x P minus
+    the GPU KV (GPU + CPU = fast_total x P, the original 0.15 + 0.40), at least cpu_floor x P; whole pages."""
+    gpu = max(int(gpu_floor), int(gpu_share * P))
+    cpu = max(int(fast_total * P) - gpu, int(cpu_floor * P)) // 4096 * 4096
+    return dict(gpu_bytes=gpu, cpu_bytes=cpu, P=int(P), gpu_share=round(gpu / P, 4), cpu_share=round(cpu / P, 4),
+                total_share=round((gpu + cpu) / P, 4), cpu_floored=cpu == int(cpu_floor * P) // 4096 * 4096)
+
+
+def run_c0(sessions, fit, until=None, caps=None):
+    """Simulated C0 replay; rows per served turn (session, turn, ttft, t_send, t_first, t_done, P, hit, ext, queue).
+    caps (capacities()): GPU KV and CPU tier bytes instead of the fit's (the pilot cells')."""
     W = {"sessions": [dict(id=s["id"], start=s["start"], turns=s["turns"]) for s in sessions]}
-    p = Params(**dict(fit["params"], until=until))
+    sp = dict(fit["params"], until=until)
+    if caps is not None:
+        sp["gpu_tokens"] = int(caps["gpu_bytes"] // (sp["hbm_kib"] * 1024))
+        sp["cpu_tokens"] = int(caps["cpu_bytes"] // (sp["kib"] * 1024))
+    p = Params(**sp)
     rows, info = simulate(W, None, p)
     return rows, info
 
@@ -36,13 +53,13 @@ def _cut_one(s, n):
     return dict(s, turns=T)
 
 
-def project(sessions, fit, end_cap, min_turns=3, max_iter=8):
+def project(sessions, fit, end_cap, min_turns=3, max_iter=8, caps=None):
     """Cut each session at its last turn whose projected C0 end is within end_cap seconds of the run start; drop a
     session left with fewer than min_turns turns. Re-simulate the cut workload until every kept turn ends by the cap
     (a cut lowers the load, so this converges in a few rounds). Returns (sessions, rows, info, rounds)."""
     cur = [s for s in sessions]
     for it in range(1, max_iter + 1):
-        rows, info = run_c0(cur, fit, until=end_cap * 4 + 3600)
+        rows, info = run_c0(cur, fit, until=end_cap * 4 + 3600, caps=caps)
         done = {}
         for r in rows:
             done.setdefault(r["session"], {})[r["turn"]] = r["t_done"]
@@ -61,7 +78,7 @@ def project(sessions, fit, end_cap, min_turns=3, max_iter=8):
         cur = nxt
         if not changed:
             return cur, rows, info, it
-    rows, info = run_c0(cur, fit, until=end_cap * 4 + 3600)
+    rows, info = run_c0(cur, fit, until=end_cap * 4 + 3600, caps=caps)
     return cur, rows, info, max_iter + 1
 
 
@@ -109,3 +126,19 @@ def stats(sessions, rows, kv=None):
 def service_rows(rows):
     """Per served turn: seconds from send to end (TTFT + decode) at the projected load."""
     return {(r["session"], r["turn"]): r["t_done"] - r["t_send"] for r in rows}
+
+
+def project_at_rule(sessions, fit, end_cap, kv, gpu_floor, rule, caps0=None, max_iter=5, tol=0.02):
+    """Project with the capacities of capacities(P, gpu_floor, **rule), P the projection's own peak live KV: iterate
+    until P moves less than tol. Returns (sessions, rows, rounds, stats, caps)."""
+    caps = caps0
+    S, rows, info, rounds = project(sessions, fit, end_cap, caps=caps)
+    st = stats(S, rows, kv)
+    for _ in range(max_iter):
+        new = capacities(st["peak_live_kv_bytes"], gpu_floor, **rule)
+        if caps is not None and abs(new["P"] - caps["P"]) <= tol * caps["P"]:
+            break
+        caps = new
+        S, rows, info, rounds = project(sessions, fit, end_cap, caps=caps)
+        st = stats(S, rows, kv)
+    return S, rows, rounds, st, caps

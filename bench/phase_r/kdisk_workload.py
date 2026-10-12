@@ -17,7 +17,7 @@ script refuses a cut whose CPU tier holds more than --max-cpu-share of the peak 
 measured cells hold 0.4 P). Disk tier: 1.2 x unique KV at turn ends, as finalize_workloads.py.
 
 With --service-fit FIT.json (fit_service.py, BENCH_PLAN draft 6) the cut and the timeline come from the fitted C0
-projection (sim_sizing.project at the model's cell capacities, end cap --minutes) instead of the per-turn estimate.
+projection (sim_sizing.project at the model's cell capacities from capacities.json, end cap --minutes) instead of the per-turn estimate.
 
 Writes OUT/NAME.json, OUT/NAME.manifest.json (source, cut rule, counts, capacities, sha256) and, from the source's
 side file, OUT/NAME.side.jsonl (mode 600; the live sidecar's input).
@@ -76,7 +76,8 @@ def main():
     if a.service_fit:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         from sim_sizing import load_fit, project
-        sessions, rows, _, _ = project([dict(s) for s in W["sessions"]], load_fit(a.service_fit), end, min_turns=2)
+        cc = dict(gpu_bytes=caps["gpu_kv_bytes"], cpu_bytes=caps["cpu_bytes"])     # the model's cell capacities
+        sessions, rows, _, _ = project([dict(s) for s in W["sessions"]], load_fit(a.service_fit), end, min_turns=2, caps=cc)
         E = {(r["session"], r["turn"]): r["t_done"] - r["t_send"] for r in rows}
         SEND = {(r["session"], r["turn"]): r["t_send"] for r in rows}
     else:

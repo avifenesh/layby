@@ -9,12 +9,12 @@ Disks, one Nebius 1x RTX PRO 6000 VM (uk-south2), three settings:
   medium  the same network_ssd without io.max (pilot: r 0.59 Qwen, 0.52 Gemma; the regime check at block start
           decides: a measured r below 0.5 stops the block with exit 4)
   fast    the 2.5 TB network_ssd_non_replicated disk (/data2), no io.max (pilot: r 2.74 Qwen, 2.38 Gemma)
-Matrix per model: slow heavy (measured), slow light (light), medium heavy, fast heavy (measured). Arms C0 T T2 LM CT K
-K_ewma in the slow cells, K_km added in Qwen slow heavy; C0 T T2 LM K K_ewma in medium and fast (CT runs in the slow
-cells only, plan 5.2).
+Matrix per model (coordinator, 2026-10-12): slow heavy (measured), slow light (light), fast heavy (measured); the
+unthrottled network_ssd (medium) is in pilot 2 only, for its r and w. Arms C0 T T2 LM CT K K_ewma in the slow cells,
+K_km added in Qwen slow heavy; C0 T T2 LM K K_ewma in fast (CT runs in the slow cells only, plan 5.2).
 
-Pilot 2 cells (p2-*): C0 dry runs on the measured workload on the slow disk (they set every cell's hard cap), K and T
-on the fast disk (T's write rate at the new load is w's numerator), the Gemma arms not yet run (T2 LM CT K K_ewma)
+Pilot 2 cells (p2-*): C0 dry runs on the measured workload on the slow disk (they set every cell's hard cap), T on the
+unthrottled network_ssd (medium: r and w), K and T on the fast disk (T's write rate at the new load is w's numerator), the Gemma arms not yet run (T2 LM CT K K_ewma)
 on the slow disk, the Gemma K disk-path test with stock vLLM's tier (T) as the reference (check_k_disk.py
 --reference-rows), and a C0 run for the engine-stall check.
 
@@ -185,7 +185,7 @@ def main():
                            "disk_bytes": str(C["workloads"][wl]["disk_bytes"])}
         src = "capacities.json (GPU and CPU per model, disk per workload)"
         for regime, load, wlk in (("slow", "heavy", "measured"), ("slow", "light", "light"),
-                                  ("medium", "heavy", "measured"), ("fast", "heavy", "measured")):
+                                  ("fast", "heavy", "measured")):
             wl = f"{key}.{wlk}"
             arms = (SLOW_ARMS if regime == "slow" else OTHER_ARMS) + (
                 ["K_km"] if m["kkm_cell"] == f"{regime}-{load}" else [])
@@ -198,6 +198,8 @@ def main():
         wl = f"{key}.pilot"
         put(f"p2-{m['tag']}-fast.json", cell(f"p2-{m['tag']}-fast", key, man(wl), caps(wl), "fast", "heavy", wl,
                                              ["T", "K"], eta, src))
+        put(f"p2-{m['tag']}-medium.json", cell(f"p2-{m['tag']}-medium", key, man(wl), caps(wl), "medium", "heavy", wl,
+                                               ["T"], eta, src))
         if key == "gemma4_31b":
             put(f"p2-{m['tag']}-slow.json", cell(f"p2-{m['tag']}-slow", key, man(wl), caps(wl), "slow", "heavy", wl,
                                                  ["T2", "LM", "CT", "K", "K_ewma"], eta, src))

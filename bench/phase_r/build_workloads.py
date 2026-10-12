@@ -49,7 +49,11 @@ runs): the sizing runs on projected C0 timelines instead of the per-turn estimat
 fitted simulator, closed loop, at the workload's own load) is within --end-cap seconds of the run start (tuning stages:
 5/6 of the stage length); sessions are added in partition order until the projected peak live KV reaches the target
 (the smallest such prefix; the projection is redone for each candidate count). The manifest records the projected C0
-makespan, mean requests in flight and resumed-turn TTFT. --dump-candidates DIR writes each partition's ordered
+makespan, mean requests in flight and resumed-turn TTFT. With --size-by-inflight F (the drained load): the measured
+workload takes the session count whose projected C0 mean requests in flight is closest to F, projected at the
+capacities of its own peak live KV P (GPU KV max(1.1 x the GPU request bytes, 0.15 P), CPU tier 0.55 P minus the GPU KV,
+at least 0.05 P); every other workload is sized to that P (extras to their multiple) and projected at those
+capacities. --dump-candidates DIR writes each partition's ordered
 candidate sessions (full turns, starts drawn as in this mode) for scan_load.py and stops.
 
 Outputs in OUT: NAME.json (engine/replay.py format, content-free, surv_v6 null until the frozen model scores the
@@ -129,12 +133,20 @@ ap.add_argument("--service-fit", action="append", default=[], help="NAME=FIT.jso
 ap.add_argument("--end-cap", type=float, default=3000.0, help="with --service-fit: cut each session where its "
                 "projected C0 end passes this many seconds after the run start")
 ap.add_argument("--dump-candidates", help="with --service-fit: write DIR/MODEL.PARTITION.candidates.json and stop")
+ap.add_argument("--size-by-inflight", type=float, help="with --service-fit (BENCH_PLAN draft 6, drained load): the "
+                "measured workload takes the smallest number of sessions whose projected C0 mean requests in flight "
+                "reaches this, at the capacities of its own peak live KV P (sim_sizing.capacities: GPU max(1.1 x the "
+                "GPU request bytes, --gpu-share P), CPU --fast-total P minus GPU, at least --cpu-floor P); every other "
+                "workload is sized to that P (extras to their multiple of it) at those capacities")
+ap.add_argument("--gpu-share", type=float, default=0.15)
+ap.add_argument("--fast-total", type=float, default=0.55)
+ap.add_argument("--cpu-floor", type=float, default=0.05)
 a = ap.parse_args()
 FITS = {}
 if a.service_fit:
     import sys
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from sim_sizing import load_fit, project, stats
+    from sim_sizing import load_fit, project, project_at_rule, stats
     FITS = {x.split("=", 1)[0]: load_fit(x.split("=", 1)[1]) for x in a.service_fit}
 os.makedirs(a.out, exist_ok=True)
 
@@ -366,7 +378,63 @@ def candidates(M, name, items, window, build_turns, skip=frozenset()):
     return out
 
 
-def assemble_sim(M, name, items, window, end_cap, build_turns, peak, skip=frozenset()):
+def sim_out(M, name, C, S, rows, rounds, st, hi, reached, peak, fit, end_cap, window, caps):
+    sessions, refs, done = [], [], {}
+    for r in rows:
+        done.setdefault(r["session"], {})[r["turn"]] = (r["t_send"], r["t_done"])
+    for x in S:
+        sid = f"{TAG[x['pool']]}{len(sessions):04d}"
+        d = done[x["id"]]
+        e2e = [d[j][1] - d[j][0] for j in range(len(x["turns"]))]
+        turns = []
+        for i, t in enumerate(x["turns"]):
+            refs.append((f"{sid}:{i}", sid, i, x["pool"], x["_src_session"], t["_ref"]))
+            turns.append({k: v for k, v in t.items() if not k.startswith("_")} | {"surv_v6": None})
+        sessions.append(dict(id=sid, pool=x["pool"], seed=1000 + len(sessions), start=x["start"], turns=turns,
+                             _src_session=x["_src_session"], _unit=x["_unit"], _len=d[len(x["turns"]) - 1][1] - x["start"],
+                             _cut=len(x["turns"]) < x["_turns_src"], _turns_src=x["_turns_src"],
+                             _why=[t["_why"] for t in x["turns"]], _e2e=e2e))
+    proj = dict(st, candidates_used=hi, candidates_available=len(C), projection_rounds=rounds,
+                target_peak_bytes=None if peak is None else int(peak), target_reached=bool(reached),
+                fit=os.path.basename(fit["path"]), kp=fit["kp"], kd=fit["kd"], end_cap_s=end_cap, start_window_s=window,
+                capacities=caps)
+    return sessions, refs, proj
+
+
+def assemble_inflight(M, name, items, window, end_cap, build_turns, target, rule):
+    """The prefix of the candidates whose projected C0 mean requests in flight is closest to target (the two counts
+    around it), each projected at the capacities of its own peak live KV (sim_sizing.project_at_rule)."""
+    fit = FITS[M["name"]]
+    C = candidates(M, name, items, window, build_turns)
+    floor = 1.1 * M["kv"]["gpu_request_bytes"]
+    memo = {}
+
+    def at(n):
+        if n not in memo:
+            memo[n] = project_at_rule([dict(x) for x in C[:n]], fit, end_cap, M["kv"], floor, rule)
+            st = memo[n][3]
+            print(f"  {name} n {n}: in flight {st['mean_inflight']}, P {st['peak_live_kv_bytes'] / 1e9:.1f} GB, "
+                  f"C0 p50 {st['resumed_ttft_p50_s']} s, recompute {st['recompute_share']}", flush=True)
+        return memo[n]
+
+    lo, hi = 0, 4
+    while hi < len(C) and at(hi)[3]["mean_inflight"] < target:
+        lo, hi = hi, min(len(C), hi * 2)
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if at(mid)[3]["mean_inflight"] >= target:
+            hi = mid
+        else:
+            lo = mid
+    if lo > 0 and target - at(lo)[3]["mean_inflight"] < at(hi)[3]["mean_inflight"] - target:
+        hi = lo                                  # the count whose in-flight is closest to the target
+    S, rows, rounds, st, caps = at(hi)
+    out = sim_out(M, name, C, S, rows, rounds, st, hi, True, None, fit, end_cap, window, caps)
+    out[2]["target_mean_inflight"] = target
+    return out
+
+
+def assemble_sim(M, name, items, window, end_cap, build_turns, peak, skip=frozenset(), caps=None):
     """Smallest prefix of the candidates whose projected C0 timeline, cut at end_cap, reaches the peak live KV."""
     fit = FITS[M["name"]]
     C = candidates(M, name, items, window, build_turns, skip)
@@ -374,7 +442,7 @@ def assemble_sim(M, name, items, window, end_cap, build_turns, peak, skip=frozen
 
     def at(n):
         if n not in memo:
-            S, rows, info, rounds = project([dict(x) for x in C[:n]], fit, end_cap)
+            S, rows, info, rounds = project([dict(x) for x in C[:n]], fit, end_cap, caps=caps)
             memo[n] = (S, rows, rounds, stats(S, rows, M["kv"]))
         return memo[n]
 
@@ -409,25 +477,7 @@ def assemble_sim(M, name, items, window, end_cap, build_turns, peak, skip=frozen
     S, rows, rounds, st = at(hi)
     reached = st[key] >= peak
     assert S, f"{name}: no session kept"
-    sessions, refs, done = [], [], {}
-    for r in rows:
-        done.setdefault(r["session"], {})[r["turn"]] = (r["t_send"], r["t_done"])
-    for x in S:
-        sid = f"{TAG[x['pool']]}{len(sessions):04d}"
-        d = done[x["id"]]
-        e2e = [d[j][1] - d[j][0] for j in range(len(x["turns"]))]
-        turns = []
-        for i, t in enumerate(x["turns"]):
-            refs.append((f"{sid}:{i}", sid, i, x["pool"], x["_src_session"], t["_ref"]))
-            turns.append({k: v for k, v in t.items() if not k.startswith("_")} | {"surv_v6": None})
-        sessions.append(dict(id=sid, pool=x["pool"], seed=1000 + len(sessions), start=x["start"], turns=turns,
-                             _src_session=x["_src_session"], _unit=x["_unit"], _len=d[len(x["turns"]) - 1][1] - x["start"],
-                             _cut=len(x["turns"]) < x["_turns_src"], _turns_src=x["_turns_src"],
-                             _why=[t["_why"] for t in x["turns"]], _e2e=e2e))
-    proj = dict(st, candidates_used=hi, candidates_available=len(C), projection_rounds=rounds,
-                target_peak_bytes=int(peak), target_reached=bool(reached),
-                fit=os.path.basename(fit["path"]), kp=fit["kp"], kd=fit["kd"], end_cap_s=end_cap, start_window_s=window)
-    return sessions, refs, proj
+    return sim_out(M, name, C, S, rows, rounds, st, hi, reached, peak, fit, end_cap, window, caps)
 
 
 def put(path, write):
@@ -527,7 +577,10 @@ def write(M, name, sessions, refs, extra, proj=None):
                               turns_in_source=s["_turns_src"], cut_at_duration=s["_cut"]) for s in sessions])
     if proj is not None:
         man["c0_projection"] = proj
-        man["sizing"] = dict(man["sizing"], by="peak live KV bytes on the projected C0 timeline (fit_service.py)",
+        man["sizing"] = dict(man["sizing"], by=(f"projected C0 mean requests in flight {a.size_by_inflight:g} (measured) "
+                                                "and its peak live KV (the rest), capacities of that P"
+                                                if a.size_by_inflight else
+                                                "peak live KV bytes on the projected C0 timeline (fit_service.py)"),
                              session_cap_s=None, end_cap_s=proj["end_cap_s"], start_window_s=proj["start_window_s"])
     put_json(os.path.join(a.out, f"{name}.manifest.json"), man, indent=1)
     print(name, json.dumps(L), json.dumps(proj) if proj else "", flush=True)
@@ -569,6 +622,17 @@ for M in models:
     if P_heavy:
         print(M["name"], f"heavy P target {P_heavy / 1e9:.2f} GB", flush=True)
     SIM = M["name"] in FITS
+    CAPS, MEAS = None, None
+    if SIM and a.size_by_inflight and not a.dump_candidates:
+        # drained load: the measured workload first, by C0's mean requests in flight; its P and capacities size the rest
+        items = [(src, sess, unit, pool[src][sess]) for src, (sess, unit) in
+                 interleave([[(s, x) for x in order["measured"][s]] for s in SRC])]
+        rule = dict(gpu_share=a.gpu_share, fast_total=a.fast_total, cpu_floor=a.cpu_floor)
+        MEAS = assemble_inflight(M, f"{M['name']}.measured", items, a.duration, a.end_cap, turns_feat,
+                                 a.size_by_inflight, rule)
+        CAPS = MEAS[2]["capacities"]
+        P_heavy = MEAS[2]["peak_live_kv_bytes"]
+        print(M["name"], "drained load: P", f"{P_heavy / 1e9:.2f} GB", json.dumps(CAPS), flush=True)
     for p in PARTS:
         items = [(src, sess, unit, pool[src][sess]) for src, (sess, unit) in
                  interleave([[(s, x) for x in order[p][s]] for s in SRC])]
@@ -584,7 +648,10 @@ for M in models:
             print("candidates", name, len(C), flush=True)
             continue
         if SIM:
-            S, R, proj = assemble_sim(M, name, items, a.duration, a.end_cap, turns_feat, P_heavy)
+            if p == "measured" and MEAS is not None:
+                S, R, proj = MEAS
+            else:
+                S, R, proj = assemble_sim(M, name, items, a.duration, a.end_cap, turns_feat, P_heavy, caps=CAPS)
             built[name] = write(M, name, S, R, dict(duration=a.duration, partition=p, to_completion=True), proj)
         else:
             S, R, _ = assemble(M, name, items, a.duration, turns_feat, None, peak=P_heavy, limit=LIM)
@@ -600,7 +667,8 @@ for M in models:
                 if f.endswith("p"):     # a multiple of the measured workload's peak live KV
                     pk = float(f[:-1]) * built[name]["load"]["peak_live_kv_bytes" if M["kv"] else "peak_live_kv_tokens"]
                 if SIM:
-                    S2, R2, proj = assemble_sim(M, nm, items, a.duration, a.end_cap, turns_feat, pk, skip=frozenset(taken))
+                    S2, R2, proj = assemble_sim(M, nm, items, a.duration, a.end_cap, turns_feat, pk, skip=frozenset(taken),
+                                                caps=CAPS)
                     man = write(M, nm, S2, R2, dict(duration=a.duration, partition=p, to_completion=True), proj)
                 else:
                     S2, R2, _ = assemble(M, nm, items, a.duration, turns_feat, None, live=1.0 if pk else float(f),
@@ -615,7 +683,7 @@ for M in models:
             for d in a.stages:
                 nm = f"{M['name']}.tuning_{int(d / 60)}min"
                 if SIM:
-                    S2, R2, proj = assemble_sim(M, nm, items, a.duration, d * 5 / 6, turns_feat, P_heavy)
+                    S2, R2, proj = assemble_sim(M, nm, items, a.duration, d * 5 / 6, turns_feat, P_heavy, caps=CAPS)
                     built[nm] = write(M, nm, S2, R2, dict(duration=a.duration, partition=p, to_completion=True), proj)
                 else:
                     S2, R2, _ = assemble(M, nm, items, d, turns_feat, None, peak=P_heavy)
@@ -627,7 +695,7 @@ for M in models:
         items = [("cc_traces", tr, tr, g) for _, tr, g in items]
         name = f"{M['name']}.heldout_cc"
         if SIM:
-            S, R, proj = assemble_sim(M, name, items, a.duration, a.end_cap, turns_cc, P_heavy)
+            S, R, proj = assemble_sim(M, name, items, a.duration, a.end_cap, turns_cc, P_heavy, caps=CAPS)
             built[name] = write(M, name, S, R, dict(duration=a.duration, partition="heldout_cc", to_completion=True), proj)
         else:
             S, R, _ = assemble(M, name, items, a.duration, turns_cc, None, peak=P_heavy, limit=LIM)

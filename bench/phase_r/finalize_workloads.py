@@ -6,8 +6,9 @@ For every workload NAME.json in DIR whose name starts with a model's name:
            fills it on a GPU)
   ct_eta   layby.continuum.memoryfulness of the workload's sessions (Continuum's eta; CT needs it per workload)
   kv       the builder's accounting (manifest load): P = peak live KV bytes, unique KV bytes, the disk tier
-Capacities per model, from its measured workload's P (BENCH_PLAN section 5): GPU KV max(0.15 P, 1.1 x the GPU KV
-the engine needs for one request at the context cap, kv.gpu_request_bytes, so the engine can start), CPU tier 0.4 P. Per workload: disk tier
+Capacities per model, from its measured workload's P (BENCH_PLAN section 5, draft 6): GPU KV max(0.15 P, 1.1 x the GPU KV
+the engine needs for one request at the context cap, kv.gpu_request_bytes, so the engine can start), CPU tier 0.55 P
+minus the GPU KV (GPU + CPU = 0.55 P, the original 0.15 + 0.40), at least 0.05 P. Per workload: disk tier
 1.2 x unique KV at turn ends (one recurrent state and the window's new tokens per turn end; the coordinator's
 2026-10-11 decision); disk_bytes_upper is 1.2 x the builder's upper bound (the sliding layers' KV of every token, a
 recurrent state at every KV block boundary), for a check against the bytes the engines write in the pilot.
@@ -31,6 +32,9 @@ ap.add_argument("dir")
 ap.add_argument("--models", required=True)
 ap.add_argument("--km", required=True)
 ap.add_argument("--alpha", type=float, default=0.8)
+ap.add_argument("--gpu-share", type=float, default=0.15)
+ap.add_argument("--fast-total", type=float, default=0.55, help="GPU KV + CPU tier as a share of P (draft 6)")
+ap.add_argument("--cpu-floor", type=float, default=0.05)
 a = ap.parse_args()
 
 
@@ -53,7 +57,8 @@ caps = dict(_note=(
     "Phase R capacities (BENCH_PLAN section 5), bytes. P: the workload builder's peak live KV (largest summed KV "
     "of started, unfinished sessions on the builder's service-time model: grow x context + recurrent state + "
     "min(context, window) x window bytes), not a C0 replay. Per model, from its measured workload: GPU KV "
-    "max(0.15 P, 1.1 x gpu_request_bytes: the GPU KV the engine needs to admit one max_model_len request), CPU tier 0.4 P. Per workload: disk_bytes = 1.2 x "
+    "max(0.15 P, 1.1 x gpu_request_bytes: the GPU KV the engine needs to admit one max_model_len request), CPU tier 0.55 P minus "
+    "the GPU KV, at least 0.05 P (draft 6). Per workload: disk_bytes = 1.2 x "
     "unique KV at turn ends (one recurrent state and the window's new tokens per turn end); disk_bytes_upper = 1.2 x "
     "the upper bound (sliding layers' KV for every token, a recurrent state per KV block, vLLM's mamba align mode), "
     "ct_eta = layby.continuum.memoryfulness. KV constants from the Hugging Face config.json "
@@ -68,7 +73,8 @@ for M in models:
     meas = mans[f"{M['name']}.measured"]["load"]
     P = meas["peak_live_kv_bytes"]
     floor = int(1.1 * k.get("gpu_request_bytes", k["longest_request_bytes"]))
-    gpu = max(int(0.15 * P), floor)
+    gpu = max(int(a.gpu_share * P), floor)
+    cpu = max(int(a.fast_total * P) - gpu, int(a.cpu_floor * P)) // 4096 * 4096
     mc = dict(measured_workload=f"{M['name']}.measured", hf=M["hf"], max_model_len=M["cap"], ctx_cap_source=M["cap_source"],
               kv_dtype=k["dtype"], grow_bytes_per_token=k["grow_bytes_per_token"],
               state_bytes_per_session=k["state_bytes_per_session"], window_tokens=k["window_tokens"],
@@ -77,7 +83,9 @@ for M in models:
               longest_request_bytes=k["longest_request_bytes"], gpu_request_bytes=k.get("gpu_request_bytes"),
               gpu_request_source=k.get("gpu_request_source"), gpu_request_check=k.get("gpu_request_check"), P_bytes=P, P_grow_tokens=meas["peak_live_kv_tokens"],
               gpu_kv_bytes_plan=int(0.15 * P), gpu_kv_floor_bytes=floor, gpu_kv_bytes=gpu, gpu_kv_floored=gpu == floor,
-              cpu_bytes=int(0.4 * P) // 4096 * 4096, service_model=dict(c0=M["c0"], tpot=M["tpot"], b_per_1k_prompt=M["b"],
+              cpu_bytes=cpu, gpu_share=round(gpu / P, 4), cpu_share=round(cpu / P, 4),
+              cpu_floored=cpu == int(a.cpu_floor * P) // 4096 * 4096, capacity_rule=dict(
+                  gpu_share=a.gpu_share, fast_total=a.fast_total, cpu_floor=a.cpu_floor), service_model=dict(c0=M["c0"], tpot=M["tpot"], b_per_1k_prompt=M["b"],
                                                           inflight=M["inflight"], status=M["service_assumption"]["status"]))
     caps["models"][M["name"]] = mc
     for n in names:

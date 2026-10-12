@@ -21,11 +21,11 @@
  "loads": {
   "heavy": {
    "prefill_tok_s": 6526.2,
-   "wt_offered_write_Bps": 107495264
+   "wt_offered_write_Bps": 41408874
   },
   "light": {
    "prefill_tok_s": 6526.2,
-   "wt_offered_write_Bps": 69464975
+   "wt_offered_write_Bps": 18825017
   }
  }
 }
