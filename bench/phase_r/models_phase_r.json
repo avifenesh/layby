@@ -43,7 +43,7 @@
   "b": 0.05015,
   "inflight": 1.4317,
   "service_assumption": {
-   "status": "measured: prefill (C0, B); ESTIMATE (replace with the pilot's microbenchmarks): TPOT",
+   "status": "MEASURED: sizing uses the C0 service model fitted on the pilot C0 runs (bench/phase_r/fit_service.py, fit_qwen38_27b.json); c0, tpot and b are the old scaled estimates, not used by the sizing",
    "measured": [
     "prefill (C0, B)"
    ],
@@ -68,6 +68,22 @@
    "ref_prefill_tok_s": 16983.0,
    "prefill_tok_s_at_c_ref": 9009.0,
    "flop_ratio": 2.1335
+  },
+  "service_fit": {
+   "file": "fit_qwen38_27b.json",
+   "sha256": "aeb80b1f94aa20e4f2782cf1d7c2af6db635ec080f27e1d91b17879b1df8b92c",
+   "kp": 1.0,
+   "kd": 0.75,
+   "base": {
+    "t0": 0.01813724542468324,
+    "bw": 276066011028.87885,
+    "f0": 9.232187735073999e-05,
+    "att": 0.013690633347734118,
+    "gpu_tokens": 153314,
+    "cpu_tokens": 369710,
+    "req_tokens": 2349,
+    "cpu_gbps": 56.0
+   }
   }
  },
  {
@@ -116,7 +132,7 @@
   "b": 0.10159,
   "inflight": 1.4317,
   "service_assumption": {
-   "status": "measured: prefill (C0, B); ESTIMATE (replace with the pilot's microbenchmarks): TPOT",
+   "status": "MEASURED: sizing uses the C0 service model fitted on the pilot C0 runs (bench/phase_r/fit_service.py, fit_gemma4_31b.json); c0, tpot and b are the old scaled estimates, not used by the sizing",
    "measured": [
     "prefill (C0, B)"
    ],
@@ -141,6 +157,22 @@
    "ref_prefill_tok_s": 16983.0,
    "prefill_tok_s_at_c_ref": 4447.0,
    "flop_ratio": 2.7428
+  },
+  "service_fit": {
+   "file": "fit_gemma4_31b.json",
+   "sha256": "b2388a6e6e986f3b4923b7ebc77ff01fb49c37e81c8b52cee6e4feef52f7e8ec",
+   "kp": 1.0,
+   "kd": 1.0,
+   "base": {
+    "t0": 0.022295124354763003,
+    "bw": 210899764972.3748,
+    "f0": 0.00011488886162023371,
+    "att": 0.07814603041187554,
+    "gpu_tokens": 339494,
+    "cpu_tokens": 563066,
+    "req_tokens": 10240,
+    "cpu_gbps": 56.0
+   }
   }
  }
 ]

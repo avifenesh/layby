@@ -56,6 +56,9 @@ class Params:
         self.kib = KIB              # KiB per token moved on the CPU and disk tiers (all TP ranks' copies)
         self.hbm_kib = None         # KiB per token a decode step reads from HBM per rank (None: kib)
         self.max_seqs = None        # max running requests, as --max-num-seqs (None: no cap)
+        self.req_tokens = 0         # GPU KV a running request holds beyond its tokens, in tokens (a recurrent
+                                    # state, a sliding window: bench/phase_r/fit_service.py)
+        self.until = None           # stop the simulation at this time (a hard cap; unfinished turns are not in out)
         self.__dict__.update(kw)
 
 
@@ -193,15 +196,16 @@ def simulate(W, src, p, rule=None):
         nonlocal alloc, link_cpu, link_disk
         k = r.sess
         own = gpu_idle.get(k, 0)
-        if not gpu_evict(r.P + r.O - min(own, r.P + r.O), k, now):
+        need = r.P + r.O + p.req_tokens
+        if not gpu_evict(need - min(own, r.P + r.O), k, now):
             return False
         g = min(r.P, max(own, running_sess.get(k, 0)))
         if own:
             live.end_idle(now, "g", now - gpu_free_t[k], own, False)
         gpu_idle.pop(k, None)
         gpu_pin.pop(k, None)
-        alloc += r.P + r.O
-        r.alloc = r.P + r.O
+        alloc += need
+        r.alloc = need
         c, d = cpu.get(k, 0), disk.get(k, 0)
         if k in cpu:
             if not any(x.sess == k for x in running):
@@ -249,6 +253,8 @@ def simulate(W, src, p, rule=None):
 
     now = 0.0
     while ev or waiting or running:
+        if p.until is not None and now >= p.until:
+            break
         if not waiting and not running:
             now = max(now, ev[0][0])
         while ev and ev[0][0] <= now:
@@ -358,6 +364,7 @@ def simulate(W, src, p, rule=None):
             H[k] = tot
             out.append(dict(session=S[k]["id"], turn=r.turn, kind=r.kind, ttft=r.t_first - r.t_send,
                             hit=r.hit, ext=r.ext, P=r.P, queue=r.t_adm - r.t_send, load=max(r.ready - r.t_adm, 0.0),
+                            t_send=r.t_send, t_first=r.t_first, t_done=now,
                             warm=None if (k, r.turn) not in wlog else [x - r.t_send for x in wlog[(k, r.turn)]]))
             t = turn_of(k, r.turn)
             if t["gap_after"] is None or r.turn + 1 >= len(S[k]["turns"]):
