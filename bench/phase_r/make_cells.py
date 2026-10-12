@@ -19,7 +19,7 @@ on the slow disk, the Gemma K disk-path test with stock vLLM's tier (T) as the r
 --reference-rows), and a C0 run for the engine-stall check.
 
 Per cell: capacities from capacities.json (GPU and CPU per model, disk per workload; the kdisk cells from their
-manifest), CT_ETA of the model's measured workload, LMCache chunk 784 on Qwen, kv_chunk_bytes the vLLM CPU tier's
+manifest), MAXLEN the workloads' context cap (capacities.json max_model_len), CT_ETA of the model's measured workload, LMCache chunk 784 on Qwen, kv_chunk_bytes the vLLM CPU tier's
 chunk (Qwen 51,380,224 B, Gemma 2,621,440 B), hard_cap_s 1.5 x the workload's projected C0 makespan (manifest
 c0_projection, fit_service.py; replaced by the C0 dry run's makespan once it has run), REPLAY_TIMEOUT the cap + 600 s,
 the runner timeout 1,800 s more. Pilot JSON per model: tier bytes per token and prefill tok/s measured in pilot 1
@@ -47,6 +47,7 @@ NETWORK_SSD = dict(seq_read_Bps=449_519_063, seq_write_Bps=462_519_988, rand_rea
 NRD = dict(seq_read_Bps=2_041_400_456, seq_write_Bps=1_412_483_080, rand_read_Bps=2_141_000_000)
 WT_PER_TOKEN = {"qwen38_27b": 1.403, "gemma4_31b": 1.455}
 
+MAXLEN = {}   # --max-model-len per model, capacities.json max_model_len (the workloads' context cap)
 MODELS = {
     "qwen38_27b": dict(
         tag="qwen", hf="Qwen/Qwen3.8-27B-FP8", serve="--revision 017b9c7af6b5689d5dd426a76e0bc077eb5ca20a",
@@ -113,7 +114,7 @@ def cell(name, key, man, caps, regime, load, wl, arms, ct_eta, cap_src, extra=No
     proj = man.get("c0_projection") or {}
     mk = proj.get("makespan_s") or man["load"]["est_makespan_s"]
     cap = int(math.ceil(1.5 * mk))
-    env = {"REPLAY_TIMEOUT": str(cap + 600), "BOOT_WAIT": "360", "MAXLEN": "131072", "SERVE_ARGS": m["serve"]}
+    env = {"REPLAY_TIMEOUT": str(cap + 600), "BOOT_WAIT": "360", "MAXLEN": str(MAXLEN[key]), "SERVE_ARGS": m["serve"]}
     if m["lm_chunk"]:
         env["LM_CHUNK"] = str(m["lm_chunk"])
     A = []
@@ -160,6 +161,7 @@ def main():
     out = os.path.abspath(a.out)
     os.makedirs(out, exist_ok=True)
     C = json.load(open(os.path.join(a.workloads, "capacities.json")))
+    MAXLEN.update({k: int(v["max_model_len"]) for k, v in C["models"].items()})
     man = lambda n: json.load(open(os.path.join(a.workloads, f"{n}.manifest.json")))   # noqa: E731
     written = []
 

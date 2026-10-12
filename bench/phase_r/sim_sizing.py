@@ -25,13 +25,21 @@ def load_fit(path):
     return dict(path=path, kp=d["fit"]["kp"], kd=d["fit"]["kd"], params=sp, model=d["model"])
 
 
-def capacities(P, gpu_floor, gpu_share=0.15, fast_total=0.55, cpu_floor=0.05):
+def cpu_min_bytes(kv, cap, sessions=1.5):
+    """The CPU tier a disk restore needs: a restore is staged through the CPU tier, so it holds sessions x one
+    max-length context at the tier's measured bytes per token, in whole tier chunks (the kdisk rule)."""
+    return math.ceil(sessions * cap * kv["tier_bytes_per_token"] / kv["tier_chunk_bytes"]) * kv["tier_chunk_bytes"]
+
+
+def capacities(P, gpu_floor, gpu_share=0.15, fast_total=0.55, cpu_floor=0.05, cpu_min=0):
     """BENCH_PLAN draft 6 capacity rule: GPU KV max(the engine's floor, gpu_share x P); CPU tier fast_total x P minus
-    the GPU KV (GPU + CPU = fast_total x P, the original 0.15 + 0.40), at least cpu_floor x P; whole pages."""
+    the GPU KV (GPU + CPU = fast_total x P, the original 0.15 + 0.40), at least cpu_floor x P and at least cpu_min
+    bytes (cpu_min_bytes: the disk path must restore a max-length session); whole pages."""
     gpu = max(int(gpu_floor), int(gpu_share * P))
-    cpu = max(int(fast_total * P) - gpu, int(cpu_floor * P)) // 4096 * 4096
+    cpu = max(int(fast_total * P) - gpu, int(cpu_floor * P), int(cpu_min)) // 4096 * 4096
     return dict(gpu_bytes=gpu, cpu_bytes=cpu, P=int(P), gpu_share=round(gpu / P, 4), cpu_share=round(cpu / P, 4),
-                total_share=round((gpu + cpu) / P, 4), cpu_floored=cpu == int(cpu_floor * P) // 4096 * 4096)
+                total_share=round((gpu + cpu) / P, 4), cpu_floored=cpu == int(cpu_floor * P) // 4096 * 4096,
+                cpu_at_min=cpu == int(cpu_min) // 4096 * 4096)
 
 
 def run_c0(sessions, fit, until=None, caps=None):

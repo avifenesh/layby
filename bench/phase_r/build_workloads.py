@@ -52,7 +52,7 @@ fitted simulator, closed loop, at the workload's own load) is within --end-cap s
 makespan, mean requests in flight and resumed-turn TTFT. With --size-by-inflight F (the drained load): the measured
 workload takes the session count whose projected C0 mean requests in flight is closest to F, projected at the
 capacities of its own peak live KV P (GPU KV max(1.1 x the GPU request bytes, 0.15 P), CPU tier 0.55 P minus the GPU KV,
-at least 0.05 P); every other workload is sized to that P (extras to their multiple) and projected at those
+at least 0.05 P and at least 1.5 max-length contexts at the tier's bytes per token); every other workload is sized to that P (extras to their multiple) and projected at those
 capacities. --dump-candidates DIR writes each partition's ordered
 candidate sessions (full turns, starts drawn as in this mode) for scan_load.py and stops.
 
@@ -146,7 +146,7 @@ FITS = {}
 if a.service_fit:
     import sys
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from sim_sizing import load_fit, project, project_at_rule, stats
+    from sim_sizing import cpu_min_bytes, load_fit, project, project_at_rule, stats
     FITS = {x.split("=", 1)[0]: load_fit(x.split("=", 1)[1]) for x in a.service_fit}
 os.makedirs(a.out, exist_ok=True)
 
@@ -627,7 +627,8 @@ for M in models:
         # drained load: the measured workload first, by C0's mean requests in flight; its P and capacities size the rest
         items = [(src, sess, unit, pool[src][sess]) for src, (sess, unit) in
                  interleave([[(s, x) for x in order["measured"][s]] for s in SRC])]
-        rule = dict(gpu_share=a.gpu_share, fast_total=a.fast_total, cpu_floor=a.cpu_floor)
+        rule = dict(gpu_share=a.gpu_share, fast_total=a.fast_total, cpu_floor=a.cpu_floor,
+                    cpu_min=cpu_min_bytes(M["kv"], M["cap"]))
         MEAS = assemble_inflight(M, f"{M['name']}.measured", items, a.duration, a.end_cap, turns_feat,
                                  a.size_by_inflight, rule)
         CAPS = MEAS[2]["capacities"]

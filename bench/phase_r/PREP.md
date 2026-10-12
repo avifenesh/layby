@@ -197,3 +197,29 @@ The next count up (10 sessions) gives 4.2 in flight on both (Qwen p50 27 s, reco
 reached. kdisk workloads come from the KV-pressure pilot workloads (`workloads/archive_v3`): the drained pilot
 workload cannot put a 1.5x-largest-session CPU tier under pressure. The KV-pressure workloads are in
 `workloads/archive_v3`, the v2 ones in `archive_v2`.
+
+### 32K context cap (owner, 2026-10-12)
+
+At 131,072 the GPU KV floor (1.1x one max-length request) took 0.40 P (Qwen) and 0.71 P (Gemma) at the drained load,
+and the CPU tier was smaller than one max-length session on both models. The owner set `--max-model-len 32768`;
+sessions past the cap restart by the same compaction rule (the newest 0.16 x CAP tokens of history plus the turn's new
+tokens). One request at 32,768 needs 48 blocks x 51,380,224 B = 2.47 GB on Qwen3.8 and 6,469 blocks x 2,621,440 B =
+16.96 GB on Gemma 4 (the formula that reproduces the compat logs; Gemma's sliding groups still reserve window + 2 x 8,192
+batch tokens per request, so its floor barely moves with the cap). vLLM 0.31.0's align-mode Mamba manager holds one
+state block per group for a running request (two while it checkpoints a prefill), so the simulator's 2,349-token
+recurrent reserve stands.
+
+CPU tier minimum: a disk restore is staged through the CPU tier, so the tier holds at least 1.5 max-length contexts at
+the tier's measured bytes per token (pilot 1: Qwen 72,472 B, Gemma 131,714 B), whole tier chunks
+(`sim_sizing.cpu_min_bytes`, the kdisk rule): Qwen 3.60 GB, Gemma 6.47 GB. The drained-load fixed point projects at
+this rule.
+
+| model | sessions / turns | P GB | GPU KV | CPU tier | C0 in flight | C0 resumed p50 s | C0 recompute share |
+|---|---|---|---|---|---|---|---|
+| Qwen3.8-27B | 20 / 826 | 19.9 | 2.99 GB, 0.15 P | 7.98 GB, 0.40 P | 2.7 | 2.5 | 0.28 |
+| Gemma 4 31B | 20 / 801 | 38.8 | 18.65 GB, 0.48 P (floor) | 6.47 GB, 0.17 P (minimum; total 0.65 P) | 2.8 | 0.1 | 0.12 |
+
+Light: Qwen 9 sessions / 309 turns, Gemma 11 / 486. kdisk (from the new pilot workloads, 20 minutes): Qwen 17 / 272
+(CPU tier 3.60 GB, 0.19 of the peak tier bytes), Gemma 19 / 309 (6.47 GB, 0.16). Cells carry MAXLEN from
+capacities.json `max_model_len`. Checks: 0 overlap (partitions, seen set, users, K_km pool), 0 public turns without a
+v6 curve, 31 of 31 cells and blocks pass the dry run. The 131K drained workloads are in `workloads/archive_v4`.
