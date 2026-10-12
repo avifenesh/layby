@@ -416,6 +416,15 @@ def sglang_patch(rn, c, mode):
     return r.out.strip() if r.ok else (r.out.strip() or r.err.strip() or f"rc={r.rc}")
 
 
+def vllm_patch(rn, c, mode):
+    """vLLM PR #60045, the sliding-window admission count (engine/phase_r/vllm/pr60045_swa_admission.patch), on the
+    engine's vLLM: every vLLM arm runs with it, stock baselines and Layby alike."""
+    py = os.path.join(c["runner"]["venv"], "bin", "python")
+    r = rn.run(in_runner(c, [py, layby_path(c, "engine/phase_r/vllm/apply_patch.py"), mode]),
+               fake="PATCHED 0.31.0 pr60045 (dry-run)\n")
+    return r.out.strip() if r.ok else (r.out.strip() or r.err.strip() or f"rc={r.rc}")
+
+
 # ---------------------------------------------------------------- preflight
 
 def live_problems(rn, c):
@@ -496,6 +505,10 @@ def preflight(rn, c, out_root=None):
         st = sglang_patch(rn, c, "apply")
         if not st.startswith(("PATCHED", "ALREADY_PATCHED")):
             problems.append(f"SGLang fadvise patch: {st}")
+    if c["engine"] == "vllm":
+        st = vllm_patch(rn, c, "apply")
+        if not st.startswith(("PATCHED", "ALREADY_PATCHED")):
+            problems.append(f"vLLM PR #60045 patch: {st}")
     return problems
 
 
@@ -679,9 +692,10 @@ class Block:
             g = health.gpu_now(rn, self.fields, str(s["cuda"]), fake_mask=self.dry.get("gpu_mask", "0x0"))
             procs = health.gpu_procs(rn, str(s["cuda"]))
             patch = sglang_patch(rn, c, "check") if c["engine"] == "sglang" else None
+            vpatch = vllm_patch(rn, c, "check") if c["engine"] == "vllm" else None
             bad = health.pre_arm(gpu_rows=g, gpu_procs_list=procs, probe_now=x["quick"], probe_first=first[s["name"]],
                                  mem_avail=mem, budget=round_budget, workload=wl, expect=c["workload"],
-                                 sglang_patch=patch, settings=c["health"])
+                                 sglang_patch=patch, vllm_patch=vpatch, settings=c["health"])
             for msg in x["cg_bad"]:
                 bad.append({"check": "cgroup", "detail": msg, "host_level": True})
             t = x["throttled"]
@@ -694,6 +708,7 @@ class Block:
             x["health"] = {"gpu": g, "gpu_procs": procs, "quick_probe": _strip(x["quick"]), "quick_tries": x["quick_tries"],
                            "throttled": _strip(t),
                            "mem_available": mem, "round_budget": round_budget, "workload": wl, "sglang_patch": patch,
+                           "vllm_patch": vpatch,
                            "wipe_notes": x["notes"], "failures": bad}
             dump(os.path.join(x["dir"], f"{x['prefix']}.health.json"), x["health"])
             for b in bad:

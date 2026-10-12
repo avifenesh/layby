@@ -9,6 +9,7 @@ Before every arm (a failure excludes the arm, and with it the host's block):
   - free host memory (MemAvailable) at least the cgroup budget plus 8 GiB
   - workload session and turn counts exact (and the file's sha256 when the cell gives it)
   - SGLang arms: the HiCacheFile fadvise patch present
+  - vLLM arms: vLLM PR #60045 (the sliding-window admission count) present
 After the arm (on the replay window, cut by the runner's replay_start and replay_end markers):
   - any memory.events oom or oom_kill increase (whole arm, boot included)
   - PSI "full" stall time over 1% of the window, for each resource in psi_resources (default memory; io is logged.
@@ -141,7 +142,7 @@ def workload_counts(path):
 
 
 def pre_arm(*, gpu_rows, gpu_procs_list, probe_now, probe_first, mem_avail, budget, workload, expect,
-            sglang_patch=None, settings=None):
+            sglang_patch=None, vllm_patch=None, settings=None):
     """List of failures; each {'check', 'detail', 'host_level'}. host_level failures mean the host needs replacing."""
     s = dict(DEFAULTS, **(settings or {}))
     bad = []
@@ -173,6 +174,8 @@ def pre_arm(*, gpu_rows, gpu_procs_list, probe_now, probe_first, mem_avail, budg
             bad.append({"check": "workload_sha256", "host_level": False, "detail": sha})
     if sglang_patch is not None and not sglang_patch.startswith(("PATCHED", "ALREADY_PATCHED")):
         bad.append({"check": "sglang_patch", "host_level": False, "detail": sglang_patch.strip()})
+    if vllm_patch is not None and not vllm_patch.startswith(("PATCHED", "ALREADY_PATCHED")):
+        bad.append({"check": "vllm_patch", "host_level": False, "detail": vllm_patch.strip()})
     return bad
 
 

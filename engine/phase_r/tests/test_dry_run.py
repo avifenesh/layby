@@ -77,6 +77,9 @@ class DryRun(unittest.TestCase):
         self.assertEqual(sum("cgroup.kill" in ln for ln in lines), n + 1)        # n arms + the regime probe cgroup
         self.assertEqual(sum("/io.max" in ln for ln in lines), n + 1)
         self.assertEqual(sum("bash /root/layby/engine/run_arms.sh" in ln for ln in lines), n)
+        # vLLM PR #60045: applied before the block, checked before every arm
+        self.assertEqual(sum("/root/layby/engine/phase_r/vllm/apply_patch.py apply" in ln for ln in lines), 1)
+        self.assertEqual(sum("/root/layby/engine/phase_r/vllm/apply_patch.py check" in ln for ln in lines), n)
         self.assertTrue(any("SERVER_WRAP=/root/layby/engine/phase_r/cg_exec.sh /sys/fs/cgroup/layby/" in ln for ln in lines))
         cmd = {ln.split(" > ")[0].split()[-1]: ln for ln in lines if "bash /root/layby/engine/run_arms.sh" in ln}
         self.assertEqual(sorted(cmd), sorted(arms))

@@ -275,6 +275,10 @@ class BeforeArm(unittest.TestCase):
         self.assertEqual([b["check"] for b in self.pre(sglang_patch="NOT_PATCHED 0.5.21 hunks=0 /x")],
                          ["sglang_patch"])
 
+    def test_vllm_patch_required(self):
+        self.assertEqual(self.pre(vllm_patch="PATCHED 0.31.0 pr60045 abc /x"), [])
+        self.assertEqual([b["check"] for b in self.pre(vllm_patch="NOT_PATCHED 0.31.0 has=none /x")], ["vllm_patch"])
+
 
 class Gpu(unittest.TestCase):
     def test_decode_and_parse(self):

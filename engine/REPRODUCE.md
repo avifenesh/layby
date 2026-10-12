@@ -142,6 +142,10 @@ configuration error), prefill tok/s and write-through's offered write
 rate per load). The regime is checked from measured numbers before any arm runs (`orchestrate.py regime` computes r and
 w by hand). SGLang arms need `engine/phase_r/sglang/hicache_fadvise.patch` (HiCacheFile drops its page-cache pages
 after each write and read); `apply_patch.sh PYTHON apply` installs it and the orchestrator checks it before every arm.
+Every vLLM arm (stock baselines and Layby alike) needs vLLM PR #60045 (`engine/phase_r/vllm/pr60045_swa_admission.patch`,
+open upstream, commit 843db146): stock 0.31.0 counts no sliding-window blocks at admission for a long prefix hit, and
+two async loads can deadlock a Gemma engine. `PYTHON engine/phase_r/vllm/apply_patch.py apply` installs it; the
+orchestrator applies it before every vLLM block and checks it before every arm.
 
 Runner hooks the harness uses (unset, the runners behave as before): `SERVER_WRAP` (command prefix for the server),
 `ARM_HOOK` (replay_start and replay_end markers), `PARK_HINTS` (arm K's curve), `WRITE_POLICY` (SGLang). Arm settings:

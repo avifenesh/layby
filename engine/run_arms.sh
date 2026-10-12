@@ -62,6 +62,7 @@
 #      own policy, C0 T T2 CT PT: lru or arc, default lru), FS_THREADS (read and write threads of every disk tier,
 #      default 16). REPLAY_TIMEOUT must exceed HARD_CAP by 300 s (the cap writes the censored rows). REPLAY_EXTRA
 #      (extra replay.py arguments for every arm, e.g. "--verify-disk 20" in the K disk-path pilot).
+#      Every arm needs vLLM PR #60045 (phase_r/vllm/apply_patch.py); the orchestrator applies it and checks it before each arm.
 set -u
 W=$1; O=$2; KV=$3; CPU=$4; DISK=$5; shift 5
 MODEL=${MODEL:-Qwen/Qwen3-8B}

@@ -40,7 +40,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_utils import get_block_hash
 from vllm.v1.kv_offload.base import LookupResult
-from vllm.utils.math_utils import cdiv
 from vllm.v1.utils import compute_iteration_details
 
 from layby.rule import TG, decide, interp_surv, recompute_cost
@@ -169,8 +168,6 @@ class ParkConnector(OffloadingConnector):
         # request id -> the GPU-local prefix hit (tokens) vLLM passed to the last lookup. vLLM calls
         # update_state_after_alloc before it sets request.num_computed_tokens, so a new request reads 0 there
         self._local: dict[str, int] = {}
-        # request id -> request, from the admission of its async load until it first runs (or finishes)
-        self._holding: dict = {}
         self._finished: "OrderedDict[str, dict]" = OrderedDict()   # park_key -> request awaiting a curve
         self._early: dict[str, tuple[float, list]] = {}               # park_key -> curve that beat the finish
         self._loads: dict[int, tuple[float, int]] = {}  # load job id -> (submit time, chunks)
@@ -219,13 +216,6 @@ class ParkConnector(OffloadingConnector):
         super().on_new_request(request)
 
     def get_num_new_matched_tokens(self, request, num_computed_tokens):
-        out = self._matched(request, num_computed_tokens)
-        if out[0] and out[1] and _safe("gpu gate", self._gpu_room, request) is False:
-            STATE.counts["gpu_wait"] += 1
-            return None, False      # holds no GPU blocks; asked again next step
-        return out
-
-    def _matched(self, request, num_computed_tokens):
         rid = request.request_id
         self._local[rid] = int(num_computed_tokens)
         out = super().get_num_new_matched_tokens(request, num_computed_tokens)
@@ -239,43 +229,6 @@ class ParkConnector(OffloadingConnector):
             return out
         alt = _safe("defer cap", self._defer_cap, request, int(num_computed_tokens), now - t0, now)
         return out if alt is None else alt
-
-    def _gpu_room(self, request) -> bool:
-        """Whether an async load for this request may be admitted beside the loads already holding GPU blocks.
-
-        A request whose load was admitted holds its blocks and cannot be preempted until it runs, and vLLM 0.31 counts
-        no sliding-window blocks for a long prefix hit (get_num_blocks_to_allocate caps the blocks held, then subtracts
-        the skipped positions), so its full-sequence check and in-flight reservation see the global group only. Two
-        such loads can fill the pool with neither able to take its next prefill chunk (Gemma 4: 2 x 1,006 of 2,188
-        blocks). With no other holder the load goes in as in vLLM (alone, it finishes once the running requests drain);
-        with one, it goes in only if the free blocks cover what it and every holder still need."""
-        others = [r for rid, r in self._holding.items() if rid != request.request_id]
-        if not others:
-            return True
-        kvm = self._kv_cache_manager
-        need = self._blocks_needed(request, held=False) + sum(self._blocks_needed(r) for r in others)
-        return need <= kvm.block_pool.get_num_free_blocks()
-
-    def _blocks_needed(self, request, held: bool = True) -> int:
-        """GPU blocks the request still needs to finish its sequence, per KV group as the allocator holds them: a
-        sliding-window (recycling) group peaks at its admission cap, a full group at the whole sequence; null blocks
-        below a window are not held. held=False: a request with nothing allocated yet."""
-        kvm = self._kv_cache_manager
-        n = min(request.num_tokens, kvm.max_model_len)
-        total = 0
-        for m in kvm.coordinator.single_type_managers:
-            peak = cdiv(n, m.block_size)
-            cap = getattr(m, "max_admission_blocks_per_request", None)
-            if cap is not None:
-                peak = min(peak, cap)
-            have = sum(1 for b in m.req_to_blocks.get(request.request_id, ()) if not b.is_null) if held else 0
-            total += max(peak - have, 0)
-        return total
-
-    def _release_holders(self, scheduler_output) -> None:
-        """A load holder that runs this step no longer waits: it can be preempted from now on."""
-        for rid in scheduler_output.num_scheduled_tokens:
-            self._holding.pop(rid, None)
 
     def _defer_cap(self, request, local: int, waited: float, now: float):
         """The bounded deferral: once the wait since the first deferral exceeds the recompute of the tokens it
@@ -367,8 +320,6 @@ class ParkConnector(OffloadingConnector):
 
     def update_state_after_alloc(self, request, blocks, num_external_tokens: int):
         out = super().update_state_after_alloc(request, blocks, num_external_tokens)
-        if num_external_tokens > 0:         # the offloading connector loads every external hit asynchronously
-            self._holding[request.request_id] = request
         _safe("admission", self._admit, request, num_external_tokens)
         return out
 
@@ -418,7 +369,6 @@ class ParkConnector(OffloadingConnector):
     # --- steps and the CPU link --------------------------------------------------------
     def build_connector_meta(self, scheduler_output):
         now = time.monotonic()
-        _safe("gpu gate", self._release_holders, scheduler_output)
         _safe("idle", STATE.flush_idle, now)
         _safe("hints", self._drain_hints, now)
         _safe("giveups", self._settle_giveups, now)
@@ -463,14 +413,12 @@ class ParkConnector(OffloadingConnector):
     # --- decisions ---------------------------------------------------------------------
     def request_finished(self, request, block_ids):
         self._local.pop(request.request_id, None)
-        self._holding.pop(request.request_id, None)
         out = super().request_finished(request, block_ids)
         _safe("finish", self._on_finish, request, block_ids)
         return out
 
     def request_finished_all_groups(self, request, block_ids):
         self._local.pop(request.request_id, None)
-        self._holding.pop(request.request_id, None)
         out = super().request_finished_all_groups(request, block_ids)
         _safe("finish", self._on_finish, request, block_ids)
         return out
