@@ -1,81 +1,118 @@
 #!/usr/bin/env python3
 """Phase R cell specs (engine/phase_r/orchestrate.py) for Qwen3.8-27B and Gemma 4 31B on vLLM 0.31.0, from the
-workloads' capacities.json and manifests and the compat check (compat.json, micro.json).
+workloads' capacities.json and manifests and the pilot's measurements (BENCH_PLAN draft 6).
 
-Matrix (coordinator, 2026-10-11): per model slow heavy (measured), slow light (light), medium heavy (measured);
-arms C0 T T2 LM CT K K_ewma, plus K_km on qwen slow heavy only. SGLang is dropped (no K arm on hybrid models), so is
-T-LRU. Pilot cells per model: slow (the pilot workload, every arm label the matrix uses plus PT, so the pilot measures
-each arm's RSS), medium (C0 T K: the NRD disk's probe, io.max and offered write), and kdisk (the K disk-path test
-under CPU pressure, bench/phase_r/kdisk_workload.py, pass criterion engine/phase_r/check_k_disk.py).
+Disks, one Nebius 1x RTX PRO 6000 VM (uk-south2), three settings:
+  slow    the 2 TB network_ssd root disk (/data) throttled with cgroup io.max, read and write SLOW_IO_MAX bytes/s, set so
+          the measured r is about 0.3 on both models (r = io.max / tier bytes per token / prefill tok/s at 8,192
+          tokens, batch 8: Qwen 0.29, Gemma 0.26; at the 32K prefill rate 0.34 and 0.44, still below 0.5)
+  medium  the same network_ssd without io.max (pilot: r 0.59 Qwen, 0.52 Gemma; the regime check at block start
+          decides: a measured r below 0.5 stops the block with exit 4)
+  fast    the 2.5 TB network_ssd_non_replicated disk (/data2), no io.max (pilot: r 2.74 Qwen, 2.38 Gemma)
+Matrix per model: slow heavy (measured), slow light (light), medium heavy, fast heavy (measured). Arms C0 T T2 LM CT K
+K_ewma in the slow cells, K_km added in Qwen slow heavy; C0 T T2 LM K K_ewma in medium and fast (CT runs in the slow
+cells only, plan 5.2).
 
-Hosts: Nebius 1x RTX PRO 6000 (1gpu-24vcpu-218gb), uk-south2. Slow: the 2 TB network_ssd root disk with /data on it,
-the provider's cap (compat fio O_DIRECT 457 MiB/s read, 460 MiB/s write), no io.max. Medium: a 2.5 TB
-network_ssd_non_replicated data disk at /data2, with an io.max read cap so the regime is medium (at its nominal 2 GiB/s
-the compat inputs give r >= 2 and w < 0.5, i.e. fast, for both models).
+Pilot 2 cells (p2-*): C0 dry runs on the measured workload on the slow disk (they set every cell's hard cap), K and T
+on the fast disk (T's write rate at the new load is w's numerator), the Gemma arms not yet run (T2 LM CT K K_ewma)
+on the slow disk, the Gemma K disk-path test with stock vLLM's tier (T) as the reference (check_k_disk.py
+--reference-rows), and a C0 run for the engine-stall check.
 
-Fixed per cell: max-model-len 131,072 (both models boot there: compat boot_maxlen; Gemma's KV need for one request
-is 25.01 GB with or without a connector, capacities.json gpu_request_check), capacities from capacities.json (GPU and
-CPU per model, disk per workload; the kdisk cells take theirs from the kdisk manifest), CT_ETA of the model's
-measured workload, LMCache chunk 784 tokens on Qwen (the hybrid block; 256 is refused), kv_chunk_bytes the vLLM
-CPU tier's chunk (compat server logs: Qwen 16 GiB / 334 chunks, one 784-token block of 16 layers, 51,380,224 B;
-Gemma 32 GiB / 13,107 chunks, one 16-token block of a 10-layer group, 2,621,440 B), hard_cap_s 3x the workload's
-estimated C0 makespan (the builder's service-time estimate, est_makespan_s: no queueing), REPLAY_TIMEOUT the cap
-+ 600 s, the runner timeout 1,800 s more.
+Per cell: capacities from capacities.json (GPU and CPU per model, disk per workload; the kdisk cells from their
+manifest), CT_ETA of the model's measured workload, LMCache chunk 784 on Qwen, kv_chunk_bytes the vLLM CPU tier's
+chunk (Qwen 51,380,224 B, Gemma 2,621,440 B), hard_cap_s 1.5 x the workload's projected C0 makespan (manifest
+c0_projection, fit_service.py; replaced by the C0 dry run's makespan once it has run), REPLAY_TIMEOUT the cap + 600 s,
+the runner timeout 1,800 s more. Pilot JSON per model: tier bytes per token and prefill tok/s measured in pilot 1
+(micro, batch 8 at 8,192 tokens), arm RSS from pilot 1's telemetry (peak memory beyond the CPU tier and the page
+cache, rounded up with 1.5 GiB or more of headroom), and write-through's offered write rate per load: T's bytes
+written per unique token in pilot 1 (Qwen 1.403, Gemma 1.455 x tier bytes) x the workload's unique tokens / its
+projected C0 makespan (pilot 2's T arms on the fast disk measure it).
 
-PLACEHOLDER in the pilot JSONs (engine/phase_r/cells/pilot_MODEL_vllm.json), replaced by the pilot: arm RSS, sidecar
-RSS, prefill tok/s at each load (compat c8 rate at 8,192 tokens) and write-through's offered write rate (that prefill
-rate x the tier's measured bytes per token: write-through at full prefill, the compat check's convention), and the
-medium cells' io.max rate.
+Pilot 2 runs each arm as its own one-attempt block (cells/p2/CELL.NN.ARM.json, written beside each p2 cell), as pilot 1
+did.
 
 Usage: make_cells.py WORKLOAD_DIR [--out engine/phase_r/cells]
 """
 import argparse
 import json
+import math
 import os
 
 GiB = 1 << 30
 SEED = 20261010
-PLAN = "BENCH_PLAN draft 4.3 + coordinator's 2026-10-11 model change (freeze commit to fill)"
-NETWORK_SSD = dict(seq_read_Bps=478_779_802, seq_write_Bps=482_764_390, rand_read_Bps=475_844_198)  # compat fio, MiB/s x 2^20
-NRD_NOMINAL = dict(seq_read_Bps=2 * GiB, seq_write_Bps=2 * GiB, rand_read_Bps=2 * GiB)
-MEDIUM_RBPS = 1_000_000_000
+PLAN = "BENCH_PLAN draft 6 (2026-10-12; freeze commit to fill)"
+SLOW_IO_MAX = 210 * (1 << 20)          # 220,200,960 B/s
+# pilot 1 in-block probes (pilot.json regime): min(seq 4 MiB, random chunk) read; 4 MiB write
+NETWORK_SSD = dict(seq_read_Bps=449_519_063, seq_write_Bps=462_519_988, rand_read_Bps=500_137_467)
+NRD = dict(seq_read_Bps=2_041_400_456, seq_write_Bps=1_412_483_080, rand_read_Bps=2_141_000_000)
+WT_PER_TOKEN = {"qwen38_27b": 1.403, "gemma4_31b": 1.455}
 
 MODELS = {
     "qwen38_27b": dict(
         tag="qwen", hf="Qwen/Qwen3.8-27B-FP8", serve="--revision 017b9c7af6b5689d5dd426a76e0bc077eb5ca20a",
-        lm_chunk=784, chunk_bytes=51_380_224, tier_bpt=72_472, prefill=10_428.8, kkm_cell="slow-heavy"),
+        lm_chunk=784, chunk_bytes=51_380_224, tier_bpt=72_472, prefill=10_477.5, kkm_cell="slow-heavy",
+        rss=dict(vllm=7 * GiB, k=7 * GiB, sidecar=2 * GiB, lm_vllm=6 * GiB, lm_server=2 * GiB)),
     "gemma4_31b": dict(
         tag="gemma", hf="google/gemma-4-31B-it",
         serve='--revision 842da3794eaa0b77d5f08bae87a17459d91ff475 --quantization fp8 '
               '--limit-mm-per-prompt {"image":0,"audio":0,"video":0}',
-        lm_chunk=None, chunk_bytes=2_621_440, tier_bpt=131_714, prefill=6_515.2, kkm_cell=None),
+        lm_chunk=None, chunk_bytes=2_621_440, tier_bpt=131_714, prefill=6_526.2, kkm_cell=None,
+        rss=dict(vllm=9 * GiB, k=9 * GiB, sidecar=2 * GiB, lm_vllm=8 * GiB, lm_server=2 * GiB)),
 }
-ARMS = ["C0", "T", "T2", "LM", "CT", "K", "K_ewma"]
+SLOW_ARMS = ["C0", "T", "T2", "LM", "CT", "K", "K_ewma"]
+OTHER_ARMS = ["C0", "T", "T2", "LM", "K", "K_ewma"]
 T2_ENV = {"T2_MIN_HITS": "2", "T2_DECAY_S": "600", "T2_COUNT": "request"}   # tuned on the tuning workload later
 
 
-def pilot_json(name, m):
-    off = round(m["prefill"] * m["tier_bpt"])
-    rss = 16 * GiB
+def offered_write(key, man):
+    """write-through's average write rate on this workload at its projected C0 makespan, bytes/s"""
+    L, P = man["load"], man["c0_projection"]
+    return round(WT_PER_TOKEN[key] * L["unique_kv_tokens"] * MODELS[key]["tier_bpt"] / P["makespan_s"])
+
+
+def pilot_json(key, m, heavy, light):
+    r = m["rss"]
     return {
         "_comment": (
-            "PLACEHOLDER values for the dry runs until the pilot measures them (engine/phase_r/examples/"
-            "pilot_qwen3_8b_vllm.json documents each field). kv_bytes_per_token: the tier's measured bytes per token "
-            "(compat micro.json tier_measured, arm T); prefill_tok_s: compat c8 prefill at 8,192 tokens; "
-            "wt_offered_write_Bps: that prefill rate x kv_bytes_per_token (write-through at full prefill); RSS: 16 GiB "
-            "per vLLM arm, LMCache 15 + 4 GiB, sidecar 3 GiB, guesses."),
+            "Pilot 1 measurements (BENCH_PLAN draft 6, bench/phase_r/make_cells.py docstring). kv_bytes_per_token: "
+            "the disk tier's measured bytes per token; prefill_tok_s: micro batch 8 at 8,192 tokens; "
+            "wt_offered_write_Bps: T's measured bytes per unique token x the load's workload unique tokens / its "
+            "projected C0 makespan; RSS: pilot 1 peak beyond the CPU tier and the page cache (C0, T, T2, CT, PT about "
+            "5.2 to 6.9 GiB, K 7.2 to 7.4 GiB with the sidecar, LM 6.3 GiB beyond its L1) plus headroom; pilot 2 "
+            "re-measures each."),
         "model": m["hf"], "engine": "vllm", "kv_bytes_per_token": m["tier_bpt"],
-        "arm_rss_bytes": {**{x: rss for x in ("C0", "T", "T2", "PT", "CT", "K", "K_ewma", "K_km")},
-                          "LM": {"vllm": 15 * GiB, "lmcache_server": 4 * GiB}},
-        "sidecar_rss_bytes": 3 * GiB,
-        "loads": {"heavy": {"prefill_tok_s": m["prefill"], "wt_offered_write_Bps": off},
-                  "light": {"prefill_tok_s": m["prefill"], "wt_offered_write_Bps": off}},
+        "arm_rss_bytes": {**{x: r["vllm"] for x in ("C0", "T", "T2", "PT", "CT", "K_ewma", "K_km")}, "K": r["k"],
+                          "LM": {"vllm": r["lm_vllm"], "lmcache_server": r["lm_server"]}},
+        "sidecar_rss_bytes": r["sidecar"],
+        "loads": {"heavy": {"prefill_tok_s": m["prefill"], "wt_offered_write_Bps": heavy},
+                  "light": {"prefill_tok_s": m["prefill"], "wt_offered_write_Bps": light}},
     }
 
 
-def cell(name, m, man, caps, regime, load, wl, arms, ct_eta, extra=None, pilot_cell=False):
-    est = man["load"]["est_makespan_s"]
-    cap = int(round(3 * est))
+def disk(regime, c):
+    slot = {"cuda": "0", "port": 8000, "park_port": 28765, "cpus": "2-23", "mems": "0"}
+    if regime in ("slow", "medium"):
+        # one slot name for the network_ssd: the host's first unthrottled probe holds both settings to it
+        c["slots"] = [dict(slot, name="netssd", disk={"mount": "/data", "wipe": "fstrim"})]
+        c["dry_run"] = {"probe": dict(NETWORK_SSD)}
+        if regime == "slow":
+            c["io_max"] = {"rbps": str(SLOW_IO_MAX), "wbps": str(SLOW_IO_MAX)}
+            c["io_max_note"] = ("network_ssd throttled to 210 MiB/s read and write (BENCH_PLAN draft 6): r about 0.3 "
+                                "on both models at the pilot's prefill rates")
+            c["dry_run"]["throttled_probe"] = dict(seq_read_Bps=SLOW_IO_MAX, seq_write_Bps=SLOW_IO_MAX,
+                                                   rand_read_Bps=SLOW_IO_MAX)
+        else:
+            c["io_max_none_note"] = "network_ssd without io.max: medium if its measured r is 0.5 or more"
+    else:
+        c["slots"] = [dict(slot, name="nrd", disk={"mount": "/data2", "wipe": "fstrim"})]
+        c["dry_run"] = {"probe": dict(NRD)}
+
+
+def cell(name, key, man, caps, regime, load, wl, arms, ct_eta, cap_src, extra=None):
+    m = MODELS[key]
+    proj = man.get("c0_projection") or {}
+    mk = proj.get("makespan_s") or man["load"]["est_makespan_s"]
+    cap = int(math.ceil(1.5 * mk))
     env = {"REPLAY_TIMEOUT": str(cap + 600), "BOOT_WAIT": "360", "MAXLEN": "131072", "SERVE_ARGS": m["serve"]}
     if m["lm_chunk"]:
         env["LM_CHUNK"] = str(m["lm_chunk"])
@@ -89,15 +126,14 @@ def cell(name, m, man, caps, regime, load, wl, arms, ct_eta, extra=None, pilot_c
         A.append(a)
     c = {
         "_comment": (
-            f"Generated by bench/phase_r/make_cells.py (its docstring has every rule). Workload {wl}: sha256, "
-            f"sessions and turns from its manifest; capacities from capacities.json (GPU and CPU per model, disk per "
-            f"workload) or the kdisk manifest; hard_cap_s = 3 x est_makespan_s {est:g} s (builder estimate, no "
-            f"queueing). PLACEHOLDER: the pilot JSON's RSS, prefill and offered write; the medium io.max rate."),
+            f"Generated by bench/phase_r/make_cells.py (its docstring has every rule). Workload {wl}: sha256, sessions "
+            f"and turns from its manifest; capacities from {cap_src}; hard_cap_s = 1.5 x the projected C0 makespan "
+            f"{mk:g} s (fit_service.py), to be replaced by 1.5 x the C0 dry run's makespan."),
         "cell": name, "plan": PLAN, "seed": SEED, "engine": "vllm", "model": m["hf"], "regime": regime, "load": load,
-        "pilot": f"pilot_{m['key']}_vllm.json",
+        "pilot": f"pilot_{key}_vllm.json",
         "workload": {"path": f"/root/phase_r/{wl}.json", "sessions": man["load"]["sessions"],
                      "turns": man["load"]["turns"], "sha256": man["sha256"]},
-        "capacities": caps, "hard_cap_s": cap, "cgroup": {"slack_bytes": "256M"},
+        "capacities": caps, "hard_cap_s": cap, "projected_c0_makespan_s": mk, "cgroup": {"slack_bytes": "256M"},
         "kv_chunk_bytes": m["chunk_bytes"],
         "live_scoring": {"side_file": f"/root/phase_r/{wl}.side.jsonl", "ckpt": "/root/dwell/model.safetensors",
                          "calib": "/root/dwell/config.json"},
@@ -109,22 +145,7 @@ def cell(name, m, man, caps, regime, load, wl, arms, ct_eta, extra=None, pilot_c
         "fio": {"ioengine": "libaio", "size": "4G", "runtime_full": 30, "runtime_quick": 8},
         "max_block_attempts": 2, "arms": A,
     }
-    # one slot, named by its disk: the host's first fio probe is kept per host and slot name, and the slow and
-    # medium cells share a VM, so each disk is held to its own first probe
-    slot = {"cuda": "0", "port": 8000, "park_port": 28765, "cpus": "2-23", "mems": "0"}
-    if regime == "slow":
-        c["slots"] = [dict(slot, name="netssd", disk={"mount": "/data", "wipe": "fstrim"})]
-        c["io_max_none_reason"] = ("real Nebius network_ssd: the 2 TB root disk with /data on it, provider cap about "
-                                   "450 MiB/s (compat fio O_DIRECT 457 MiB/s read, 460 MiB/s write)")
-        c["dry_run"] = {"probe": dict(NETWORK_SSD)}
-    else:
-        c["slots"] = [dict(slot, name="nrd", disk={"mount": "/data2", "wipe": "fstrim"})]
-        c["io_max"] = {"rbps": str(MEDIUM_RBPS)}
-        c["io_max_note"] = ("PLACEHOLDER read cap: the 2.5 TB network_ssd_non_replicated disk at its nominal 2 GiB/s "
-                            "gives r >= 2 and w < 0.5 (fast) on the compat inputs; 1 GB/s gives r 1.32 (Qwen) and 1.17 "
-                            "(Gemma), w 0.35 and 0.40: medium. The pilot sets it from orchestrate.py regime bounds.")
-        c["dry_run"] = {"probe": dict(NRD_NOMINAL),
-                        "throttled_probe": dict(NRD_NOMINAL, seq_read_Bps=MEDIUM_RBPS, rand_read_Bps=MEDIUM_RBPS)}
+    disk(regime, c)
     if extra:
         c.update(extra)
     return c
@@ -144,48 +165,69 @@ def main():
 
     def put(name, obj):
         p = os.path.join(out, name)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
         with open(p, "w") as f:
             json.dump(obj, f, indent=1)
             f.write("\n")
         written.append(p)
+        if name.startswith("p2-"):
+            # pilot 2 runs each arm as its own one-attempt block, as pilot 1 did, so one exclusion stops nothing else
+            for i, arm in enumerate(obj["arms"], 1):
+                put(os.path.join("p2", f"{obj['cell']}.{i:02d}.{arm['label']}.json"),
+                    dict(obj, arms=[arm], max_block_attempts=1, pilot="../" + obj["pilot"]))
 
     for key, m in MODELS.items():
-        m["key"] = key
         mc = C["models"][key]
         eta = C["workloads"][f"{key}.measured"]["ct_eta"]
-        put(f"pilot_{key}_vllm.json", pilot_json(key, m))
+        put(f"pilot_{key}_vllm.json", pilot_json(key, m, offered_write(key, man(f"{key}.measured")),
+                                                 offered_write(key, man(f"{key}.light"))))
         caps = lambda wl: {"gpu_kv_bytes": str(mc["gpu_kv_bytes"]), "cpu_bytes": str(mc["cpu_bytes"]),   # noqa: E731
                            "disk_bytes": str(C["workloads"][wl]["disk_bytes"])}
-        for regime, load, wlk in (("slow", "heavy", "measured"), ("slow", "light", "light"), ("medium", "heavy", "measured")):
+        src = "capacities.json (GPU and CPU per model, disk per workload)"
+        for regime, load, wlk in (("slow", "heavy", "measured"), ("slow", "light", "light"),
+                                  ("medium", "heavy", "measured"), ("fast", "heavy", "measured")):
             wl = f"{key}.{wlk}"
-            arms = ARMS + (["K_km"] if m["kkm_cell"] == f"{regime}-{load}" else [])
+            arms = (SLOW_ARMS if regime == "slow" else OTHER_ARMS) + (
+                ["K_km"] if m["kkm_cell"] == f"{regime}-{load}" else [])
             name = f"{m['tag']}-{regime}-{load}"
-            put(f"{name}.json", cell(name, m, man(wl), caps(wl), regime, load, wl, arms, eta))
+            put(f"{name}.json", cell(name, key, man(wl), caps(wl), regime, load, wl, arms, eta, src))
+        # pilot 2
+        wl = f"{key}.measured"
+        put(f"p2-{m['tag']}-c0dry.json", cell(f"p2-{m['tag']}-c0dry", key, man(wl), caps(wl), "slow", "heavy", wl,
+                                              ["C0"], eta, src))
         wl = f"{key}.pilot"
-        parms = ARMS + ["PT"] + (["K_km"] if m["kkm_cell"] else [])
-        put(f"pilot-{m['tag']}-slow.json", cell(f"pilot-{m['tag']}-slow", m, man(wl), caps(wl), "slow", "heavy", wl,
-                                               parms, eta))
-        put(f"pilot-{m['tag']}-medium.json", cell(f"pilot-{m['tag']}-medium", m, man(wl), caps(wl), "medium", "heavy",
-                                                 wl, ["C0", "T", "K"], eta))
+        put(f"p2-{m['tag']}-fast.json", cell(f"p2-{m['tag']}-fast", key, man(wl), caps(wl), "fast", "heavy", wl,
+                                             ["T", "K"], eta, src))
+        if key == "gemma4_31b":
+            put(f"p2-{m['tag']}-slow.json", cell(f"p2-{m['tag']}-slow", key, man(wl), caps(wl), "slow", "heavy", wl,
+                                                 ["T2", "LM", "CT", "K", "K_ewma"], eta, src))
         wl = f"{key}.kdisk"
         km = man(wl)
         kc = km["capacities"]
         kcaps = {"gpu_kv_bytes": str(kc["gpu_kv_bytes"]), "cpu_bytes": str(kc["cpu_bytes"]), "disk_bytes": str(kc["disk_bytes"])}
-        kd = cell(f"pilot-{m['tag']}-kdisk", m, km, kcaps, "slow", "heavy", wl, ["C0", "K"], eta, extra={
-            "pass": {
-                "criterion": ("K: the rule chose ins or park (park_live counts), wrote chunks (disk.chunks_on_disk or "
-                              "written_jobs > 0), restored from disk on at least one turn that ran alone (replay "
-                              "--verify-disk: the disk tier's read bytes rose during the turn) and every such turn's "
-                              "greedy output equals a cold recompute of the same prompt (fresh cache_salt)"),
-                "command": "python3 engine/phase_r/check_k_disk.py --rows CELL.K.HOST.jsonl --park-live "
-                           "CELL.K.HOST.park_live.json --min-verified 1",
-                "capacity_rule": (f"CPU tier {kc['cpu_bytes']} B = 1.5 x the largest session's tier bytes, "
-                                  f"{kc['cpu_over_peak_tier_bytes']} of the peak live tier bytes (the measured cells hold "
-                                  f"0.4 P); GPU KV the model's cell value")}})
-        for x in kd["arms"]:
-            if x["label"] == "K":
-                x["env"] = {"REPLAY_EXTRA": "--verify-disk 20"}
-        put(f"pilot-{m['tag']}-kdisk.json", kd)
+        km = dict(km, c0_projection={"makespan_s": km["load"]["est_makespan_s"]})
+        if key == "gemma4_31b":
+            kd = cell(f"p2-{m['tag']}-kdisk", key, km, kcaps, "slow", "heavy", wl, ["T", "K"], eta,
+                      "the kdisk manifest", extra={
+                          "pass": {
+                              "criterion": (
+                                  "K: the rule chose ins or park, wrote chunks, restored from disk on verified turns "
+                                  "(replay --verify-disk), and its share of verified turns whose greedy output differs "
+                                  "from a cold recompute is not above stock vLLM's (arm T, its own disk tier, same "
+                                  "workload and probe) at one-sided Fisher exact p < 0.05 (BENCH_PLAN draft 6)"),
+                              "command": "python3 engine/phase_r/check_k_disk.py --rows CELL.K.HOST.jsonl --park-live "
+                                         "CELL.K.HOST.park_live.json --min-verified 10 --reference-rows CELL.T.HOST.jsonl",
+                              "capacity_rule": (f"CPU tier {kc['cpu_bytes']} B = 1.5 x the largest session's tier "
+                                                f"bytes, {kc['cpu_over_peak_tier_bytes']} of the peak live tier bytes")}})
+            for x in kd["arms"]:
+                x["env"] = dict(x.get("env", {}), REPLAY_EXTRA="--verify-disk 20")
+            put(f"p2-{m['tag']}-kdisk.json", kd)
+        else:
+            # engine-stall check (50780f4): C0 on the short kdisk workload, its engine stopped for 330 s mid-replay
+            put(f"p2-{m['tag']}-stall.json", cell(f"p2-{m['tag']}-stall", key, km, kcaps, "slow", "heavy", wl, ["C0"],
+                                                  eta, "the kdisk manifest", extra={
+                "stall_check": ("PILOT2_PLAN.md job 3: SIGSTOP the engine for 330 s after replay_start + 120 s; the "
+                                "verdict must exclude the arm as an engine stall (health.py engine_stall_s 300)")}))
     for p in written:
         print(p)
 
