@@ -8,8 +8,8 @@ rule) grows with --max-num-batched-tokens C. For each measured C this script:
      printed beside vLLM's own figure (pool / "Maximum concurrency" at the cells' 18.65 GB pool, --vllm-concurrency)
   2. the C0 service model at C: the microbenchmark at C (micro_cC.json: prefill and TPOT on the pilot-2 VM),
      scaled by the KP and KD refitted on the measured Gemma C0 runs with the corrected reserve (--fit)
-  3. the drained load at C: the measured partition's candidates (build_workloads.py --dump-candidates), the session
-     count whose projected C0 mean requests in flight is closest to --target, each count projected at the capacities
+  3. the drained load at C: the measured partition's candidates (build_workloads.py --dump-candidates), the largest
+     session count whose projected C0 resumed turns are admitted on arrival at the median, each count projected at the capacities
      of its own P (BENCH_PLAN draft 6.1 rule: GPU max(0.15 P, floor), CPU 0.55 P - GPU, at least 0.05 P and 1.5
      max-length contexts), the builder's search (build_workloads.assemble_inflight)
 Rule (the plan's pre-registered GPU share): the largest C whose floor(C) <= 0.15 P(C). Writes --out JSON.
@@ -28,29 +28,33 @@ from sim_sizing import cpu_min_bytes, load_fit, project_at_rule, req_reserve_byt
 
 
 def drained(C, fit, kv, floor, rule, target, end_cap):
+    """The builder's drained-load search (build_workloads.assemble_drained): the largest count whose projected C0
+    resumed turns are admitted on arrival at the median."""
     memo = {}
 
     def at(n):
         if n not in memo:
             memo[n] = project_at_rule([dict(x) for x in C[:n]], fit, end_cap, kv, floor, rule)
             st = memo[n][3]
-            print(f"    n {n}: in flight {st['mean_inflight']}, P {st['peak_live_kv_bytes'] / 1e9:.1f} GB, "
-                  f"C0 p50 {st['resumed_ttft_p50_s']} s, recompute {st['recompute_share']}", flush=True)
+            print(f"    n {n}: queue p50 {st['resumed_queue_p50_s']} s, in flight {st['mean_inflight']}, "
+                  f"P {st['peak_live_kv_bytes'] / 1e9:.1f} GB, C0 p50 {st['resumed_ttft_p50_s']} s, "
+                  f"recompute {st['recompute_share']}", flush=True)
         return memo[n]
 
-    lo, hi = 0, 4
-    while hi < len(C) and at(hi)[3]["mean_inflight"] < target:
+    ok = lambda n: (at(n)[3]["resumed_queue_p50_s"] or 0.0) <= 0.0   # noqa: E731
+    lo, hi = 1, 2
+    while hi < len(C) and ok(hi):
         lo, hi = hi, min(len(C), hi * 2)
+    if ok(hi):
+        lo = hi
     while hi - lo > 1:
         mid = (lo + hi) // 2
-        if at(mid)[3]["mean_inflight"] >= target:
-            hi = mid
-        else:
+        if ok(mid):
             lo = mid
-    if lo > 0 and target - at(lo)[3]["mean_inflight"] < at(hi)[3]["mean_inflight"] - target:
-        hi = lo
-    _, _, _, st, caps = at(hi)
-    return hi, st, caps
+        else:
+            hi = mid
+    _, _, _, st, caps = at(lo)
+    return lo, st, caps
 
 
 def main():

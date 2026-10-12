@@ -49,8 +49,9 @@ runs): the sizing runs on projected C0 timelines instead of the per-turn estimat
 fitted simulator, closed loop, at the workload's own load) is within --end-cap seconds of the run start (tuning stages:
 5/6 of the stage length); sessions are added in partition order until the projected peak live KV reaches the target
 (the smallest such prefix; the projection is redone for each candidate count). The manifest records the projected C0
-makespan, mean requests in flight and resumed-turn TTFT. With --size-by-inflight F (the drained load): the measured
-workload takes the session count whose projected C0 mean requests in flight is closest to F, projected at the
+makespan, mean requests in flight and resumed-turn TTFT. With --size-drained (the drained load): the measured
+workload takes the largest session count whose projected C0 resumed turns are admitted on arrival at the median
+(resumed-turn queue wait median 0), projected at the
 capacities of its own peak live KV P (GPU KV max(1.1 x the GPU request bytes, 0.15 P), CPU tier 0.55 P minus the GPU KV,
 at least 0.05 P and at least 1.5 max-length contexts at the tier's bytes per token); every other workload is sized to that P (extras to their multiple) and projected at those
 capacities. --dump-candidates DIR writes each partition's ordered
@@ -133,10 +134,11 @@ ap.add_argument("--service-fit", action="append", default=[], help="NAME=FIT.jso
 ap.add_argument("--end-cap", type=float, default=3000.0, help="with --service-fit: cut each session where its "
                 "projected C0 end passes this many seconds after the run start")
 ap.add_argument("--dump-candidates", help="with --service-fit: write DIR/MODEL.PARTITION.candidates.json and stop")
-ap.add_argument("--size-by-inflight", type=float, help="with --service-fit (BENCH_PLAN draft 6, drained load): the "
-                "measured workload takes the smallest number of sessions whose projected C0 mean requests in flight "
-                "reaches this, at the capacities of its own peak live KV P (sim_sizing.capacities: GPU max(1.1 x the "
-                "GPU request bytes, --gpu-share P), CPU --fast-total P minus GPU, at least --cpu-floor P); every other "
+ap.add_argument("--size-drained", action="store_true", help="with --service-fit (BENCH_PLAN draft 6.1, drained load): "
+                "the measured workload takes the largest number of sessions whose projected C0 resumed turns wait no "
+                "time in the queue at the median (resumed_queue_p50_s 0: admitted on arrival), at the capacities of "
+                "its own peak live KV P (sim_sizing.capacities: GPU max(1.1 x the GPU request bytes, --gpu-share P), "
+                "CPU --fast-total P minus GPU, at least --cpu-floor P and 1.5 max-length contexts); every other "
                 "workload is sized to that P (extras to their multiple of it) at those capacities")
 ap.add_argument("--gpu-share", type=float, default=0.15)
 ap.add_argument("--fast-total", type=float, default=0.55)
@@ -401,9 +403,11 @@ def sim_out(M, name, C, S, rows, rounds, st, hi, reached, peak, fit, end_cap, wi
     return sessions, refs, proj
 
 
-def assemble_inflight(M, name, items, window, end_cap, build_turns, target, rule):
-    """The prefix of the candidates whose projected C0 mean requests in flight is closest to target (the two counts
-    around it), each projected at the capacities of its own peak live KV (sim_sizing.project_at_rule)."""
+def assemble_drained(M, name, items, window, end_cap, build_turns, rule):
+    """The longest prefix of the candidates whose projected C0 resumed turns are admitted on arrival at the median
+    (resumed_queue_p50_s 0), each count projected at the capacities of its own peak live KV
+    (sim_sizing.project_at_rule). Mean requests in flight counts waiting requests too, so it is no drain criterion
+    for an engine that serves one or two long requests at a time (pilot 2, 2026-10-12)."""
     fit = FITS[M["name"]]
     C = candidates(M, name, items, window, build_turns)
     floor = 1.1 * M["kv"]["gpu_request_bytes"]
@@ -417,20 +421,24 @@ def assemble_inflight(M, name, items, window, end_cap, build_turns, target, rule
                   f"C0 p50 {st['resumed_ttft_p50_s']} s, recompute {st['recompute_share']}", flush=True)
         return memo[n]
 
-    lo, hi = 0, 4
-    while hi < len(C) and at(hi)[3]["mean_inflight"] < target:
+    drained = lambda n: (at(n)[3]["resumed_queue_p50_s"] or 0.0) <= 0.0   # noqa: E731
+    lo, hi = 1, 2                                # lo drains, hi does not
+    if not drained(lo):
+        raise SystemExit(f"{name}: one session already queues at the median")
+    while hi < len(C) and drained(hi):
         lo, hi = hi, min(len(C), hi * 2)
+    if drained(hi):
+        lo = hi
     while hi - lo > 1:
         mid = (lo + hi) // 2
-        if at(mid)[3]["mean_inflight"] >= target:
-            hi = mid
-        else:
+        if drained(mid):
             lo = mid
-    if lo > 0 and target - at(lo)[3]["mean_inflight"] < at(hi)[3]["mean_inflight"] - target:
-        hi = lo                                  # the count whose in-flight is closest to the target
-    S, rows, rounds, st, caps = at(hi)
-    out = sim_out(M, name, C, S, rows, rounds, st, hi, True, None, fit, end_cap, window, caps)
-    out[2]["target_mean_inflight"] = target
+        else:
+            hi = mid
+    S, rows, rounds, st, caps = at(lo)
+    out = sim_out(M, name, C, S, rows, rounds, st, lo, True, None, fit, end_cap, window, caps)
+    out[2]["drain_rule"] = "largest count with projected C0 resumed-turn queue wait median 0"
+    out[2]["first_count_that_queues"] = None if lo == hi else hi
     return out
 
 
@@ -577,9 +585,9 @@ def write(M, name, sessions, refs, extra, proj=None):
                               turns_in_source=s["_turns_src"], cut_at_duration=s["_cut"]) for s in sessions])
     if proj is not None:
         man["c0_projection"] = proj
-        man["sizing"] = dict(man["sizing"], by=(f"projected C0 mean requests in flight {a.size_by_inflight:g} (measured) "
+        man["sizing"] = dict(man["sizing"], by=("projected C0 resumed turns admitted on arrival at the median (measured) "
                                                 "and its peak live KV (the rest), capacities of that P"
-                                                if a.size_by_inflight else
+                                                if a.size_drained else
                                                 "peak live KV bytes on the projected C0 timeline (fit_service.py)"),
                              session_cap_s=None, end_cap_s=proj["end_cap_s"], start_window_s=proj["start_window_s"])
     put_json(os.path.join(a.out, f"{name}.manifest.json"), man, indent=1)
@@ -623,14 +631,13 @@ for M in models:
         print(M["name"], f"heavy P target {P_heavy / 1e9:.2f} GB", flush=True)
     SIM = M["name"] in FITS
     CAPS, MEAS = None, None
-    if SIM and a.size_by_inflight and not a.dump_candidates:
-        # drained load: the measured workload first, by C0's mean requests in flight; its P and capacities size the rest
+    if SIM and a.size_drained and not a.dump_candidates:
+        # drained load: the measured workload first, by C0's queue wait; its P and capacities size the rest
         items = [(src, sess, unit, pool[src][sess]) for src, (sess, unit) in
                  interleave([[(s, x) for x in order["measured"][s]] for s in SRC])]
         rule = dict(gpu_share=a.gpu_share, fast_total=a.fast_total, cpu_floor=a.cpu_floor,
                     cpu_min=cpu_min_bytes(M["kv"], M["cap"]))
-        MEAS = assemble_inflight(M, f"{M['name']}.measured", items, a.duration, a.end_cap, turns_feat,
-                                 a.size_by_inflight, rule)
+        MEAS = assemble_drained(M, f"{M['name']}.measured", items, a.duration, a.end_cap, turns_feat, rule)
         CAPS = MEAS[2]["capacities"]
         P_heavy = MEAS[2]["peak_live_kv_bytes"]
         print(M["name"], "drained load: P", f"{P_heavy / 1e9:.2f} GB", json.dumps(CAPS), flush=True)
