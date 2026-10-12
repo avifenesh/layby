@@ -76,7 +76,7 @@ def build(n_chunks, root):
     conn = object.__new__(C.ParkConnector)
     conn.connector_scheduler, conn.connector_worker = cs, None
     conn.__dict__["_bounding_group_ids"] = ()          # every group is offloaded: no bound on the load
-    conn._waiting, conn._deferred, conn._local, conn._giveups = {}, {}, {}, {}
+    conn._waiting, conn._deferred, conn._local, conn._giveups, conn._holding = {}, {}, {}, {}, {}
     conn._loads, conn._finished, conn._early, conn._hints_on = {}, {}, {}, False
     return conn, cs, mgr, prim, fs, prim._policy
 
