@@ -633,8 +633,26 @@ class Block:
             os.makedirs(armdir, exist_ok=True)
             prefix = f"{c['cell']}.{arm['label']}.{self.host}"
             quick = self.probe_raw(s, "quick")
+            quick_tries = [_strip(quick)] if quick is not None else []
+            # NRD reads swing about 7% between arms and dip up to 20% right after a heavy write (pilot 2: 1,638 to
+            # 2,111 MB/s over 13 probes; network_ssd 449 to 461): a read off the first probe is probed again after a
+            # pause, up to fio_retries times, before the health check judges the last one (PILOT2_PLAN: "repeat
+            # the probe once")
+            first_bps = (first.get(s["name"]) or {}).get("seq_read_Bps")
+            tol = c["health"].get("fio_tolerance", 0.10)
+            for _ in range(int(c["health"].get("fio_retries", 2))):
+                got = (quick or {}).get("seq_read_Bps")
+                if quick is None or not first_bps or (got is not None and abs(got - first_bps) / first_bps <= tol):
+                    break
+                log(f"{s['name']}: quick read {got} B/s vs first {first_bps}: probing again in "
+                    f"{c['health'].get('fio_retry_wait_s', 90)} s")
+                if not rn.dry:
+                    time.sleep(float(c["health"].get("fio_retry_wait_s", 90)))
+                quick = self.probe_raw(s, "quick")
+                quick_tries.append(_strip(quick))
             notes = wipe(rn, c, s, self.devs.get(s["name"]))
-            ctx.append({"slot": s, "arm": arm, "dir": armdir, "prefix": prefix, "quick": quick, "notes": notes})
+            ctx.append({"slot": s, "arm": arm, "dir": armdir, "prefix": prefix, "quick": quick, "notes": notes,
+                        "quick_tries": quick_tries})
         drop_caches(rn)
         round_budget = 0
         for x in ctx:
@@ -673,7 +691,8 @@ class Block:
                 if want and (got is None or abs(got - want) / want > c["health"].get("fio_tolerance", 0.10)):
                     bad.append({"check": "io_max", "host_level": True,
                                 "detail": f"throttled read {got} B/s vs io.max rbps {want}"})
-            x["health"] = {"gpu": g, "gpu_procs": procs, "quick_probe": _strip(x["quick"]), "throttled": _strip(t),
+            x["health"] = {"gpu": g, "gpu_procs": procs, "quick_probe": _strip(x["quick"]), "quick_tries": x["quick_tries"],
+                           "throttled": _strip(t),
                            "mem_available": mem, "round_budget": round_budget, "workload": wl, "sglang_patch": patch,
                            "wipe_notes": x["notes"], "failures": bad}
             dump(os.path.join(x["dir"], f"{x['prefix']}.health.json"), x["health"])

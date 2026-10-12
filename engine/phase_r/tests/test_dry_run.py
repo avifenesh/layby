@@ -169,6 +169,42 @@ class DryRun(unittest.TestCase):
         h = [json.loads(x) for x in open(os.path.join(self.out, "runs.jsonl"))]
         self.assertEqual(h[0]["status"], "health_failed")
 
+    def test_fio_dip_is_probed_again_before_it_counts(self):
+        # pilot 2: NRD reads dip up to 20% right after a heavy write and recover on the next probe; a quick read off the
+        # first probe is probed again (fio_retries) and only the last read is judged
+        hosts = os.path.join(self.out, "hosts", "h1")
+        os.makedirs(hosts)
+        json.dump({"seq_read_Bps": 3.6e9}, open(os.path.join(hosts, "first_probe.A.json"), "w"))
+        cls = next(v for v in vars(orchestrate).values() if isinstance(v, type) and hasattr(v, "probe_raw"))
+        real = cls.probe_raw
+
+        def run_with(quick_reads):
+            reads = iter(quick_reads)
+
+            def fake(self, slot, kind):
+                p = real(self, slot, kind)
+                if kind == "quick" and p is not None:
+                    p = dict(p, seq_read_Bps=next(reads, quick_reads[-1]))
+                return p
+            cls.probe_raw = fake
+            try:
+                cell = self.cell("cell_main_vllm_slow_heavy.json", health={"fio_retry_wait_s": 0})
+                return run(["run", "--cell", cell, "--host", "h1", "--out", self.out, "--dry-run"])
+            finally:
+                cls.probe_raw = real
+        rc, out = run_with([2.9e9, 3.55e9])          # -19%, then -1%
+        self.assertEqual(rc, orchestrate.EXIT_OK)
+        import glob
+        h = json.load(open(sorted(glob.glob(os.path.join(self.out, "**", "*.health.json"),
+                                            recursive=True))[0]))
+        self.assertEqual([round(x["seq_read_Bps"] / 1e9, 2) for x in h["quick_tries"]], [2.9, 3.55])
+        for d in os.listdir(self.out):
+            if d != "hosts":
+                p = os.path.join(self.out, d)
+                shutil.rmtree(p) if os.path.isdir(p) else os.remove(p)
+        rc, _ = run_with([2.9e9])                     # stays low: a host fault, as before
+        self.assertEqual(rc, orchestrate.EXIT_HOST_FAULT)
+
     def test_aa_mode(self):
         rc, _ = run(["run", "--cell", self.cell("cell_main_vllm_slow_heavy.json"), "--aa", "C0", "--host", "h1",
                      "--out", self.out, "--dry-run"])
