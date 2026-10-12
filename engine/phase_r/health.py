@@ -355,7 +355,11 @@ def verdict(*, markers, cg_before, cg_after, tel_rows, cg_name, gpu_rows, runner
         lim = s["page_cache_max_bytes"]
         if cached and not ram_tier and max(cached) > lim:
             reasons.append(f"page cache: tier cached {max(cached) / MiB:.0f} MiB > {lim / MiB:.0f} MiB in the window")
-        if filec and max(filec) > lim:
+        # BENCH_PLAN 5: tier cachestat, or (no tier to measure) the cgroup's unmapped non-shmem file pages. With a tier,
+        # the cgroup figure is a covariate: pilot 2 traced its growth to filesystem metadata (about 6 KB of block-device
+        # cache per tier file: Gemma's 2.6 MB chunks, 56,000 files in one arm) and lazily loaded library code, with
+        # the tier's own pages at 0 to 4 KiB.
+        if filec and not cached and max(filec) > lim:
             reasons.append(f"page cache: cgroup file (unmapped, non-shmem) {max(filec) / MiB:.0f} MiB > "
                            f"{lim / MiB:.0f} MiB in the window")
     return {"valid": not reasons, "reasons": reasons, "covariates": cov}

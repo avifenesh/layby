@@ -172,11 +172,12 @@ class AfterArm(unittest.TestCase):
 
     def test_page_cache_over_the_slack_in_the_window(self):
         M = 1 << 20
-        def rows(cached=0, file=0, shmem=0, at=T0 + 500):
+        def rows(cached=0, file=0, shmem=0, at=T0 + 500, tier=True):
             out = tel()
             for r in out:
                 inwin = abs(r["t"] - at) < 6
-                r["tier"] = {"K": {"files": 1, "bytes": 0, "cached": cached if inwin else 0, "dirty": 0}}
+                if tier:
+                    r["tier"] = {"K": {"files": 1, "bytes": 0, "cached": cached if inwin else 0, "dirty": 0}}
                 r["cg"]["K"]["memory.stat"] = {"file": (file if inwin else 0) + shmem, "shmem": shmem}
             return out
         self.assertTrue(verdict(tel_rows=rows(cached=256 * M))["valid"])
@@ -184,15 +185,21 @@ class AfterArm(unittest.TestCase):
         self.assertFalse(v["valid"])
         self.assertIn("tier cached", v["reasons"][0])
         self.assertEqual(v["covariates"]["page_cache"]["tier_cached_max"], 257 * M)
-        v = verdict(tel_rows=rows(file=300 * M))
+        # no tier to measure: the cgroup's unmapped non-shmem file pages decide
+        v = verdict(tel_rows=rows(file=300 * M, tier=False))
         self.assertFalse(v["valid"])
         self.assertIn("cgroup file", v["reasons"][0])
+        # a measured tier with its pages out of the cache: the cgroup figure (pilot 2: filesystem metadata of
+        # 56,000 tier files, lazily loaded library code) is a covariate
+        v = verdict(tel_rows=rows(file=300 * M))
+        self.assertTrue(v["valid"])
+        self.assertEqual(v["covariates"]["page_cache"]["cg_file_nonshmem_max"], 300 * M)
         # the pinned CPU tier in /dev/shm (and a tmpfs tier) is shmem, not page-cache slack
-        self.assertTrue(verdict(tel_rows=rows(file=100 * M, shmem=28 * GiB))["valid"])
+        self.assertTrue(verdict(tel_rows=rows(file=100 * M, shmem=28 * GiB, tier=False))["valid"])
         # mapped pages (libraries, about 370 MiB in the 2026-10-11 pilot, plus the mapped shmem tier) are logged as
         # file_mapped and do not count; unmapped cache above the slack still does
         def mapped(file, libs):
-            out = rows(file=file, shmem=28 * GiB)
+            out = rows(file=file, shmem=28 * GiB, tier=False)
             for r in out:
                 r["cg"]["K"]["memory.stat"]["file_mapped"] = 28 * GiB + libs
             return out
