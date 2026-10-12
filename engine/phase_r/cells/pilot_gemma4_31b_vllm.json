@@ -20,12 +20,12 @@
  "sidecar_rss_bytes": 2147483648,
  "loads": {
   "heavy": {
-   "prefill_tok_s": 6526.2,
-   "wt_offered_write_Bps": 77291064
+   "prefill_tok_s": 6201.4,
+   "wt_offered_write_Bps": 38057902
   },
   "light": {
-   "prefill_tok_s": 6526.2,
-   "wt_offered_write_Bps": 51468322
+   "prefill_tok_s": 6201.4,
+   "wt_offered_write_Bps": 17608186
   }
  }
 }
