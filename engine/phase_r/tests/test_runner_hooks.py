@@ -61,12 +61,19 @@ with open(out, "w") as f:
 """
 
 
+_given = set()
+
+
 def free_port():
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    p = s.getsockname()[1]
-    s.close()
-    return p
+    # each call closes its socket, so the kernel can hand the same port out twice; LMCache also binds LM_PORT + 100
+    while True:
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        p = s.getsockname()[1]
+        s.close()
+        if not _given & {p, p - 100, p + 100}:
+            _given.add(p)
+            return p
 
 
 class RunnerHooks(unittest.TestCase):
