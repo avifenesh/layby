@@ -189,10 +189,37 @@ class AfterArm(unittest.TestCase):
         self.assertIn("cgroup file", v["reasons"][0])
         # the pinned CPU tier in /dev/shm (and a tmpfs tier) is shmem, not page-cache slack
         self.assertTrue(verdict(tel_rows=rows(file=100 * M, shmem=28 * GiB))["valid"])
+        # mapped pages (libraries, about 370 MiB in the 2026-10-11 pilot, plus the mapped shmem tier) are logged as
+        # file_mapped and do not count; unmapped cache above the slack still does
+        def mapped(file, libs):
+            out = rows(file=file, shmem=28 * GiB)
+            for r in out:
+                r["cg"]["K"]["memory.stat"]["file_mapped"] = 28 * GiB + libs
+            return out
+        self.assertTrue(verdict(tel_rows=mapped(370 * M, 370 * M))["valid"])
+        v = verdict(tel_rows=mapped(370 * M + 300 * M, 370 * M))
+        self.assertFalse(v["valid"])
+        self.assertEqual(v["covariates"]["page_cache"]["cg_file_nonshmem_max"], 300 * M)
         # outside the replay window (boot: loading the weights) it does not count
         self.assertTrue(verdict(tel_rows=rows(cached=2 * GiB, file=2 * GiB, at=T0 - 50))["valid"])
         # a RAM tier's cached pages are the tier itself
         self.assertTrue(verdict(tel_rows=rows(cached=8 * GiB), ram_tier=True)["valid"])
+
+    def test_engine_stall_with_requests_in_flight(self):
+        # 2026-10-11 pilot, arm CT: the engine stopped scheduling at 2,394 s (15 waiting, 0 running, GPU idle) and
+        # /health kept answering, so nothing excluded it; the replay censored every later turn at the cap.
+        def run(last_done, wall=3600.0, idle_gap=False):
+            turns = [{"session": "s", "turn": i, "sent": 10.0 * i, "ttft": 1.0, "e2e": 2.0}
+                     for i in range(int(last_done // 10))]
+            turns.append({"session": "t", "turn": 0, "ttft": float("inf"), "e2e": float("inf"), "censored": True})
+            conc = [[0.0, 1], [last_done + 1, 0 if idle_gap else 3], [wall - 0.5, 0]]
+            return turns + [{"concurrency_series": conc}, {"wall_s": wall}]
+        v = verdict(turn_rows=run(2390.0))
+        self.assertFalse(v["valid"])
+        self.assertIn("engine stall", " ".join(v["reasons"]))
+        self.assertGreater(v["covariates"]["stall_max_s"], 1000)
+        self.assertTrue(verdict(turn_rows=run(3500.0))["valid"])          # a 100 s quiet stretch is not a stall
+        self.assertTrue(verdict(turn_rows=run(2390.0, idle_gap=True))["valid"])   # nothing in flight: idle
 
     def test_vllm_odirect_fallback(self):
         log = "WARNING O_DIRECT is not supported at '/mnt/x'; falling back to buffered I/O"

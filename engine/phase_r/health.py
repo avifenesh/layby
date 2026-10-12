@@ -24,8 +24,12 @@ After the arm (on the replay window, cut by the runner's replay_start and replay
   - disk tier over capacity: the tier directory's size (telemetry samples and the runner's du after the replay) above
     the cell's disk-tier bytes (vLLM's fs tier has no bound of its own, so this is how the 2 P capacity holds)
   - page-cache slack used: in the replay window, the disk tier's cached bytes (cachestat; not for a RAM tier, whose
-    pages are the tier) or the cgroup's page cache (memory.stat file minus shmem: the pinned CPU tier in /dev/shm and a
-    tmpfs tier are shmem) above page_cache_max_bytes (256 MiB, the budget's slack); the maxima are reported per arm
+    pages are the tier) or the cgroup's unmapped page cache (memory.stat file minus max(shmem, file_mapped): the
+    pinned CPU tier in /dev/shm and a tmpfs tier are shmem, and mapped pages are the libraries and the mapped shmem
+    tier, logged as file_mapped) above page_cache_max_bytes (256 MiB, the budget's slack); the maxima are reported
+    per arm. The weights' clean cache from loading is reclaimed at replay_start (arm_hook.sh), before the window
+  - engine stall: requests in flight and no first token or completion for engine_stall_s (300 s) or more in the
+    replay (the engine hung while /health still answered); counted as an engine crash
 Covariates logged: SM clock per GPU (median and min in the window), software power-cap time, max temperature, io PSI,
 the tier's peak size, the page-cache maxima, the connection-failure fraction.
 """
@@ -50,7 +54,8 @@ GPU_FIELDS = ["timestamp", "index", "clocks.sm", "clocks.mem", "clocks.max.sm", 
 COUNTER_FIELDS = ["clocks_event_reasons_counters." + c for c in
                   ("sw_power_cap", "sw_thermal_slowdown", "hw_thermal_slowdown", "hw_power_brake_slowdown")]
 DEFAULTS = {"fio_tolerance": 0.10, "free_mem_margin_bytes": 8 * GiB, "psi_full_max_frac": 0.01,
-            "psi_resources": ["memory"], "conn_fail_max_frac": 0.005, "page_cache_max_bytes": 256 * MiB}
+            "psi_resources": ["memory"], "conn_fail_max_frac": 0.005, "page_cache_max_bytes": 256 * MiB,
+            "engine_stall_s": 300.0}
 CONN_PATTERNS = ("ClientConnectorError", "ServerDisconnectedError", "ClientOSError", "ClientPayloadError",
                  "Connection refused", "Connection reset")
 ODIRECT_FALLBACK = "O_DIRECT is not supported at"
@@ -217,6 +222,36 @@ def conn_failures(turn_rows):
     return len(rows), bad
 
 
+def longest_stall(rows):
+    """(seconds, start) of the longest stretch of the replay with requests in flight and no first token or completion,
+    from a replay output's rows (turn rows' sent + ttft and sent + e2e, the concurrency_series row, wall_s). The
+    in-flight count dropping to 0 ends a stretch (idle, not stalled), except in the last second (the cap's drain).
+    (0.0, None) without a concurrency series."""
+    INF = float("inf")
+    ev = {0.0}
+    for r in rows:
+        if "ttft" in r and r.get("sent") is not None:
+            for x in (r.get("ttft"), r.get("e2e")):
+                if x is not None and x != INF:
+                    ev.add(float(r["sent"]) + float(x))
+    conc = next((r["concurrency_series"] for r in rows if "concurrency_series" in r), None)
+    wall = next((r["wall_s"] for r in rows if "wall_s" in r), None)
+    if not conc or wall is None:
+        return 0.0, None
+    bounds = sorted(e for e in ev if e <= wall) + [float(wall)]
+    best = (0.0, None)
+    for a, b in zip(bounds, bounds[1:]):
+        if b - a <= best[0]:
+            continue
+        k = 0
+        for t, n in conc:
+            if t <= a:
+                k = n
+        if k > 0 and not any(a < t < b - 1.0 and n == 0 for t, n in conc):
+            best = (b - a, a)
+    return best
+
+
 def read_jsonl(path):
     out = []
     if os.path.exists(path):
@@ -251,6 +286,11 @@ def verdict(*, markers, cg_before, cg_after, tel_rows, cg_name, gpu_rows, runner
         if frac > s["conn_fail_max_frac"]:
             reasons.append(f"engine death: {bad} of {n} turns ({frac:.2%}) failed on a lost connection "
                            f"> {s['conn_fail_max_frac']:.1%}")
+        st, at = longest_stall(turn_rows)
+        cov["stall_max_s"] = st
+        if st >= s["engine_stall_s"]:
+            reasons.append(f"engine stall: requests in flight and no token for {st:.0f} s from {at:.0f} s of the "
+                           f"replay (>= {s['engine_stall_s']:.0f} s)")
     for k in ("oom", "oom_kill"):
         d = cg_after["memory.events"].get(k, 0) - cg_before["memory.events"].get(k, 0)
         if d > 0:
@@ -309,13 +349,13 @@ def verdict(*, markers, cg_before, cg_after, tel_rows, cg_name, gpu_rows, runner
         for r in win:
             st = (r.get("cg", {}).get(cg_name) or {}).get("memory.stat") or {}
             if st.get("file") is not None:
-                filec.append(st["file"] - (st.get("shmem") or 0))
+                filec.append(st["file"] - max(st.get("shmem") or 0, st.get("file_mapped") or 0))
         cov["page_cache"] = {"tier_cached_max": max(cached, default=None), "cg_file_nonshmem_max": max(filec, default=None),
                              "limit": s["page_cache_max_bytes"], "ram_tier": ram_tier}
         lim = s["page_cache_max_bytes"]
         if cached and not ram_tier and max(cached) > lim:
             reasons.append(f"page cache: tier cached {max(cached) / MiB:.0f} MiB > {lim / MiB:.0f} MiB in the window")
         if filec and max(filec) > lim:
-            reasons.append(f"page cache: cgroup file (non-shmem) {max(filec) / MiB:.0f} MiB > {lim / MiB:.0f} MiB "
-                           f"in the window")
+            reasons.append(f"page cache: cgroup file (unmapped, non-shmem) {max(filec) / MiB:.0f} MiB > "
+                           f"{lim / MiB:.0f} MiB in the window")
     return {"valid": not reasons, "reasons": reasons, "covariates": cov}

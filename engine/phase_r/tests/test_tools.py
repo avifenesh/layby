@@ -121,6 +121,29 @@ class Shell(unittest.TestCase):
         self.assertEqual(sorted(m), ["replay_end", "replay_start"])
         self.assertLessEqual(m["replay_start"], m["replay_end"])
 
+    def test_arm_hook_reclaims_the_boot_page_cache_at_replay_start(self):
+        # 2026-10-11 pilot: every arm kept 26 to 32 GiB of the weights' clean page cache (read at boot, unmapped) in
+        # its cgroup through the window, so the page-cache rule excluded all of them. replay_start now asks the kernel
+        # to reclaim the unmapped, non-shmem file pages (memory.reclaim) before the window opens.
+        out, cg = tempfile.mkdtemp(dir=SCRATCH), tempfile.mkdtemp(dir=SCRATCH)
+        shmem, mapped, weights = 28 * GiB, 28 * GiB + 370 * MiB, 27 * GiB
+        with open(os.path.join(cg, "memory.stat"), "w") as f:
+            f.write(f"anon 5000000000\nfile {shmem + 370 * MiB + weights}\nshmem {shmem}\nfile_mapped {mapped}\n")
+        open(os.path.join(cg, "memory.reclaim"), "w").close()
+        h = os.path.join(PR, "arm_hook.sh")
+        env = dict(os.environ, SERVER_WRAP=f"/root/layby/engine/phase_r/cg_exec.sh {cg}")
+        subprocess.run([h, "replay_start", "K", out], check=True, env=env)
+        self.assertEqual(open(os.path.join(cg, "memory.reclaim")).read().strip(), str(weights))
+        self.assertEqual(open(os.path.join(out, "K.reclaim")).read().split()[:2], ["reclaim", str(weights)])
+        subprocess.run([h, "replay_end", "K", out], check=True, env=env)   # only replay_start reclaims
+        self.assertEqual(open(os.path.join(cg, "memory.reclaim")).read().strip(), str(weights))
+        import health
+        self.assertIn("replay_start", health.read_markers(os.path.join(out, "K.markers")))
+        # no cgroup (a test runner, or SERVER_WRAP without cg_exec.sh): markers only
+        out2 = tempfile.mkdtemp(dir=SCRATCH)
+        subprocess.run([h, "replay_start", "K", out2], check=True, env=dict(os.environ, SERVER_WRAP="env X=1"))
+        self.assertFalse(os.path.exists(os.path.join(out2, "K.reclaim")))
+
 
 class Telemetry(unittest.TestCase):
     def test_samples_this_cgroup(self):
