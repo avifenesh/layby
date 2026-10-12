@@ -48,7 +48,7 @@
 # Usage: run_arms.sh WORKLOAD OUTDIR GPU_KV_BYTES CPU_BYTES DISK_DIR ARM...
 # Env: MODEL (default Qwen/Qwen3-8B), VENV (dir with bin/vllm and bin/python, default $HOME/.venv), ENGINE_DIR (this
 #      directory, default the script's own), REPO (the layby repo root, default ENGINE_DIR/..), SERVE_ARGS (extra
-#      vllm serve args), OFF_EXTRA (extra kv_connector_extra_config entries, each starting with a comma), MAXLEN
+#      vllm serve args), MAX_NUM_SEQS (default 64), OFF_EXTRA (extra kv_connector_extra_config entries, each starting with a comma), MAXLEN
 #      (default 40960), BOOT_WAIT (5 s polls, default 180), REPLAY_TIMEOUT (s, default 5400), VOCAB (replay token
 #      ids, default 150000), HARD_CAP (replay --hard-cap seconds), PORT (default 8000), PARK_PORT (hint port, default
 #      8765). The server runs in its own session (setsid); cleanup kills only that process group.
@@ -151,7 +151,7 @@ for arm in "$@"; do
   esac
   echo "=== arm $arm $(date -u +%H:%M:%S)"
   setsid ${SERVER_WRAP:-} $VENV/bin/vllm serve $MODEL --port $PORT --max-model-len ${MAXLEN:-40960} --enable-prefix-caching \
-    --kv-cache-memory-bytes $KV --max-num-seqs 64 --enable-prompt-tokens-details ${SERVE_ARGS:-} \
+    --kv-cache-memory-bytes $KV --max-num-seqs ${MAX_NUM_SEQS:-64} --enable-prompt-tokens-details ${SERVE_ARGS:-} \
     --kv-transfer-config "$OFF" > $O/$arm.server.log 2>&1 &
   SP=$!
   trap "kill -9 -- -$SP ${LMP:+-$LMP} 2>/dev/null" EXIT INT TERM   # a killed runner takes its server groups with it

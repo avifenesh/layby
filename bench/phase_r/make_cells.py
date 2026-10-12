@@ -19,7 +19,7 @@ on the slow disk, the Gemma K disk-path test with stock vLLM's tier (T) as the r
 --reference-rows), and a C0 run for the engine-stall check.
 
 Per cell: capacities from capacities.json (GPU and CPU per model, disk per workload; the kdisk cells from their
-manifest), MAXLEN the workloads' context cap (capacities.json max_model_len), CT_ETA of the model's measured workload, LMCache chunk 784 on Qwen, kv_chunk_bytes the vLLM CPU tier's
+manifest), MAX_NUM_SEQS on Qwen at most its GPU KV blocks (vLLM's Mamba CUDA graph rule; 64 otherwise), MAXLEN the workloads' context cap (capacities.json max_model_len), CT_ETA of the model's measured workload, LMCache chunk 784 on Qwen, kv_chunk_bytes the vLLM CPU tier's
 chunk (Qwen 51,380,224 B, Gemma 2,621,440 B), hard_cap_s 1.5 x the workload's projected C0 makespan (manifest
 c0_projection, fit_service.py; replaced by the C0 dry run's makespan once it has run), REPLAY_TIMEOUT the cap + 600 s,
 the runner timeout 1,800 s more. Pilot JSON per model: tier bytes per token and prefill tok/s measured in pilot 1
@@ -51,13 +51,13 @@ MAXLEN = {}   # --max-model-len per model, capacities.json max_model_len (the wo
 MODELS = {
     "qwen38_27b": dict(
         tag="qwen", hf="Qwen/Qwen3.8-27B-FP8", serve="--revision 017b9c7af6b5689d5dd426a76e0bc077eb5ca20a",
-        lm_chunk=784, chunk_bytes=51_380_224, tier_bpt=72_472, prefill=10_477.5, kkm_cell="slow-heavy",
+        lm_chunk=784, chunk_bytes=51_380_224, tier_bpt=72_472, prefill=10_477.5, kkm_cell="slow-heavy", mamba=True,
         rss=dict(vllm=7 * GiB, k=7 * GiB, sidecar=2 * GiB, lm_vllm=6 * GiB, lm_server=2 * GiB)),
     "gemma4_31b": dict(
         tag="gemma", hf="google/gemma-4-31B-it",
         serve='--revision 842da3794eaa0b77d5f08bae87a17459d91ff475 --quantization fp8 '
               '--limit-mm-per-prompt {"image":0,"audio":0,"video":0}',
-        lm_chunk=None, chunk_bytes=2_621_440, tier_bpt=131_714, prefill=6_526.2, kkm_cell=None,
+        lm_chunk=None, chunk_bytes=2_621_440, tier_bpt=131_714, prefill=6_526.2, kkm_cell=None, mamba=False,
         rss=dict(vllm=9 * GiB, k=9 * GiB, sidecar=2 * GiB, lm_vllm=8 * GiB, lm_server=2 * GiB)),
 }
 SLOW_ARMS = ["C0", "T", "T2", "LM", "CT", "K", "K_ewma"]
@@ -117,6 +117,11 @@ def cell(name, key, man, caps, regime, load, wl, arms, ct_eta, cap_src, extra=No
     env = {"REPLAY_TIMEOUT": str(cap + 600), "BOOT_WAIT": "360", "MAXLEN": str(MAXLEN[key]), "SERVE_ARGS": m["serve"]}
     if m["lm_chunk"]:
         env["LM_CHUNK"] = str(m["lm_chunk"])
+    if m["mamba"]:
+        # vLLM 0.31.0 needs one Mamba block per decode sequence for CUDA graph capture: max_num_seqs at most the GPU
+        # KV blocks, rounded down to the graph batch step of 8 (Qwen at 2.99 GB: 58 blocks, 56)
+        blocks = int(caps["gpu_kv_bytes"]) // m["chunk_bytes"]
+        env["MAX_NUM_SEQS"] = str(min(64, blocks // 8 * 8))
     A = []
     for x in arms:
         a = {"label": x, "code": x}

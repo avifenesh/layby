@@ -40,7 +40,8 @@
    "BOOT_WAIT": "360",
    "MAXLEN": "32768",
    "SERVE_ARGS": "--revision 017b9c7af6b5689d5dd426a76e0bc077eb5ca20a",
-   "LM_CHUNK": "784"
+   "LM_CHUNK": "784",
+   "MAX_NUM_SEQS": "56"
   },
   "timeout_s": 6692
  },
