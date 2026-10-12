@@ -33,6 +33,26 @@ class Scorer:
         self.model = build_model(cfg, encoder_dir=os.path.join(model_dir, "encoder"))
         self.model.load_state_dict(load_file(ckpt), strict=True)
         self.model.to(self.dev).eval()
+        if self.dev.type == "cuda":
+            self.warmup()
+
+    @torch.no_grad()
+    def warmup(self, lengths=(64, None), batches=(1, 8)):
+        """One forward pass per (batch, length) before serving: CUDA loads kernel images lazily on their first call,
+        so without it the first live requests pay for loading them (and their page cache lands mid-run; pilot 2's
+        K arm: 425 MB of library pages after the replay began)."""
+        L_max = self.cfg["max_len"]
+        for n in batches:
+            for L in lengths:
+                L = L or L_max
+                args = (torch.full((n, L), self.tok.pad_token_id, dtype=torch.long, device=self.dev),
+                        torch.ones((n, L), dtype=torch.long, device=self.dev),
+                        torch.arange(self.K, device=self.dev).repeat(n, 1) % L,
+                        torch.ones((n, self.K), dtype=torch.bool, device=self.dev),
+                        torch.full((n,), QTYPES["score"], dtype=torch.long, device=self.dev))
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    self.model(*args)
+        torch.cuda.synchronize(self.dev)
 
     @torch.no_grad()
     def score(self, states, kinds):
