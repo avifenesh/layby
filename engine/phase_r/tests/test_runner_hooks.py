@@ -215,6 +215,19 @@ class RunnerHooks(unittest.TestCase):
         self.assertEqual(len(lm), 1)
         self.assertEqual(lm[0]["wrapped"], "yes")
 
+    def test_blocks_per_chunk_reaches_the_offloading_connector(self):
+        # T's tuning grid (BENCH_PLAN section 8): BLOCKS_PER_CHUNK is vLLM 0.31.0's kv_connector_extra_config
+        # blocks_per_chunk (offloading/config.py); unset, the key is absent (vLLM's 1); a non-integer, or OFF_EXTRA
+        # setting the chunk too, is refused before any arm
+        import json
+        r, rows = self.run_runner("run_arms.sh", "T", {"BLOCKS_PER_CHUNK": "16", "FS_THREADS": "32"})
+        argv, _ = self.check(r, rows, "T")
+        x = json.loads(argv[argv.index("--kv-transfer-config") + 1])["kv_connector_extra_config"]
+        self.assertEqual((x["blocks_per_chunk"], x["secondary_tiers"][0]["n_write_threads"]), (16, 32))
+        for bad in ({"BLOCKS_PER_CHUNK": "0"}, {"BLOCKS_PER_CHUNK": "16", "OFF_EXTRA": ',"block_size":784'}):
+            r, _ = self.run_runner("run_arms.sh", "T", bad)
+            self.assertEqual(r.returncode, 4, r.stdout)
+
     def test_vllm_baseline_and_control_arms(self):
         # T2, CT, PT, K_km in one runner call: each arm's kv-transfer-config and client flags, with the plan's
         # fairness settings (same CPU bytes, offload_prompt_only false, every disk tier on vLLM's fs tier class)
@@ -240,6 +253,7 @@ class RunnerHooks(unittest.TestCase):
             cfg.setdefault(arm, []).append((c, x, cl))
         (c, x, cl), (c3, x3, _) = cfg["T2"]
         self.assertEqual(c["kv_connector"], "OffloadingConnector")
+        self.assertNotIn("blocks_per_chunk", x)
         self.assertEqual(x["eviction_policy"], "lru")
         self.assertEqual(x["secondary_tiers"], [{"type": "FreqFsTier", "module_path": "layby.vllm.freq_tier",
                                                  "root_dir": os.path.join(self.d, "disk"), "n_read_threads": 16,

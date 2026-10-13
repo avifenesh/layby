@@ -34,6 +34,8 @@
 #        smoke_restore.py. LMR: LM with LMCache keeping what it restores from disk in L1 (--l2-prefetch-policy retain;
 #        the default deletes a prefetched chunk from L1 when its reader ends, so a session's next turn reads the disk
 #        again) and L1 eviction at 0.95 (default 0.8). Needs `lmcache` on PATH in the server's environment.
+#        Eviction stays LRU: LMCache 0.5.5's --eviction-policy (and its L2 eviction) takes LRU, IsolatedLRU or noop
+#        only (lmcache/v1/distributed/config.py, l2_adapters/config.py), so there is no ARC to select.
 # A repeat carries a suffix (C0.2 runs arm C0 again into C0.2.*).
 # Fairness (BENCH_PLAN sections 5 and 6): every arm but LM gets the same cpu_bytes_to_use (CPU_BYTES) and
 # offload_prompt_only false, and LM's L1 the same bytes (checked before any arm: exit 4 if LMCache would round it, or
@@ -60,7 +62,12 @@
 #      the sidecar's own choice: cuda when present), SIDECAR_WAIT (5 s polls, default 60). EVICTION (the CPU-tier
 #      eviction of the arms on vLLM's
 #      own policy, C0 T T2 CT PT: lru or arc, default lru), FS_THREADS (read and write threads of every disk tier,
-#      default 16). REPLAY_TIMEOUT must exceed HARD_CAP by 300 s (the cap writes the censored rows). REPLAY_EXTRA
+#      default 16), BLOCKS_PER_CHUNK (kv_connector_extra_config blocks_per_chunk of every arm on vLLM's offloading
+#      connector, all but LM: GPU blocks per offloaded chunk, unset = vLLM 0.31.0's 1; vLLM's offloading/config.py).
+#      It is connector-wide, not a disk-tier setting: the CPU tier's chunk grows with it (vLLM sizes the CPU tier as
+#      cpu_bytes // (block bytes x N) chunks, so bytes past the last whole chunk go unused) and the fs tier writes
+#      one file per chunk; on a hybrid Mamba model (Qwen3.8) an offload hit rounds down to N blocks and the partial
+#      tail is off (scheduler.py resolve_mamba_align_size, supports_partial_tail). REPLAY_TIMEOUT must exceed HARD_CAP by 300 s (the cap writes the censored rows). REPLAY_EXTRA
 #      (extra replay.py arguments for every arm, e.g. "--verify-disk 20" in the K disk-path pilot).
 #      Every arm needs vLLM PR #60045 (phase_r/vllm/apply_patch.py); the orchestrator applies it and checks it before each arm.
 set -u
@@ -95,6 +102,13 @@ for arm in "$@"; do
   esac
 done
 case "${OFF_EXTRA:-}" in *cpu_bytes_to_use*) echo "PREFLIGHT: OFF_EXTRA sets cpu_bytes_to_use; every arm gets CPU_BYTES"; exit 4 ;; esac
+BPC=""
+if [ -n "${BLOCKS_PER_CHUNK:-}" ]; then
+  [[ "$BLOCKS_PER_CHUNK" =~ ^[1-9][0-9]*$ ]] || { echo "PREFLIGHT: BLOCKS_PER_CHUNK must be a positive integer, got '$BLOCKS_PER_CHUNK'"; exit 4; }
+  # vLLM refuses blocks_per_chunk beside block_size, and a second blocks_per_chunk in OFF_EXTRA would silently win
+  case "${OFF_EXTRA:-}" in *blocks_per_chunk*|*'"block_size"'*) echo "PREFLIGHT: OFF_EXTRA sets the chunk size; use BLOCKS_PER_CHUNK alone"; exit 4 ;; esac
+  BPC=",\"blocks_per_chunk\":$BLOCKS_PER_CHUNK"
+fi
 # LMCache takes GiB as a float and sizes int(gb * 2^30): the shortest float repr of bytes / 2^30 is exact
 L1GB=$(python3 -c "print(repr(int('$CPU') / 2**30))")
 [ "$(python3 -c "print(int(float('$L1GB') * (1 << 30)))")" = "$CPU" ] || { echo "PREFLIGHT: LMCache L1 $L1GB GiB is not CPU_BYTES $CPU"; exit 4; }
@@ -140,7 +154,7 @@ for arm in "$@"; do
   esac
   rm -rf $DISK; mkdir -p $DISK
   SHM0=$(ls /dev/shm | grep '^vllm_offload_' | sort)   # other servers' CPU tiers: never touched
-  OFF="{$conn,\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"cpu_bytes_to_use\":$CPU,\"offload_prompt_only\":false,$pol$tier$extra${OFF_EXTRA:-}}}"
+  OFF="{$conn,\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"cpu_bytes_to_use\":$CPU,\"offload_prompt_only\":false,$pol$tier$extra$BPC${OFF_EXTRA:-}}}"
   LMP=""
   case ${arm%%.*} in LM|LMS|LMR)
     OFF="{$conn,\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{$extra}}"
