@@ -214,5 +214,46 @@ bw = pool.get_new_blocks(free + 15)                       # now it fits: admitte
 conn.update_state_after_alloc(w, NS(blocks=(bw,)), 0)
 step()
 assert set(conn._pins) == {"x"} and CC.CT_STATE.counts["unpin_pressure"] == 3
+pool.free_blocks(reversed(bw)); conn._unpin("x"); conn._waiting.clear()
+assert pool.get_num_free_blocks() == FREE0
+
+# eviction is judged against the prefix the return shares with what its program held: a pinned return whose
+# prompt re-renders the reply's tail (pilot 2: hit 28,448 of 28,602 held tokens, nothing evicted) is not an eviction;
+# a return whose shared prefix missed the GPU is
+n0 = req("n0", "n-0", 20 * BT, park_kind="tool", park_tool="Read")
+n0.all_token_ids = list(range(20 * BT))
+bn = run(n0); finish(n0, bn)
+assert "n" in conn._pins
+ev0 = CC.CT_STATE.counts["evicted_returns"]
+n1 = req("n1", "n-1", 24 * BT, park_kind="tool", park_tool="Read")
+n1.all_token_ids = list(range(17 * BT + 5)) + [-1] * (7 * BT - 5)   # the template re-rendered the last 2.7 blocks
+conn.on_new_request(n1)
+pool.touch(bn[:17]); conn.get_num_new_matched_tokens(n1, 17 * BT)
+conn.update_state_after_alloc(n1, NS(blocks=([],)), 0)
+r = CC.CT_STATE.rlog[-1]
+assert r["pinned"] and r["shared"] == 17 * BT + 5 and r["evicted"] is False, r
+assert CC.CT_STATE.counts["evicted_returns"] == ev0
+pool.free_blocks(reversed(bn[:17]))
+n1.num_tokens = 24 * BT
+finish(n1, [])                                            # n1 held nothing new in this stub: no pin
+n2 = req("n2", "n-2", 30 * BT, park_kind="tool", park_tool="Read")
+n2.all_token_ids = list(n1.all_token_ids) + [7] * (6 * BT)
+conn.on_new_request(n2); conn.get_num_new_matched_tokens(n2, 2 * BT)    # 2 of 24 shared blocks still on the GPU
+conn.update_state_after_alloc(n2, NS(blocks=([],)), 0)
+r = CC.CT_STATE.rlog[-1]
+assert r["shared"] == 24 * BT and r["evicted"] is True and CC.CT_STATE.counts["evicted_returns"] == ev0 + 1, r
+conn._waiting.clear()
+
+# a finish that finds its program still pinned replaces the pin and counts it
+clock[0] += 0.01
+m0 = req("m0", "m-0", 160, park_kind="tool", park_tool="Grep")
+bm0 = run(m0); finish(m0, bm0)
+m1 = req("m1", "m-1", 160, park_kind="tool", park_tool="Grep")
+bm1 = pool.get_new_blocks(10)                             # its admission hook never ran: the old pin is replaced
+for i, b in enumerate(bm1):
+    b.set_block_hash(f"m1-{i}".encode(), BT)
+finish(m1, bm1)
+assert CC.CT_STATE.counts["unpin_replace"] == 1 and all(b.ref_cnt == 0 for b in bm0)
+conn._unpin("m"); conn._waiting.clear()
 print("pin ok: tool turns pinned for the TTL, unpinned at admission, at expiry, and latest-arrival first under pressure")
 print("CT ok")

@@ -93,13 +93,28 @@ def _params(request):
     return getattr(request, "kv_transfer_params", None) or {}
 
 
+def _common_prefix(a, b) -> int:
+    """Length of the longest common prefix of two token lists (slice compares run in C)."""
+    n = min(len(a), len(b))
+    if a[:n] == b[:n]:
+        return n
+    lo, hi = 0, n                         # a[:lo] == b[:lo], a[:hi] != b[:hi]
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if a[:mid] == b[:mid]:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
 class CTState:
     """What the hint server needs (layby.vllm.server): a hint queue (unused here), snapshot(), the logs."""
 
     def __init__(self):
         self.hints = queue.SimpleQueue()
-        self.counts = dict(pins=0, unpin_admit=0, unpin_ttl=0, unpin_pressure=0, no_pin=0, tool_records=0,
-                           evicted_returns=0)
+        self.counts = dict(pins=0, unpin_admit=0, unpin_ttl=0, unpin_pressure=0, unpin_replace=0, no_pin=0,
+                           tool_records=0, evicted_returns=0)
         self.dlog: list = []
         self.rlog: list = []
         self.conn = None
@@ -152,6 +167,7 @@ class ContinuumConnector(OffloadingConnector):
         self._local: dict[str, int] = {}            # request id -> GPU prefix hit at its lookup
         self._tried: set = set()                    # request ids looked up and not allocated in this step
         self._last: dict[str, tuple] = {}           # session -> (finish time, tool or None, tokens held)
+        self._held: dict[str, list] = {}            # session -> token ids of its last finished request
         self._arrival: dict[str, float] = {}        # session -> its program's first arrival
         self._waits: deque = deque()                # (time, admission wait) of returns whose KV was evicted
         self._loads: dict[int, tuple[float, int]] = {}   # load job id -> (submit time, tokens)
@@ -220,12 +236,20 @@ class ContinuumConnector(OffloadingConnector):
         if sess is None:
             return
         last = self._last.get(sess)
-        evicted = last is not None and (local if local is not None else 0) + self.block_tokens <= last[2]
+        # evicted: the GPU hit falls a block short of the prefix this request shares with the KV its program held.
+        # The shared prefix, not the held tokens: a chat template that re-renders the reply's tail (pilot 2: 154
+        # tokens on a pinned Gemma return) shortens the hit with nothing evicted
+        shared = last[2] if last else 0
+        prev, cur = self._held.get(sess), getattr(request, "all_token_ids", None)
+        if last is not None and prev is not None and cur is not None:
+            shared = min(shared, _common_prefix(prev, cur))
+        evicted = last is not None and (local if local is not None else 0) + self.block_tokens <= shared
         if evicted:
             self._waits.append((now, now - t_add))
             CT_STATE.counts["evicted_returns"] += 1
         CT_STATE.rlog.append(dict(t=round(now, 3), sess=sess, wait=round(now - t_add, 4), local=local,
-                                  held=last[2] if last else None, evicted=evicted, pinned=sess in self._pins))
+                                  held=last[2] if last else None, shared=shared if last else None, evicted=evicted,
+                                  pinned=sess in self._pins))
         del CT_STATE.rlog[:-20000]
         if sess in self._pins:
             # the program's next request is admitted: it holds its own references now (Algorithm 1, line 26)
@@ -300,11 +324,15 @@ class ContinuumConnector(OffloadingConnector):
             return
         if sess in self._pins:            # a pin the program never came back to (should not happen): replace it
             self._unpin(sess)
+            CT_STATE.counts["unpin_replace"] += 1
         tool_call = params.get("park_kind") == "tool" and not params.get("park_last")
         tool = (params.get("park_tool") or "?") if tool_call else None
         self._last[sess] = (now, tool, int(request.num_tokens))
+        toks = getattr(request, "all_token_ids", None)
+        if toks is not None:
+            self._held[sess] = list(toks)
         if params.get("park_last"):
-            self._last.pop(sess, None); self._arrival.pop(sess, None)
+            self._last.pop(sess, None); self._arrival.pop(sess, None); self._held.pop(sess, None)
         if not tool_call or self._pool is None:
             CT_STATE.counts["no_pin"] += 1
             return
