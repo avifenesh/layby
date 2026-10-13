@@ -18,5 +18,24 @@
    "p95": 49.340356,
    "ranking": "rank/t-gemma-c0-slow-s3.json"
   }
+ },
+ "qwen38_27b": {
+  "C0": {
+   "block": {
+    "attempt": 1,
+    "host": "tune-qwen",
+    "repeat": 1
+   },
+   "carried": {},
+   "cell": "t-qwen-c0-slow-s3",
+   "knobs": {
+    "budget": 8192,
+    "eviction": "lru"
+   },
+   "label": "C0_lru_b8192",
+   "p50": 0.359527,
+   "p95": 11.019576,
+   "ranking": "rank/t-qwen-c0-slow-s3.json"
+  }
  }
 }
