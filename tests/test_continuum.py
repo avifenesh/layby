@@ -260,14 +260,20 @@ for i, b in enumerate(bm1):
 finish(m1, bm1)
 assert CC.CT_STATE.counts["unpin_replace"] == 1 and all(b.ref_cnt == 0 for b in bm0)
 conn._unpin("m"); conn._waiting.clear()
-# vLLM's own hit rounding is not an eviction: Gemma 4 on vLLM 0.31 hits whole 32-token pages minus the 128 tokens
-# its sliding window replays (prefix_replay_tokens), so an intact return of 17,749 held tokens hits 17,600
-g = object.__new__(CC.ContinuumConnector)
-gcfg = NS(num_blocks=64, kv_cache_tensors=[NS(size=64 * 16 * 1000)], kv_cache_groups=[
-    NS(kv_cache_spec=NS(block_size=16, prefix_replay_tokens=128)), NS(kv_cache_spec=NS(block_size=32))])
-g._setup({"ct_eta": 1.0}, 16, gcfg, 16, clock=lambda: clock[0])
-assert g.hit_slack == 32 + 128 and conn.hit_slack == BT
-assert 17600 + g.hit_slack > 17749 and 17600 - 32 + g.hit_slack <= 17749   # one page more missing is an eviction
-CC.CT_STATE.conn = conn
+# eviction is read off the blocks: a return whose program's last cached block still holds its hash is intact however
+# short its hit (vLLM 0.31 rounds every Gemma 4 hit down by 128 tokens), and one whose block lost its hash is evicted
+e0 = req("e0", "e-0", 10 * BT, park_kind="human")
+be = run(e0); finish(e0, be)
+e1 = req("e1", "e-1", 12 * BT, park_kind="human")
+conn.on_new_request(e1); conn.get_num_new_matched_tokens(e1, 2 * BT)
+conn.update_state_after_alloc(e1, NS(blocks=([],)), 0)
+assert CC.CT_STATE.rlog[-1]["evicted"] is False, CC.CT_STATE.rlog[-1]
+finish(e1, be)                                            # the same blocks again, still cached
+be[-1].reset_hash()                                       # BlockPool evicts the program's last block
+e2 = req("e2", "e-2", 14 * BT, park_kind="human")
+conn.on_new_request(e2); conn.get_num_new_matched_tokens(e2, 9 * BT)
+conn.update_state_after_alloc(e2, NS(blocks=([],)), 0)
+assert CC.CT_STATE.rlog[-1]["evicted"] is True, CC.CT_STATE.rlog[-1]
+conn._waiting.clear()
 print("pin ok: tool turns pinned for the TTL, unpinned at admission, at expiry, and latest-arrival first under pressure")
 print("CT ok")

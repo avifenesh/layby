@@ -34,8 +34,8 @@ the blocks go back to the free queue as vLLM frees a request) when
 
 Measured here: the duration of each tool call (a program's finish to its next request's arrival, server side), T
 (the mean admission wait of requests whose program's KV was evicted from the GPU: a returning request whose GPU
-prefix hit is short of the prefix it shares with what its program held at its last finish by more than vLLM's own
-hit rounding, over the last ct_window seconds), and R (Prefill-Reload: the session's tokens times the measured seconds per token of the connector's CPU to
+program's KV from its last finish left the GPU prefix cache (the last cached block of a KV group lost its hash),
+over the last ct_window seconds), and R (Prefill-Reload: the session's tokens times the measured seconds per token of the connector's CPU to
 GPU load jobs, submit to completion; before the first load, the KV bytes per token at 20 GB/s, the adapter's
 PCIe-class default).
 
@@ -160,12 +160,6 @@ class ContinuumConnector(OffloadingConnector):
         self.ttl = ContinuumTTL(eta=float(extra.get("ct_eta", 1.0)), k=int(extra.get("ct_k", 100)))
         self.window = float(extra.get("ct_window", 120.0))
         self.block_tokens = int(block_tokens)
-        # vLLM's own rounding of a prefix hit: whole pages of the largest group, minus the tokens a sliding-window
-        # model recomputes at the hit's end (kv_cache_spec.prefix_replay_tokens; Gemma 4 on vLLM 0.31: 32-token
-        # pages and 128 replayed, so every intact Gemma return hits floor32(held) - 128)
-        specs = [g.kv_cache_spec for g in getattr(kv_cache_config, "kv_cache_groups", ()) or ()]
-        self.hit_slack = (max([self.block_tokens] + [int(getattr(sp, "block_size", 0)) for sp in specs])
-                          + max([0] + [int(getattr(sp, "prefix_replay_tokens", 0) or 0) for sp in specs]))
         self.chunk_tokens = int(chunk_tokens)
         nb = getattr(kv_cache_config, "num_blocks", 0) or 0
         size = sum(getattr(t, "size", 0) for t in getattr(kv_cache_config, "kv_cache_tensors", ()) or ())
@@ -178,6 +172,7 @@ class ContinuumConnector(OffloadingConnector):
         self._pending: set = set()                  # request ids whose connector lookup is still pending
         self._last: dict[str, tuple] = {}           # session -> (finish time, tool or None, tokens held)
         self._held: dict[str, list] = {}            # session -> token ids of its last finished request
+        self._marks: dict[str, list] = {}           # session -> (block id, hash) of the last cached block per group
         self._arrival: dict[str, float] = {}        # session -> its program's first arrival
         self._waits: deque = deque()                # (time, admission wait) of returns whose KV was evicted
         self._loads: dict[int, tuple[float, int]] = {}   # load job id -> (submit time, tokens)
@@ -249,14 +244,23 @@ class ContinuumConnector(OffloadingConnector):
         if sess is None:
             return
         last = self._last.get(sess)
-        # evicted: the GPU hit falls a block short of the prefix this request shares with the KV its program held.
-        # The shared prefix, not the held tokens: a chat template that re-renders the reply's tail (pilot 2: 154
-        # tokens on a pinned Gemma return) shortens the hit with nothing evicted
+        # evicted: the KV its program held at its last finish left the GPU prefix cache, read off the blocks
+        # themselves: the last cached block of each KV group lost its hash (BlockPool evicts by resetting it). The
+        # hit length is no measure: vLLM 0.31 rounds a Gemma 4 hit down by four 32-token pages with nothing evicted
+        # (every intact return hit floor32(held) - 128 in the start block), and a chat template that re-renders the
+        # reply's tail shortens the hit too (pilot 2). Without marks (no pool bound), a block short of the shared
+        # prefix counts.
         shared = last[2] if last else 0
         prev, cur = self._held.get(sess), getattr(request, "all_token_ids", None)
         if last is not None and prev is not None and cur is not None:
             shared = min(shared, _common_prefix(prev, cur))
-        evicted = last is not None and (local if local is not None else 0) + self.hit_slack <= shared
+        marks = self._marks.get(sess)
+        if last is None:
+            evicted = False
+        elif marks and self._pool is not None:
+            evicted = any(self._pool.blocks[bid].block_hash != h for bid, h in marks)
+        else:
+            evicted = (local if local is not None else 0) + self.block_tokens <= shared
         if evicted:
             self._waits.append((now, now - t_add))
             CT_STATE.counts["evicted_returns"] += 1
@@ -345,8 +349,18 @@ class ContinuumConnector(OffloadingConnector):
         toks = getattr(request, "all_token_ids", None)
         if toks is not None:
             self._held[sess] = list(toks)
+        if self._pool is not None:
+            marks = []
+            for ids in groups:
+                for bid in reversed(list(ids or ())):
+                    b = self._pool.blocks[bid]
+                    if not b.is_null and b.block_hash is not None:
+                        marks.append((bid, b.block_hash))
+                        break
+            self._marks[sess] = marks
         if params.get("park_last"):
             self._last.pop(sess, None); self._arrival.pop(sess, None); self._held.pop(sess, None)
+            self._marks.pop(sess, None)
         if not tool_call or self._pool is None:
             CT_STATE.counts["no_pin"] += 1
             return
