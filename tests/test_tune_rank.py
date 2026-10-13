@@ -233,7 +233,10 @@ def test_c0_first_then_carried(tmp_path, workloads):
     assert [x["label"] for x in t["arms"]] == ["T_b1_t16", "T_b1_t32"]
     lm = json.load(open(os.path.join(tune, "t-qwen-lm-slow-s1.json")))
     assert {x["label"]: x["code"] for x in lm["arms"]} == {
-        "LM_c784_default": "LM", "LM_c784_retain": "LMR", "LM_c1568_default": "LM", "LM_c1568_retain": "LMR"}
+        f"LM_c{c}_{p}{e}": ("LMR" if p == "retain" else "LM")
+        for c in (784, 1568) for p in ("default", "retain") for e in ("", "_eager")}
+    assert {x["label"]: x["env"].get("LM_EAGER") for x in lm["arms"]}["LM_c784_retain_eager"] == "1"
+    assert "LM_EAGER" not in {x["label"]: x["env"] for x in lm["arms"]}["LM_c784_retain"]
     # a main cell picks up C0's knobs everywhere and a tuned family's knobs on its own disk only
     tuned["qwen38_27b"]["T"] = {"fast": {"label": "T_b16_t32", "knobs": {"blocks_per_chunk": 16, "fs_threads": 32}}}
     tuned["qwen38_27b"]["LM"] = {"slow": {"label": "LM_c1568_retain", "knobs": {"chunk": 1568, "prefetch": "retain"}}}

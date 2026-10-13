@@ -846,7 +846,8 @@ class Block:
             tb = text(".tier_bytes").strip()
             v = health.verdict(markers=health.read_markers(pre + ".markers"), cg_before=x["cg_before"],
                                cg_after=x["cg_after"], tel_rows=tel, cg_name=x["arm"]["label"], gpu_rows=gpu,
-                               runner_rc=rc, runner_log=rl, server_log=sl, regime=c["regime"], engine=c["engine"],
+                               runner_rc=rc, runner_log=rl, server_log=sl, lmcache_log=text(".lmcache.log", "replace"),
+                               regime=c["regime"], engine=c["engine"],
                                settings=c["health"], turn_rows=health.read_jsonl(pre + ".jsonl"),
                                disk_bytes=parse_size(c["capacities"]["disk_bytes"]),
                                tier_bytes_end=int(tb) if tb.isdigit() else None,

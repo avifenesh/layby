@@ -269,11 +269,13 @@ def read_jsonl(path):
 
 def verdict(*, markers, cg_before, cg_after, tel_rows, cg_name, gpu_rows, runner_rc, runner_log="", server_log="",
             regime=None, engine=None, settings=None, turn_rows=None, disk_bytes=None, tier_bytes_end=None,
-            ram_tier=False):
+            ram_tier=False, lmcache_log=""):
     """{'valid', 'reasons', 'window_s', 'covariates'} for one arm. gpu_rows: parse_gpu_csv rows of the arm's GPUs,
     their 'timestamp' in the host's local time (nvidia-smi's own format). turn_rows: the replay output's rows;
     disk_bytes: the cell's disk-tier capacity; tier_bytes_end: the runner's du of the tier after the replay; ram_tier:
-    the tier is a tmpfs (its cachestat is the tier itself, not page-cache slack)."""
+    the tier is a tmpfs (its cachestat is the tier itself, not page-cache slack). lmcache_log: the LM arm's LMCache
+    server log; its dropped stores (L1 allocations refused while write-through stores pin L1, and failed L2 store
+    tasks) are covariates, never exclusions: they are how LMCache behaves at the cell's capacities."""
     s = dict(DEFAULTS, **(settings or {}))
     reasons, cov = [], {}
     t0, t1 = markers.get("replay_start"), markers.get("replay_end")
@@ -282,6 +284,9 @@ def verdict(*, markers, cg_before, cg_after, tel_rows, cg_name, gpu_rows, runner
         reasons.append(f"engine_crash: rc={runner_rc}, markers={sorted(markers)}"
                        + (", server failed" if "server failed" in runner_log else "")
                        + (", server died during the replay" if died else ""))
+    if lmcache_log:
+        cov["lm_alloc_failed"] = lmcache_log.count("Failed to batched allocate")
+        cov["lm_store_task_failed"] = lmcache_log.lower().count("store task failed")
     if turn_rows is not None:
         n, bad = conn_failures(turn_rows)
         frac = bad / n if n else 0.0

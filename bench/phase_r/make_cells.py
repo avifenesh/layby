@@ -90,7 +90,7 @@ def c0_env(key, knobs):
 
 def family_arm(family, knobs):
     """(runner code, arm env) of one T, T2 or LM grid point (run_arms.sh docstring): T {blocks_per_chunk,
-    fs_threads}; T2 {min_hits, count, decay_s} plus T's two; LM {chunk, prefetch: default or retain (code LMR)}."""
+    fs_threads}; T2 {min_hits, count, decay_s} plus T's two; LM {chunk, prefetch: default or retain (code LMR), eager: the eager prefetch}."""
     if family in ("T", "T2"):
         env = {"BLOCKS_PER_CHUNK": str(int(knobs["blocks_per_chunk"])), "FS_THREADS": str(int(knobs["fs_threads"]))}
         if family == "T2":
@@ -100,7 +100,10 @@ def family_arm(family, knobs):
     if family == "LM":
         if knobs["prefetch"] not in ("default", "retain"):
             raise ValueError(f"LM prefetch {knobs['prefetch']!r}")
-        return ("LMR" if knobs["prefetch"] == "retain" else "LM"), {"LM_CHUNK": str(int(knobs["chunk"]))}
+        env = {"LM_CHUNK": str(int(knobs["chunk"]))}
+        if knobs.get("eager"):
+            env["LM_EAGER"] = "1"
+        return ("LMR" if knobs["prefetch"] == "retain" else "LM"), env
     raise ValueError(f"no tuned knobs for family {family!r}")
 
 

@@ -75,6 +75,16 @@ class AfterArm(unittest.TestCase):
         self.assertAlmostEqual(v["covariates"]["window_s"], WIN)
         self.assertEqual(v["covariates"]["gpu0"]["sm_clock_median"], 2400)
 
+    def test_lmcache_dropped_stores_are_covariates(self):
+        """The start block's Gemma LM: 1,554 refused L1 allocations while write-through stores pinned L1 ("0 store
+        failures" missed them); counted, never an exclusion."""
+        log = ("WARNING Failed to batched allocate 4 memory blocks of size 209715200 because ...\n" * 3
+               + "ERROR Dynamic NIXL store task failed: NIXL_ERR_INVALID_PARAM\n")
+        v = verdict(lmcache_log=log)
+        self.assertTrue(v["valid"], v["reasons"])
+        self.assertEqual((v["covariates"]["lm_alloc_failed"], v["covariates"]["lm_store_task_failed"]), (3, 1))
+        self.assertNotIn("lm_alloc_failed", verdict()["covariates"])
+
     def test_oom_and_oom_kill_invalidate(self):
         self.assertFalse(verdict(cg_after=cg(oom=1))["valid"])
         v = verdict(cg_after=cg(oom_kill=2))

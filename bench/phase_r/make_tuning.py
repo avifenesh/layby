@@ -27,7 +27,10 @@ Grids (section 8 and the decisions since), in grid order (first knob slowest):
   LM  per disk: chunk (Qwen {784, 1568}; Gemma {256, 512}; LM_CHUNK) x prefetch {default, retain} (code LM or LMR),
       direct I/O on (the runner's L2 adapter). The plan's eviction {LRU, ARC} cannot run: LMCache 0.5.5's server
       takes --eviction-policy LRU, IsolatedLRU or noop only (lmcache/v1/distributed/config.py), so eviction stays LRU.
-      LMR also raises L1's eviction watermark to 0.95 (ratio 0.1), as run_arms.sh has run it since 5c24f29.
+      LMR also raises L1's eviction watermark to 0.95 (ratio 0.1), as run_arms.sh has run it since 5c24f29. Added
+      after the start block: x eager prefetch {off, on} (LM_EAGER: lmcache.mp.eager_prefetch). Gemma's LM waited a
+      median 6.1 s on its disk prefetch on hits (LMCache 0.5.5 waits for the full prefetch even when vLLM's GPU
+      cache covers the prompt), and the eager prefetch is LMCache's own knob to overlap that read with queueing.
   CT  slow only (CT runs in slow cells only): no knob, one full-length run (stage 3 directly) with the model's
       measured-workload CT_ETA, on C0's carried settings, so it can be ranked for "best".
 T, LM and CT wait for C0's winner; T2 on a disk waits for T's winner on that disk.
@@ -99,8 +102,8 @@ def grid(key, family, t_knobs=None, cpu_bytes=None, max_model_len=None):
         return [(f"T2_n{n}_{cm}", dict(base, min_hits=n, count=cm, decay_s=T2_DECAY_S))
                 for n, cm in itertools.product((2, 3), ("request", "store"))]
     if family == "LM":
-        return [(f"LM_c{c}_{p}", {"chunk": c, "prefetch": p})
-                for c, p in itertools.product(g["lm_chunk"], ("default", "retain"))]
+        return [(f"LM_c{c}_{p}" + ("_eager" if e else ""), {"chunk": c, "prefetch": p, "eager": e})
+                for c, p, e in itertools.product(g["lm_chunk"], ("default", "retain"), (False, True))]
     if family == "CT":
         return [("CT", {})]
     raise ValueError(f"family {family!r}")

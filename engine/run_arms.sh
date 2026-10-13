@@ -33,7 +33,10 @@
 #        LM_CHUNK (tokens, default 256: a multiple of the engine's block size). LMS: the same stack under
 #        smoke_restore.py. LMR: LM with LMCache keeping what it restores from disk in L1 (--l2-prefetch-policy retain;
 #        the default deletes a prefetched chunk from L1 when its reader ends, so a session's next turn reads the disk
-#        again) and L1 eviction at 0.95 (default 0.8). Needs `lmcache` on PATH in the server's environment.
+#        again) and L1 eviction at 0.95 (default 0.8). LM_EAGER=1 (LM, LMR): the connector's lmcache.mp.eager_prefetch,
+#        which submits the LMCache lookup and its disk prefetch when a request arrives instead of when vLLM first
+#        schedules it, so the read overlaps the request's queue wait (lmcache_mp_connector.py, LMCache 0.5.5).
+#        Needs `lmcache` on PATH in the server's environment.
 #        Eviction stays LRU: LMCache 0.5.5's --eviction-policy (and its L2 eviction) takes LRU, IsolatedLRU or noop
 #        only (lmcache/v1/distributed/config.py, l2_adapters/config.py), so there is no ARC to select.
 # A repeat carries a suffix (C0.2 runs arm C0 again into C0.2.*).
@@ -140,7 +143,8 @@ for arm in "$@"; do
        extra=",\"ct_eta\":$CT_ETA,\"ct_port\":$PARK_PORT"; client="--continuum" ;;
     PT) tier=",\"spec_name\":\"TieringOffloadingSpec\",\"secondary_tiers\":[{\"type\":\"ParkFsTier\",\"module_path\":\"layby.vllm.fs_tier\",$FSIO,\"write_all\":true}]" ;;
     LM|LMS|LMR) conn='"kv_connector":"LMCacheMPConnector","kv_connector_module_path":"lmcache.integration.vllm.lmcache_mp_connector"'
-       tier=""; pol=""; extra="\"lmcache.mp.port\":${LM_PORT:-6555}" ;;
+       tier=""; pol=""; extra="\"lmcache.mp.port\":${LM_PORT:-6555}"
+       [ "${LM_EAGER:-0}" = 1 ] && extra="$extra,\"lmcache.mp.eager_prefetch\":true" ;;
     K|K_km|K_ewma|K0|KW|KD|SM) pol='"eviction_policy":"ParkCachePolicy","cache_policy_module_path":"layby.vllm.policy"'
        tier=",\"spec_name\":\"TieringOffloadingSpec\",\"secondary_tiers\":[{\"type\":\"ParkFsTier\",\"module_path\":\"layby.vllm.fs_tier\",$FSIO}]"
        conn='"kv_connector":"ParkConnector","kv_connector_module_path":"layby.vllm.connector"'
