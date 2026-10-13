@@ -172,7 +172,8 @@ def workloads(tmp_path):
     d.mkdir()
     C = {"models": {}, "workloads": {}}
     for key in M.MODELS:
-        C["models"][key] = {"max_model_len": 32768, "gpu_kv_bytes": 2 << 30, "cpu_bytes": 4 << 30}
+        C["models"][key] = {"max_model_len": 32768, "gpu_kv_bytes": 2 << 30,
+                            "cpu_bytes": {"qwen38_27b": 4831838208, "gemma4_31b": 8657043456}[key]}
         for w in ("measured", "tuning_20min", "tuning_40min", "tuning"):
             C["workloads"][f"{key}.{w}"] = {"disk_bytes": 100 << 30, "ct_eta": 0.034}
             (d / f"{key}.{w}.manifest.json").write_text(json.dumps(
@@ -228,7 +229,8 @@ def test_c0_first_then_carried(tmp_path, workloads):
     t = json.load(open(os.path.join(tune, "t-qwen-t-fast-s1.json")))
     assert t["runner"]["env"]["EVICTION"] == "arc"
     assert t["runner"]["env"]["SERVE_ARGS"].endswith("--max-num-batched-tokens 4096")
-    assert {x["label"]: x["env"]["BLOCKS_PER_CHUNK"] for x in t["arms"]}["T_b16_t32"] == "16"
+    # blocks_per_chunk 16 is left out on Qwen: its CPU tier cannot hold a restore beside a write in 16-block chunks
+    assert [x["label"] for x in t["arms"]] == ["T_b1_t16", "T_b1_t32"]
     lm = json.load(open(os.path.join(tune, "t-qwen-lm-slow-s1.json")))
     assert {x["label"]: x["code"] for x in lm["arms"]} == {
         "LM_c784_default": "LM", "LM_c784_retain": "LMR", "LM_c1568_default": "LM", "LM_c1568_retain": "LMR"}
@@ -262,3 +264,10 @@ def test_partial_ranking_does_not_advance(tmp_path, workloads):
     p.write_text(json.dumps(R.collect(c, str(tmp_path / "runs"))))
     assert MT.next_stage(W, out, str(p)) == 2
     assert not os.path.exists(os.path.join(out, "tune", "t-gemma-c0-slow-s3.json"))
+
+
+def test_t_grid_drops_chunks_the_cpu_tier_cannot_hold():
+    """Qwen at blocks_per_chunk 16: 5 CPU chunks where a restore beside a write needs 6; Gemma's 206 meet its 206."""
+    q = [k["blocks_per_chunk"] for _, k in MT.grid("qwen38_27b", "T", None, 4831838208, 32768)]
+    g = [k["blocks_per_chunk"] for _, k in MT.grid("gemma4_31b", "T", None, 8657043456, 32768)]
+    assert q == [1, 1] and g == [1, 1, 16, 16]

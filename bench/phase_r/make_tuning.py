@@ -19,7 +19,8 @@ Grids (section 8 and the decisions since), in grid order (first knob slowest):
       threads {16, 32} (FS_THREADS). blocks_per_chunk is connector-wide: the CPU tier's chunk is 16 blocks too. On
       Qwen that is 16 x 51,380,224 B, so the 4,831,838,208 B CPU tier holds 5 chunks (80 blocks, 4.11 GB) where the
       plan's restore-beside-write minimum is 2 x 47 blocks in whole chunks (6 chunks), and an offload hit rounds down
-      to 12,544 tokens (the Mamba alignment); on Gemma 206 chunks of 16 x 2,621,440 B, the minimum exactly. The cell's
+      to 12,544 tokens (the Mamba alignment); on Gemma 206 chunks of 16 x 2,621,440 B, the minimum exactly. A point
+      the CPU tier cannot hold that way does not run (bpc_fits): Qwen's T grid is blocks_per_chunk 1 only. The cell's
       kv_chunk_bytes (the regime check's random-read size) stays the 1-block chunk, the smaller and stricter read.
   T2  per disk, after T on that disk: threshold {2, 3} (T2_MIN_HITS) x count mode {request, store} (T2_COUNT), decay
       600 s (T2_DECAY_S), on T's tuned blocks_per_chunk and fs threads.
@@ -68,15 +69,29 @@ DROPPED = {"LM": ["eviction ARC: LMCache 0.5.5's --eviction-policy takes LRU, Is
                   "(lmcache/v1/distributed/config.py); eviction stays LRU"]}
 
 
-def grid(key, family, t_knobs=None):
-    """[(label, knobs)] of one family's grid in grid order. t_knobs: T's tuned knobs on the disk (T2 only)."""
+def bpc_fits(key, cpu_bytes, bpc, max_model_len):
+    """A blocks_per_chunk point the CPU tier can run: its chunk (bpc blocks) is the CPU tier's unit, and the tier must
+    hold one max-length restore beside one max-length write in whole chunks (BENCH_PLAN draft 6.4; sim_sizing
+    cpu_min_bytes at that chunk). Qwen at 16: 5 chunks fit where 2 x 3 are needed, so the point cannot run."""
+    m = M.MODELS[key]
+    chunk = bpc * m["chunk_bytes"]
+    per = -(-max_model_len * m["tier_bpt"] // chunk)
+    return int(cpu_bytes) // chunk >= 2 * per
+
+
+def grid(key, family, t_knobs=None, cpu_bytes=None, max_model_len=None):
+    """[(label, knobs)] of one family's grid in grid order. t_knobs: T's tuned knobs on the disk (T2 only). With
+    cpu_bytes and max_model_len, T's blocks_per_chunk points the CPU tier cannot hold are left out (bpc_fits)."""
     g = GRID[key]
     if family == "C0":
         return [(f"C0_{ev}" + (f"_b{b}" if b else ""), {"eviction": ev, "budget": b})
                 for ev, b in itertools.product(("lru", "arc"), g["c0_budget"])]
     if family == "T":
+        bs = [b for b in (1, 16) if cpu_bytes is None or bpc_fits(key, cpu_bytes, b, max_model_len)]
+        if not bs:
+            raise ValueError(f"{key}: a {cpu_bytes} B CPU tier is below the restore-beside-write minimum")
         return [(f"T_b{b}_t{t}", {"blocks_per_chunk": b, "fs_threads": t})
-                for b, t in itertools.product((1, 16), (16, 32))]
+                for b, t in itertools.product(bs, (16, 32))]
     if family == "T2":
         if not t_knobs:
             raise ValueError("T2's grid sits on T's tuned disk knobs")
@@ -142,7 +157,8 @@ def build(W, key, family, disk, stage, carried, labels=None):
     """One tuning cell (module docstring); labels: the advancing points (stages 2 and 3), else the whole grid."""
     if disk not in DISKS[family]:
         raise ValueError(f"{family} is not tuned on the {disk} disk")
-    pts = grid(key, family, carried.get("T"))
+    mc = W.C["models"][key]
+    pts = grid(key, family, carried.get("T"), mc["cpu_bytes"], int(mc["max_model_len"]))
     full = [lab for lab, _ in pts]
     if labels is not None:
         miss = set(labels) - set(full)
