@@ -9,10 +9,10 @@ Disks, one Nebius 1x RTX PRO 6000 VM (uk-south2), three settings:
   medium  the same network_ssd without io.max (pilot: r 0.59 Qwen, 0.52 Gemma; the regime check at block start
           decides: a measured r below 0.5 stops the block with exit 4)
   fast    the 2.5 TB network_ssd_non_replicated disk (/data2), no io.max (pilot: r 2.74 Qwen, 2.38 Gemma)
-Matrix per model (BENCH_PLAN draft 6.5): slow heavy (measured), slow pressure (sweep_1.5x: 1.5x P, the disk-pressure
-cell, owner 2026-10-13), slow light (light), fast heavy (measured); the unthrottled network_ssd (medium) was in pilot 2
-only, for its r and w. Arms C0 T T2 LM CT K K_ewma in the slow cells,
-K_km added in Qwen slow heavy; C0 T T2 LM K K_ewma in fast (CT runs in the slow cells only, plan 5.2).
+Matrix per model (BENCH_PLAN draft 6.6): slow pressure (sweep_1.5x: 1.5x P, H1 and H4 primary, owner 2026-10-13),
+slow heavy (measured, H1 secondary), slow light (light), fast heavy (measured); the unthrottled network_ssd (medium)
+was in pilot 2 only, for its r and w. Arms C0 T T2 LM CT K K_ewma in the slow cells,
+K_km added in Qwen slow pressure; C0 T T2 LM K K_ewma in fast (CT runs in the slow cells only, plan 5.2).
 
 Start-block cells (s-*, written to cells/start one arm per block): C0 dry runs on the slow disk for the measured,
 pressure and light workloads (each sets its cells' hard cap), and CT and LM on the pilot workload (GPU checks of the
