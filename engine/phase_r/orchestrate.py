@@ -206,14 +206,18 @@ def filler_arm(c):
     return {"label": order.FILLER, "code": FILLER_CODE, "env": {}, "filler": True, "rss_of": src}
 
 
+CPU_TIER_ALIGN = 64 << 20   # LMCache lazy_memory_allocator.PIN_CHUNK_SIZE
+
+
 def check_cpu_tiers(c):
     """Every arm's CPU tier is capacities.cpu_bytes exactly: no env overrides cpu_bytes_to_use, and LMCache's L1
     (a float of GiB) gives back the same bytes. Returns {label: bytes}."""
     cpu = parse_size(c["capacities"]["cpu_bytes"])
-    if cpu % cgroup.PAGE:
-        # LMCache's NIXL L2 adapter fails at startup on an L1 that is not whole pages (NIXL_ERR_NOT_FOUND), and the
-        # CPU tier is the same bytes in every arm
-        raise ValueError(f"capacities.cpu_bytes {cpu} is not a whole number of {cgroup.PAGE} B pages")
+    if cpu % CPU_TIER_ALIGN:
+        # LMCache 0.5.5's lazy L1 allocator rounds its address space up to 64 MiB but registers the configured size
+        # with NIXL: a store placed in the tail is rejected (NIXL_ERR_INVALID_PARAM, pilot 2: 16 store tasks, about 4%
+        # of keys dropped) and arm LM gets more L1 than the cell; below a page it fails at startup (pilot 1)
+        raise ValueError(f"capacities.cpu_bytes {cpu} is not a multiple of {CPU_TIER_ALIGN} B (LMCache's L1 pin chunk)")
     envs = [c["runner"].get("env") or {}] + [s.get("env") or {} for s in c["slots"]] + [a["env"] for a in c["arms"]]
     for e in envs:
         if "cpu_bytes_to_use" in str(e.get("OFF_EXTRA", "")):

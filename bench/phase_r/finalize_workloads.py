@@ -80,8 +80,9 @@ for M in models:
     P = meas["peak_live_kv_bytes"]
     floor = int(1.1 * k.get("gpu_request_bytes", k["longest_request_bytes"]))
     gpu = max(int(a.gpu_share * P), floor)
-    cmin = cpu_min_bytes(k, M["cap"])
-    cpu = max(int(a.fast_total * P) - gpu, int(a.cpu_floor * P), cmin) // 4096 * 4096
+    A = 64 << 20                                     # whole 64 MiB (LMCache's L1 pin chunk)
+    cmin = -(-cpu_min_bytes(k, M["cap"]) // A) * A
+    cpu = max((int(a.fast_total * P) - gpu) // A * A, int(a.cpu_floor * P) // A * A, cmin)
     mc = dict(measured_workload=f"{M['name']}.measured", hf=M["hf"], max_model_len=M["cap"], ctx_cap_source=M["cap_source"],
               kv_dtype=k["dtype"], grow_bytes_per_token=k["grow_bytes_per_token"],
               state_bytes_per_session=k["state_bytes_per_session"], window_tokens=k["window_tokens"],
@@ -91,7 +92,7 @@ for M in models:
               gpu_request_source=k.get("gpu_request_source"), gpu_request_check=k.get("gpu_request_check"), P_bytes=P, P_grow_tokens=meas["peak_live_kv_tokens"],
               gpu_kv_bytes_plan=int(0.15 * P), gpu_kv_floor_bytes=floor, gpu_kv_bytes=gpu, gpu_kv_floored=gpu == floor,
               cpu_bytes=cpu, gpu_share=round(gpu / P, 4), cpu_share=round(cpu / P, 4),
-              cpu_floored=cpu == int(a.cpu_floor * P) // 4096 * 4096, cpu_min_bytes=cmin, cpu_at_min=cpu == cmin // 4096 * 4096,
+              cpu_floored=cpu == int(a.cpu_floor * P) // A * A, cpu_min_bytes=cmin, cpu_at_min=cpu == cmin,
               tier_bytes_per_token=k["tier_bytes_per_token"], capacity_rule=dict(
                   gpu_share=a.gpu_share, fast_total=a.fast_total, cpu_floor=a.cpu_floor,
                   cpu_min="1.5 x max_model_len x tier_bytes_per_token, whole tier chunks (a disk restore is staged through the CPU tier)"), service_model=dict(c0=M["c0"], tpot=M["tpot"], b_per_1k_prompt=M["b"],

@@ -132,6 +132,7 @@ def main():
     mx = np.array([max(t["ctx"] for t in s["turns"]) for s in sessions])
     tier_peak = peak_tokens * a.tier_bytes_per_token
     cpu = math.ceil(a.cpu_sessions * mx.max() * a.tier_bytes_per_token / a.chunk_bytes) * a.chunk_bytes
+    cpu = -(-cpu // (64 << 20)) * (64 << 20)        # whole 64 MiB (LMCache's L1 pin chunk; orchestrate.check_cpu_tiers)
     share = cpu / tier_peak
     T = [t for s in sessions for t in s["turns"]]
     resumed = [(s["turns"][i - 1]["gap_after"], s["turns"][i]["kind"]) for s in sessions for i in range(1, len(s["turns"]))]

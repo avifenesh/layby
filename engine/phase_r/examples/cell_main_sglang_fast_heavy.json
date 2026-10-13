@@ -9,7 +9,7 @@
  "load": "heavy",
  "pilot": "pilot_qwen3_8b_sglang.json",
  "workload": {"path": "/root/phase_r/measured.json", "sessions": 28, "turns": 1133},
- "capacities": {"gpu_kv_bytes": "10047622348", "cpu_bytes": "26793656320", "disk_bytes": "346861102694"},
+ "capacities": {"gpu_kv_bytes": "10047622348", "cpu_bytes": "26776436736", "disk_bytes": "346861102694"},
  "ram_tier_bytes": "346861102694",
  "hard_cap_s": 9000,
  "kv_chunk_bytes": 9437184,

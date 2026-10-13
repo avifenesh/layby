@@ -15,7 +15,7 @@
  },
  "capacities": {
   "gpu_kv_bytes": "3475860867",
-  "cpu_bytes": "34271039488",
+  "cpu_bytes": "34225520640",
   "disk_bytes": "114480725428"
  },
  "hard_cap_s": 13500,

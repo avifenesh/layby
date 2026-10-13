@@ -30,7 +30,12 @@ class CpuTier(unittest.TestCase):
                     "arms": [{"label": "C0", "code": "C0", "env": {}}, {"label": "LM", "code": "LM", "env": {}}]}
         with self.assertRaises(ValueError):
             orchestrate.check_cpu_tiers(cell(26793659596))
-        self.assertEqual(set(orchestrate.check_cpu_tiers(cell(26793656320)).values()), {26793656320})
+        # 2026-10-12 pilot 2: whole pages are not enough. LMCache's lazy L1 rounds its space up to 64 MiB and registers
+        # the configured size with NIXL, so a store in the tail fails (NIXL_ERR_INVALID_PARAM); Gemma's 6,474,956,800 B
+        # (whole pages) dropped 16 store tasks
+        with self.assertRaises(ValueError):
+            orchestrate.check_cpu_tiers(cell(6474956800))
+        self.assertEqual(set(orchestrate.check_cpu_tiers(cell(96 << 26)).values()), {96 << 26})
 
 
 class KDiskReference(unittest.TestCase):

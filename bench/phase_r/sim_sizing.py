@@ -65,6 +65,9 @@ def sim_reserve_params(kv):
     return dict(req_tokens=0, req_tokens_prefill=None, win_groups=0)
 
 
+CPU_ALIGN = 64 << 20   # the CPU tier is whole 64 MiB (LMCache L1 pin chunks; orchestrate.check_cpu_tiers)
+
+
 def cpu_min_bytes(kv, cap, sessions=1.5):
     """The CPU tier a disk restore needs: a restore is staged through the CPU tier, so it holds sessions x one
     max-length context at the tier's measured bytes per token, in whole tier chunks (the kdisk rule)."""
@@ -74,12 +77,13 @@ def cpu_min_bytes(kv, cap, sessions=1.5):
 def capacities(P, gpu_floor, gpu_share=0.15, fast_total=0.55, cpu_floor=0.05, cpu_min=0):
     """BENCH_PLAN draft 6 capacity rule: GPU KV max(the engine's floor, gpu_share x P); CPU tier fast_total x P minus
     the GPU KV (GPU + CPU = fast_total x P, the original 0.15 + 0.40), at least cpu_floor x P and at least cpu_min
-    bytes (cpu_min_bytes: the disk path must restore a max-length session); whole pages."""
+    bytes (cpu_min_bytes: the disk path must restore a max-length session); whole 64 MiB."""
     gpu = max(int(gpu_floor), int(gpu_share * P))
-    cpu = max(int(fast_total * P) - gpu, int(cpu_floor * P), int(cpu_min)) // 4096 * 4096
+    cmin = -(-int(cpu_min) // CPU_ALIGN) * CPU_ALIGN                  # the minimum rounds up, the rest down
+    cfloor = int(cpu_floor * P) // CPU_ALIGN * CPU_ALIGN
+    cpu = max((int(fast_total * P) - gpu) // CPU_ALIGN * CPU_ALIGN, cfloor, cmin)
     return dict(gpu_bytes=gpu, cpu_bytes=cpu, P=int(P), gpu_share=round(gpu / P, 4), cpu_share=round(cpu / P, 4),
-                total_share=round((gpu + cpu) / P, 4), cpu_floored=cpu == int(cpu_floor * P) // 4096 * 4096,
-                cpu_at_min=cpu == int(cpu_min) // 4096 * 4096)
+                total_share=round((gpu + cpu) / P, 4), cpu_floored=cpu == cfloor, cpu_at_min=cpu == cmin)
 
 
 def run_c0(sessions, fit, until=None, caps=None):
