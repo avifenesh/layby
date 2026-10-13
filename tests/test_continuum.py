@@ -7,7 +7,8 @@
    the request's blocks (out of the free queue after the scheduler frees the request); a human turn or a last request
    does not pin; the program's next request records the tool's duration and its admission ends the pin; an expired
    TTL ends a pin unless the program has a request waiting; when the oldest waiting request does not fit, pins go
-   latest program arrival first, and the waiting program's own pin stays.
+   latest program arrival first, one per scheduler step in which vLLM looked a waiting request up, could not
+   allocate it and ran nothing; the waiting program's own pin is a victim too (the Gemma stall of pilot 2).
 Run: PYTHONPATH=. python tests/test_continuum.py
 """
 import math
@@ -158,7 +159,33 @@ clock[0] += conn._pins["q"]["tau"] + 0.01
 step()
 assert "q" not in conn._pins and pool.get_num_free_blocks() == FREE0
 
-# deadlock prevention: x then y then z pinned (program arrival order); a waiting request needs more than is free
+# deadlock prevention (section 5.2): the scheduler looked up the head waiting request, could not allocate it and ran
+# nothing, so a pin goes, latest program arrival first, one per step (vLLM retries the request next step)
+def tried(r):
+    """vLLM looked r up (its connector lookup finished) and did not allocate it: no update_state_after_alloc."""
+    if r.request_id not in conn._waiting:
+        conn.on_new_request(r)
+    conn.get_num_new_matched_tokens(r, 0)
+
+
+OffloadingConnector.get_num_new_matched_tokens = lambda self, r, n: (getattr(r, "ext", 0), False)
+
+# the stall: a program's next request does not extend its pinned prefix (its prompt shrank) and needs more than is
+# free; the pin's TTL expired, but its program waits, so only deadlock prevention can free it, the program's own pin
+# included (the paper names no exception; an unpinned block stays in the prefix cache, evictable)
+s0 = req("s0", "s-0", 50 * BT, park_kind="tool", park_tool="Read")
+bs = run(s0); finish(s0, bs)
+assert "s" in conn._pins and pool.get_num_free_blocks() == FREE0 - 50
+clock[0] += conn._pins["s"]["tau"] + 1.0
+s1 = req("s1", "s-1", 30 * BT, park_kind="tool", park_tool="Edit")   # 30 blocks > 13 free; old estimate 30 - 50 < 0
+tried(s1)
+step()
+assert "s" not in conn._pins, f"the waiting program's own pin was kept while nothing could run: {set(conn._pins)}"
+assert pool.get_num_free_blocks() == FREE0 and CC.CT_STATE.counts["unpin_pressure"] == 1
+b1 = pool.get_new_blocks(30); conn.update_state_after_alloc(s1, NS(blocks=(b1,)), 0)   # admitted next step
+conn._waiting.pop("s1", None); pool.free_blocks(reversed(b1))
+assert pool.get_num_free_blocks() == FREE0
+
 pins = {}
 for s in ("x", "y", "z"):
     clock[0] += 0.01                                      # well inside the TTL (ln 2 s)
@@ -167,18 +194,25 @@ for s in ("x", "y", "z"):
     pins[s] = b
 free = pool.get_num_free_blocks()
 assert free == FREE0 - 30
-big = req("w0", "x-1", (free + 5) * BT, park_kind="tool", park_tool="Grep")   # x's next turn: its own pin covers 10
-conn.on_new_request(big)
-conn.get_num_new_matched_tokens(big, 0)
-step()
-# need = free + 5 - 10 (x's own pin) < free: fits without unpinning anyone
+# a request that was scheduled this step, or a lookup still pending (None), releases nothing
+w = req("w0", "w-0", (free + 15) * BT)
+tried(w)
+conn.build_connector_meta(NS(total_num_scheduled_tokens=7))       # something ran: vLLM waits for it to finish
 assert set(conn._pins) == {"x", "y", "z"}, set(conn._pins)
-conn._waiting.clear()
-big2 = req("w1", "w-0", (free + 15) * BT)                 # a new program: needs 15 blocks more than free
-conn.on_new_request(big2)
+w.ext = None
+tried(w)
 step()
-assert set(conn._pins) == {"x"}, f"expected z then y unpinned (latest arrival first), left {set(conn._pins)}"
-assert CC.CT_STATE.counts["unpin_pressure"] == 2
-assert pool.get_num_free_blocks() == free + 20
+assert set(conn._pins) == {"x", "y", "z"}, "a pending connector lookup is not an allocation failure"
+del w.ext
+step()                                                    # no lookup this step: nothing to relieve
+assert set(conn._pins) == {"x", "y", "z"}
+tried(w); step()
+assert set(conn._pins) == {"x", "y"}, f"expected z (latest arrival) first, left {set(conn._pins)}"
+tried(w); step()
+assert set(conn._pins) == {"x"}, f"expected y next, left {set(conn._pins)}"
+bw = pool.get_new_blocks(free + 15)                       # now it fits: admitted, x keeps its pin
+conn.update_state_after_alloc(w, NS(blocks=(bw,)), 0)
+step()
+assert set(conn._pins) == {"x"} and CC.CT_STATE.counts["unpin_pressure"] == 3
 print("pin ok: tool turns pinned for the TTL, unpinned at admission, at expiry, and latest-arrival first under pressure")
 print("CT ok")

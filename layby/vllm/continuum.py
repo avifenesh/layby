@@ -27,8 +27,10 @@ The next request of the program gets them as a prefix-cache hit. A pin ends (Blo
 the blocks go back to the free queue as vLLM frees a request) when
   - the program's next request is admitted (the paper's line 26: it now holds its own references);
   - the TTL expired and no request of the program is waiting (section 5.2, unpin_requests);
-  - the oldest waiting request does not fit in the free blocks: pins go, latest program arrival first, until it
-    fits (section 5.2, deadlock prevention).
+  - vLLM could not allocate the head waiting request and ran nothing in that step: the pin of the latest program
+    arrival goes, the waiting program's own pin included (section 5.2, deadlock prevention; the reference
+    scheduler unpins when allocation fails with an empty running queue). An unpinned block stays in the prefix
+    cache, evictable, so the waiting program can still hit it.
 
 Measured here: the duration of each tool call (a program's finish to its next request's arrival, server side), T
 (the mean admission wait of requests whose program's KV was evicted from the GPU: a returning request whose GPU
@@ -45,10 +47,11 @@ Deviations from the paper (also in the paper's baseline appendix):
   - The tool name and the tool-call flag come from the client (kv_transfer_params) instead of a parser of the
     model's output (section 5.1); the replay's outputs are random tokens, so the workload's recorded tool names stand
     in for the parsed ones.
-  - The deadlock check runs once per scheduler step, after vLLM's schedule, against the oldest waiting request's
-    block need (its tokens less what its own pin covers) and the pool's free blocks; the paper unpins inside the
-    scheduler when an allocation fails. A request that waits for another reason (token budget, max_num_seqs) and
-    fits releases nothing.
+  - The deadlock check runs after vLLM's schedule, not inside it: a step that looked a waiting request up (its
+    connector lookup finished), did not allocate it and scheduled no tokens unpins one pin; vLLM retries the
+    request next step, so pins go one per step until it is scheduled (the paper unpins in a loop inside the
+    failed allocation). The engine's allocator is the judge: no block count is estimated here, which a hybrid
+    model (sliding-window groups, PR #60045's admission count) would get wrong.
   - T_default is recomputed per request from the current T and that request's R (the paper derives one fixed value
     from the same formula).
 Differences from the simulator's port (sim/baselines.py ContinuumTTL), which this follows where the paper is silent:
@@ -147,6 +150,7 @@ class ContinuumConnector(OffloadingConnector):
         self._pins: dict[str, dict] = {}            # session -> {blocks, expiry, arrival, tau}
         self._waiting: dict[str, tuple] = {}        # request id -> (time added, session, request)
         self._local: dict[str, int] = {}            # request id -> GPU prefix hit at its lookup
+        self._tried: set = set()                    # request ids looked up and not allocated in this step
         self._last: dict[str, tuple] = {}           # session -> (finish time, tool or None, tokens held)
         self._arrival: dict[str, float] = {}        # session -> its program's first arrival
         self._waits: deque = deque()                # (time, admission wait) of returns whose KV was evicted
@@ -195,7 +199,10 @@ class ContinuumConnector(OffloadingConnector):
 
     def get_num_new_matched_tokens(self, request, num_computed_tokens):
         self._local[request.request_id] = int(num_computed_tokens)
-        return super().get_num_new_matched_tokens(request, num_computed_tokens)
+        out = super().get_num_new_matched_tokens(request, num_computed_tokens)
+        if out is not None and out[0] is not None:          # None: the lookup is still pending, vLLM skips it
+            self._tried.add(request.request_id)
+        return out
 
     def update_state_after_alloc(self, request, blocks, num_external_tokens: int):
         out = super().update_state_after_alloc(request, blocks, num_external_tokens)
@@ -204,6 +211,7 @@ class ContinuumConnector(OffloadingConnector):
 
     def _admit(self, request):
         now = self.clock()
+        self._tried.discard(request.request_id)
         w = self._waiting.pop(request.request_id, None)
         local = self._local.pop(request.request_id, None)
         if w is None:
@@ -229,31 +237,27 @@ class ContinuumConnector(OffloadingConnector):
         now = self.clock()
         for job_id, job in getattr(meta, "load_jobs", {}).items():
             self._loads[job_id] = (now, len(job.src_spec.block_ids) * self.chunk_tokens)
-        _safe("unpin", self._step, now)
+        blocked = bool(self._tried) and not getattr(scheduler_output, "total_num_scheduled_tokens", 0)
+        self._tried = set()
+        _safe("unpin", self._step, now, blocked)
         return meta
 
-    def _step(self, now):
+    def _step(self, now, blocked=False):
         waiting = {s for _, s, _ in self._waiting.values() if s is not None}
         for sess, p in list(self._pins.items()):
             if p["expiry"] < now and sess not in waiting:
                 self._unpin(sess)
                 CT_STATE.counts["unpin_ttl"] += 1
-        self._relieve()
+        if blocked:
+            self._relieve()
 
     def _relieve(self):
-        """Deadlock prevention: unpin, latest program arrival first, until the oldest waiting request fits."""
-        if not self._waiting or not self._pins or self._pool is None:
+        """Deadlock prevention (section 5.2): vLLM could not allocate the head waiting request and ran nothing, so
+        the pin of the latest program arrival goes, the waiting program's own pin included; one per step."""
+        if not self._pins or self._pool is None:
             return
-        t_add, sess, req = min(self._waiting.values(), key=lambda w: w[0])
-        own = self._pins.get(sess)
-        need = -(-int(getattr(req, "num_tokens", 0)) // self.block_tokens) - (len(own["blocks"]) if own else 0)
-        free = self._pool.get_num_free_blocks()
-        victims = sorted((s for s in self._pins if s != sess), key=lambda s: self._pins[s]["arrival"], reverse=True)
-        for v in victims:
-            if free >= need:
-                break
-            free += self._unpin(v)
-            CT_STATE.counts["unpin_pressure"] += 1
+        self._unpin(max(self._pins, key=lambda s: self._pins[s]["arrival"]))
+        CT_STATE.counts["unpin_pressure"] += 1
 
     def update_connector_output(self, connector_output):
         _safe("cpu link", self._links, connector_output)
@@ -289,6 +293,7 @@ class ContinuumConnector(OffloadingConnector):
         now = self.clock()
         self._waiting.pop(request.request_id, None)
         self._local.pop(request.request_id, None)
+        self._tried.discard(request.request_id)
         params = _params(request)
         sess = session_of(params.get("park_key"))
         if sess is None:
