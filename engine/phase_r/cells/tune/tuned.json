@@ -1,0 +1,22 @@
+{
+ "_comment": "Tuned settings (bench/phase_r/make_tuning.py next, from the stage-3 rankings of tune_rank.py): per model, C0's knobs (carried to every cell) and T, T2, LM per disk; make_cells.py --tuned reads it.",
+ "gemma4_31b": {
+  "C0": {
+   "block": {
+    "attempt": 1,
+    "host": "tune-gemma",
+    "repeat": 1
+   },
+   "carried": {},
+   "cell": "t-gemma-c0-slow-s3",
+   "knobs": {
+    "budget": null,
+    "eviction": "lru"
+   },
+   "label": "C0_lru",
+   "p50": 10.991009,
+   "p95": 49.340356,
+   "ranking": "rank/t-gemma-c0-slow-s3.json"
+  }
+ }
+}
