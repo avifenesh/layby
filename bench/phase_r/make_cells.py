@@ -30,9 +30,19 @@ projected C0 makespan (pilot 2's T arms on the fast disk measure it).
 
 The start block runs each arm as its own one-attempt block (cells/start/CELL.NN.ARM.json), as the pilots did.
 
-Usage: make_cells.py WORKLOAD_DIR [--out engine/phase_r/cells]
+Tuned settings (BENCH_PLAN section 8; bench/phase_r/make_tuning.py writes them to cells/tune/tuned.json, read with
+--tuned, by default that file when it exists): C0's eviction and chunked-prefill budget carry to every cell of the
+model (runner env EVICTION, and SERVE_ARGS with --max-num-batched-tokens on Qwen; Gemma's 1,024 is fixed in its serve
+args); every arm the runner gives vLLM's own CPU policy (C0 T T2 CT) takes the eviction, every arm the budget. K's
+ParkCachePolicy orders its unhinted chunks LRU whatever EVICTION says (layby/vllm/policy.py), and LMCache has its own
+L1 eviction. T, T2 and LM take their tuned knobs per disk (the cell's regime): T BLOCKS_PER_CHUNK and FS_THREADS, T2
+its threshold, count mode and decay on T's disk knobs, LM LM_CHUNK and its prefetch policy (code LMR for retain,
+label LM). An arm with no tuned entry keeps the defaults above (T2_ENV, LM_CHUNK 784 on Qwen and the runner's own).
+
+Usage: make_cells.py WORKLOAD_DIR [--out engine/phase_r/cells] [--tuned cells/tune/tuned.json]
 """
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -61,7 +71,65 @@ MODELS = {
 }
 SLOW_ARMS = ["C0", "T", "T2", "LM", "CT", "K", "K_ewma"]
 OTHER_ARMS = ["C0", "T", "T2", "LM", "K", "K_ewma"]
-T2_ENV = {"T2_MIN_HITS": "2", "T2_DECAY_S": "600", "T2_COUNT": "request"}   # tuned on the tuning workload later
+T2_ENV = {"T2_MIN_HITS": "2", "T2_DECAY_S": "600", "T2_COUNT": "request"}   # the default until T2 is tuned
+TUNED_FAMILIES = ("T", "T2", "LM")   # tuned per disk; C0 once per model (slow disk), carried to every cell
+
+
+def c0_env(key, knobs):
+    """Runner env of C0's tuned knobs {eviction, budget}: EVICTION, and SERVE_ARGS with --max-num-batched-tokens when
+    the model's budget is tuned (Qwen); a budget beside one already in the serve args (Gemma's 1,024) is refused."""
+    env = {"EVICTION": str(knobs["eviction"])}
+    if knobs.get("budget") is not None:
+        serve = MODELS[key]["serve"]
+        if "--max-num-batched-tokens" in serve:
+            raise ValueError(f"{key}: the serve args already fix --max-num-batched-tokens")
+        env["SERVE_ARGS"] = f"{serve} --max-num-batched-tokens {int(knobs['budget'])}"
+    return env
+
+
+def family_arm(family, knobs):
+    """(runner code, arm env) of one T, T2 or LM grid point (run_arms.sh docstring): T {blocks_per_chunk,
+    fs_threads}; T2 {min_hits, count, decay_s} plus T's two; LM {chunk, prefetch: default or retain (code LMR)}."""
+    if family in ("T", "T2"):
+        env = {"BLOCKS_PER_CHUNK": str(int(knobs["blocks_per_chunk"])), "FS_THREADS": str(int(knobs["fs_threads"]))}
+        if family == "T2":
+            env.update(T2_MIN_HITS=str(int(knobs["min_hits"])), T2_COUNT=str(knobs["count"]),
+                       T2_DECAY_S=str(int(knobs["decay_s"])))
+        return family, env
+    if family == "LM":
+        if knobs["prefetch"] not in ("default", "retain"):
+            raise ValueError(f"LM prefetch {knobs['prefetch']!r}")
+        return ("LMR" if knobs["prefetch"] == "retain" else "LM"), {"LM_CHUNK": str(int(knobs["chunk"]))}
+    raise ValueError(f"no tuned knobs for family {family!r}")
+
+
+def load_tuned(path):
+    """The tuned settings JSON (make_tuning.py next) and its sha256, or (None, None) without a file."""
+    if not path or not os.path.exists(path):
+        return None, None
+    raw = open(path, "rb").read()
+    return json.loads(raw), hashlib.sha256(raw).hexdigest()
+
+
+def apply_tuned(c, key, tuned, sha=None, path=None):
+    """Carry the tuned settings into cell c (in place): C0's knobs into the runner env, each tuned family's knobs
+    for the cell's disk (regime) into the arm labelled with that family. Records what it applied in c["tuned"]."""
+    t = (tuned or {}).get(key) or {}
+    applied = {}
+    if t.get("C0"):
+        c["runner"]["env"].update(c0_env(key, t["C0"]["knobs"]))
+        applied["C0"] = t["C0"]["knobs"]
+    for a in c["arms"]:
+        fam = a["label"]
+        entry = (t.get(fam) or {}).get(c["regime"]) if fam in TUNED_FAMILIES else None
+        if entry:
+            code, env = family_arm(fam, entry["knobs"])
+            a["code"] = code
+            a["env"] = dict({k: v for k, v in (a.get("env") or {}).items() if not k.startswith("T2_")}, **env)
+            applied[fam] = entry["knobs"]
+    if applied:
+        c["tuned"] = {"file": os.path.basename(path) if path else None, "sha256": sha, "applied": applied}
+    return applied
 
 
 def offered_write(key, man):
@@ -109,7 +177,9 @@ def disk(regime, c):
         c["dry_run"] = {"probe": dict(NRD)}
 
 
-def cell(name, key, man, caps, regime, load, wl, arms, ct_eta, cap_src, extra=None):
+def cell(name, key, man, caps, regime, load, wl, arms, ct_eta, cap_src, extra=None, tuned=None):
+    """One cell spec (engine/phase_r/examples/cell_main_vllm_slow_heavy.json documents the format). tuned: (settings,
+    sha256, path) from load_tuned, carried into the cell by apply_tuned."""
     m = MODELS[key]
     proj = man.get("c0_projection") or {}
     mk = proj.get("makespan_s") or man["load"]["est_makespan_s"]
@@ -124,6 +194,9 @@ def cell(name, key, man, caps, regime, load, wl, arms, ct_eta, cap_src, extra=No
         env["MAX_NUM_SEQS"] = str(min(64, blocks // 8 * 8))
     A = []
     for x in arms:
+        if isinstance(x, dict):   # a built arm (make_tuning.py: grid points with their own labels and env)
+            A.append(x)
+            continue
         a = {"label": x, "code": x}
         if x == "T2":
             a["env"] = dict(T2_ENV)
@@ -154,6 +227,8 @@ def cell(name, key, man, caps, regime, load, wl, arms, ct_eta, cap_src, extra=No
     disk(regime, c)
     if extra:
         c.update(extra)
+    if tuned and tuned[0]:
+        apply_tuned(c, key, *tuned)
     return c
 
 
@@ -162,9 +237,15 @@ def main():
     ap.add_argument("workloads")
     ap.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "engine",
                                                   "phase_r", "cells"))
+    ap.add_argument("--tuned", help="tuned settings JSON (default OUT/tune/tuned.json when it exists)")
     a = ap.parse_args()
     out = os.path.abspath(a.out)
     os.makedirs(out, exist_ok=True)
+    tuned_path = a.tuned or os.path.join(out, "tune", "tuned.json")
+    tuned, tuned_sha = load_tuned(tuned_path)
+    if a.tuned and tuned is None:
+        ap.error(f"--tuned {a.tuned}: no such file")
+    tune = (tuned, tuned_sha, tuned_path)
     C = json.load(open(os.path.join(a.workloads, "capacities.json")))
     MAXLEN.update({k: int(v["max_model_len"]) for k, v in C["models"].items()})
     man = lambda n: json.load(open(os.path.join(a.workloads, f"{n}.manifest.json")))   # noqa: E731
@@ -199,17 +280,17 @@ def main():
             arms = (SLOW_ARMS if regime == "slow" else OTHER_ARMS) + (
                 ["K_km"] if m["kkm_cell"] == f"{regime}-{load}" else [])
             name = f"{m['tag']}-{regime}-{load}"
-            put(f"{name}.json", cell(name, key, man(wl), caps(wl), regime, load, wl, arms, eta, src))
+            put(f"{name}.json", cell(name, key, man(wl), caps(wl), regime, load, wl, arms, eta, src, tuned=tune))
         # start block (BENCH_PLAN draft 6.5): C0 dry runs on the slow disk for every workload a cell runs (each sets
         # its cells' hard cap, 1.5x its makespan), then CT and LM once on the pilot workload: the GPU checks of the CT
         # pin release (90d52d5, 9adb696) and of the whole-64 MiB CPU tier (6bea6ae), neither yet run on a GPU host
         for load, wlk in (("heavy", "measured"), ("pressure", "sweep_1.5x"), ("light", "light")):
             wl = f"{key}.{wlk}"
             put(f"s-{m['tag']}-c0dry-{load}.json", cell(f"s-{m['tag']}-c0dry-{load}", key, man(wl), caps(wl), "slow",
-                                                        load, wl, ["C0"], eta, src))
+                                                        load, wl, ["C0"], eta, src, tuned=tune))
         wl = f"{key}.pilot"
         put(f"s-{m['tag']}-check.json", cell(f"s-{m['tag']}-check", key, man(wl), caps(wl), "slow", "heavy", wl,
-                                             ["CT", "LM"], eta, src))
+                                             ["CT", "LM"], eta, src, tuned=tune))
     for p in written:
         print(p)
 
