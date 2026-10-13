@@ -10,7 +10,7 @@ rule) grows with --max-num-batched-tokens C. For each measured C this script:
      scaled by the KP and KD refitted on the measured Gemma C0 runs with the corrected reserve (--fit)
   3. the drained load at C: the measured partition's candidates (build_workloads.py --dump-candidates), the largest
      session count whose projected C0 resumed turns are admitted on arrival at the median, each count projected at the capacities
-     of its own P (BENCH_PLAN draft 6.1 rule: GPU max(0.15 P, floor), CPU 0.55 P - GPU, at least 0.05 P and 1.5
+     of its own P (BENCH_PLAN draft 6.1 rule: GPU max(0.15 P, floor), CPU 0.55 P - GPU, at least 0.05 P and 2
      max-length contexts), the builder's search (build_workloads.assemble_inflight)
 Rule (the plan's pre-registered GPU share): the largest C whose floor(C) <= 0.15 P(C). Writes --out JSON.
 

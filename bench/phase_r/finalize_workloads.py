@@ -8,7 +8,7 @@ For every workload NAME.json in DIR whose name starts with a model's name:
   kv       the builder's accounting (manifest load): P = peak live KV bytes, unique KV bytes, the disk tier
 Capacities per model, from its measured workload's P (BENCH_PLAN section 5, draft 6): GPU KV max(0.15 P, 1.1 x the GPU KV
 the engine needs for one request at the context cap, kv.gpu_request_bytes, so the engine can start), CPU tier 0.55 P
-minus the GPU KV (GPU + CPU = 0.55 P, the original 0.15 + 0.40), at least 0.05 P and at least 1.5 max-length contexts
+minus the GPU KV (GPU + CPU = 0.55 P, the original 0.15 + 0.40), at least 0.05 P and at least one max-length restore beside one max-length write
 at the tier's measured bytes per token (sim_sizing.cpu_min_bytes; a disk restore is staged through the CPU tier). Per workload: disk tier
 1.2 x max(1, the model's measured disk_write_factor: bytes the tier wrote per unique KV byte in pilot 2's T arms) x
 unique KV at turn ends (one recurrent state and the window's new tokens per turn end; the coordinator's
@@ -64,7 +64,7 @@ caps = dict(_note=(
     "of started, unfinished sessions on the builder's service-time model: grow x context + recurrent state + "
     "min(context, window) x window bytes), not a C0 replay. Per model, from its measured workload: GPU KV "
     "max(0.15 P, 1.1 x gpu_request_bytes: the GPU KV the engine needs to admit one max_model_len request), CPU tier 0.55 P minus "
-    "the GPU KV, at least 0.05 P and at least 1.5 max_model_len contexts at tier_bytes_per_token (draft 6). Per workload: disk_bytes = 1.2 x "
+    "the GPU KV, at least 0.05 P and at least 2 max_model_len contexts at tier_bytes_per_token (a restore beside a write; draft 6.4). Per workload: disk_bytes = 1.2 x "
     "unique KV at turn ends (one recurrent state and the window's new tokens per turn end); disk_bytes_upper = 1.2 x "
     "the upper bound (sliding layers' KV for every token, a recurrent state per KV block, vLLM's mamba align mode), "
     "ct_eta = layby.continuum.memoryfulness. KV constants from the Hugging Face config.json "
@@ -95,7 +95,7 @@ for M in models:
               cpu_floored=cpu == int(a.cpu_floor * P) // A * A, cpu_min_bytes=cmin, cpu_at_min=cpu == cmin,
               tier_bytes_per_token=k["tier_bytes_per_token"], capacity_rule=dict(
                   gpu_share=a.gpu_share, fast_total=a.fast_total, cpu_floor=a.cpu_floor,
-                  cpu_min="1.5 x max_model_len x tier_bytes_per_token, whole tier chunks (a disk restore is staged through the CPU tier)"), service_model=dict(c0=M["c0"], tpot=M["tpot"], b_per_1k_prompt=M["b"],
+                  cpu_min="2 x max_model_len x tier_bytes_per_token, each in whole tier chunks (a disk restore is staged through the CPU tier while a parked write may hold it)"), service_model=dict(c0=M["c0"], tpot=M["tpot"], b_per_1k_prompt=M["b"],
                                                           inflight=M["inflight"], status=M["service_assumption"]["status"]))
     caps["models"][M["name"]] = mc
     for n in names:

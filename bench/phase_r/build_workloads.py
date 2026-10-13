@@ -53,7 +53,7 @@ makespan, mean requests in flight and resumed-turn TTFT. With --size-drained (th
 workload takes the largest session count whose projected C0 resumed turns are admitted on arrival at the median
 (resumed-turn queue wait median 0), projected at the
 capacities of its own peak live KV P (GPU KV max(1.1 x the GPU request bytes, 0.15 P), CPU tier 0.55 P minus the GPU KV,
-at least 0.05 P and at least 1.5 max-length contexts at the tier's bytes per token); every other workload is sized to that P (extras to their multiple) and projected at those
+at least 0.05 P and at least 2 max-length contexts at the tier's bytes per token: a restore beside a write); every other workload is sized to that P (extras to their multiple) and projected at those
 capacities. --dump-candidates DIR writes each partition's ordered
 candidate sessions (full turns, starts drawn as in this mode) for scan_load.py and stops.
 
@@ -138,7 +138,7 @@ ap.add_argument("--size-drained", action="store_true", help="with --service-fit 
                 "the measured workload takes the largest number of sessions whose projected C0 resumed turns wait no "
                 "time in the queue at the median (resumed_queue_p50_s 0: admitted on arrival), at the capacities of "
                 "its own peak live KV P (sim_sizing.capacities: GPU max(1.1 x the GPU request bytes, --gpu-share P), "
-                "CPU --fast-total P minus GPU, at least --cpu-floor P and 1.5 max-length contexts); every other "
+                "CPU --fast-total P minus GPU, at least --cpu-floor P and 2 max-length contexts); every other "
                 "workload is sized to that P (extras to their multiple of it) at those capacities")
 ap.add_argument("--gpu-share", type=float, default=0.15)
 ap.add_argument("--fast-total", type=float, default=0.55)

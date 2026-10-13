@@ -68,16 +68,18 @@ def sim_reserve_params(kv):
 CPU_ALIGN = 64 << 20   # the CPU tier is whole 64 MiB (LMCache L1 pin chunks; orchestrate.check_cpu_tiers)
 
 
-def cpu_min_bytes(kv, cap, sessions=1.5):
-    """The CPU tier a disk restore needs: a restore is staged through the CPU tier, so it holds sessions x one
-    max-length context at the tier's measured bytes per token, in whole tier chunks (the kdisk rule)."""
-    return math.ceil(sessions * cap * kv["tier_bytes_per_token"] / kv["tier_chunk_bytes"]) * kv["tier_chunk_bytes"]
+def cpu_min_bytes(kv, cap, contexts=2):
+    """The CPU tier a disk restore needs: a restore is staged through the CPU tier while a parked write may hold it,
+    so the tier holds one max-length restore beside one max-length write (contexts=2; owner, 2026-10-12, after pilot
+    2's Gemma restores failed over to recompute at 1.5), each a whole number of tier chunks at the tier's measured
+    bytes per token."""
+    return contexts * math.ceil(cap * kv["tier_bytes_per_token"] / kv["tier_chunk_bytes"]) * kv["tier_chunk_bytes"]
 
 
 def capacities(P, gpu_floor, gpu_share=0.15, fast_total=0.55, cpu_floor=0.05, cpu_min=0):
     """BENCH_PLAN draft 6 capacity rule: GPU KV max(the engine's floor, gpu_share x P); CPU tier fast_total x P minus
     the GPU KV (GPU + CPU = fast_total x P, the original 0.15 + 0.40), at least cpu_floor x P and at least cpu_min
-    bytes (cpu_min_bytes: the disk path must restore a max-length session); whole 64 MiB."""
+    bytes (cpu_min_bytes: a max-length restore beside a max-length write); whole 64 MiB."""
     gpu = max(int(gpu_floor), int(gpu_share * P))
     cmin = -(-int(cpu_min) // CPU_ALIGN) * CPU_ALIGN                  # the minimum rounds up, the rest down
     cfloor = int(cpu_floor * P) // CPU_ALIGN * CPU_ALIGN
