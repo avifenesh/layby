@@ -61,7 +61,7 @@ MAXLEN = {}   # --max-model-len per model, capacities.json max_model_len (the wo
 MODELS = {
     "qwen38_27b": dict(
         tag="qwen", hf="Qwen/Qwen3.8-27B-FP8", serve="--revision 017b9c7af6b5689d5dd426a76e0bc077eb5ca20a",
-        lm_chunk=784, chunk_bytes=51_380_224, tier_bpt=72_472, prefill=10_477.5, kkm_cell="slow-heavy", mamba=True,
+        lm_chunk=784, chunk_bytes=51_380_224, tier_bpt=72_472, prefill=10_477.5, kkm_cell="slow-pressure", mamba=True,
         rss=dict(vllm=7 * GiB, k=7 * GiB, sidecar=2 * GiB, lm_vllm=6 * GiB, lm_server=2 * GiB)),
     "gemma4_31b": dict(
         tag="gemma", hf="google/gemma-4-31B-it",

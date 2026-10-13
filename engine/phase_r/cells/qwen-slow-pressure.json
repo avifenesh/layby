@@ -101,6 +101,10 @@
   {
    "label": "K_ewma",
    "code": "K_ewma"
+  },
+  {
+   "label": "K_km",
+   "code": "K_km"
   }
  ],
  "c0_dryrun_makespan_s": 2508.0,
