@@ -27,15 +27,15 @@ The next request of the program gets them as a prefix-cache hit. A pin ends (Blo
 the blocks go back to the free queue as vLLM frees a request) when
   - the program's next request is admitted (the paper's line 26: it now holds its own references);
   - the TTL expired and no request of the program is waiting (section 5.2, unpin_requests);
-  - vLLM could not allocate the head waiting request and ran nothing in that step: the pin of the latest program
-    arrival goes, the waiting program's own pin included (section 5.2, deadlock prevention; the reference
-    scheduler unpins when allocation fails with an empty running queue). An unpinned block stays in the prefix
-    cache, evictable, so the waiting program can still hit it.
+  - vLLM scheduled nothing in a step while requests waited, with no connector lookup pending and no CPU load in
+    flight: the pin of the latest program arrival goes, the waiting program's own pin included (section 5.2,
+    deadlock prevention; the reference scheduler unpins when allocation fails with an empty running queue). An
+    unpinned block stays in the prefix cache, evictable, so the waiting program can still hit it.
 
 Measured here: the duration of each tool call (a program's finish to its next request's arrival, server side), T
 (the mean admission wait of requests whose program's KV was evicted from the GPU: a returning request whose GPU
-prefix hit is at least one block short of what its program held at its last finish, over the last ct_window
-seconds), and R (Prefill-Reload: the session's tokens times the measured seconds per token of the connector's CPU to
+prefix hit is short of the prefix it shares with what its program held at its last finish by more than vLLM's own
+hit rounding, over the last ct_window seconds), and R (Prefill-Reload: the session's tokens times the measured seconds per token of the connector's CPU to
 GPU load jobs, submit to completion; before the first load, the KV bytes per token at 20 GB/s, the adapter's
 PCIe-class default).
 
@@ -47,11 +47,14 @@ Deviations from the paper (also in the paper's baseline appendix):
   - The tool name and the tool-call flag come from the client (kv_transfer_params) instead of a parser of the
     model's output (section 5.1); the replay's outputs are random tokens, so the workload's recorded tool names stand
     in for the parsed ones.
-  - The deadlock check runs after vLLM's schedule, not inside it: a step that looked a waiting request up (its
-    connector lookup finished), did not allocate it and scheduled no tokens unpins one pin; vLLM retries the
-    request next step, so pins go one per step until it is scheduled (the paper unpins in a loop inside the
-    failed allocation). The engine's allocator is the judge: no block count is estimated here, which a hybrid
-    model (sliding-window groups, PR #60045's admission count) would get wrong.
+  - The deadlock check runs after vLLM's schedule, not inside it: a step that scheduled no tokens while requests
+    were waiting, with no connector lookup pending and no CPU load in flight, unpins one pin; vLLM retries next
+    step, so pins go one per step until something is scheduled (the paper unpins in a loop inside the failed
+    allocation). The engine's allocator is the judge: no block count is estimated here, which a hybrid model
+    (sliding-window groups, PR #60045's admission count) would get wrong. The signal is not a failed lookup: vLLM
+    0.31 drains waiting requests that already hold KV blocks first and stops at the first it cannot allocate, and
+    such a request (its CPU load done) gets no connector lookup, so the requests behind it are never looked up
+    (the start block's Gemma CT stall, 2026-10-13: 0 running, 7 waiting, one pin of 1,109 of 2,188 blocks).
   - T_default is recomputed per request from the current T and that request's R (the paper derives one fixed value
     from the same formula).
 Differences from the simulator's port (sim/baselines.py ContinuumTTL), which this follows where the paper is silent:
@@ -157,6 +160,12 @@ class ContinuumConnector(OffloadingConnector):
         self.ttl = ContinuumTTL(eta=float(extra.get("ct_eta", 1.0)), k=int(extra.get("ct_k", 100)))
         self.window = float(extra.get("ct_window", 120.0))
         self.block_tokens = int(block_tokens)
+        # vLLM's own rounding of a prefix hit: whole pages of the largest group, minus the tokens a sliding-window
+        # model recomputes at the hit's end (kv_cache_spec.prefix_replay_tokens; Gemma 4 on vLLM 0.31: 32-token
+        # pages and 128 replayed, so every intact Gemma return hits floor32(held) - 128)
+        specs = [g.kv_cache_spec for g in getattr(kv_cache_config, "kv_cache_groups", ()) or ()]
+        self.hit_slack = (max([self.block_tokens] + [int(getattr(sp, "block_size", 0)) for sp in specs])
+                          + max([0] + [int(getattr(sp, "prefix_replay_tokens", 0) or 0) for sp in specs]))
         self.chunk_tokens = int(chunk_tokens)
         nb = getattr(kv_cache_config, "num_blocks", 0) or 0
         size = sum(getattr(t, "size", 0) for t in getattr(kv_cache_config, "kv_cache_tensors", ()) or ())
@@ -165,7 +174,8 @@ class ContinuumConnector(OffloadingConnector):
         self._pins: dict[str, dict] = {}            # session -> {blocks, expiry, arrival, tau}
         self._waiting: dict[str, tuple] = {}        # request id -> (time added, session, request)
         self._local: dict[str, int] = {}            # request id -> GPU prefix hit at its lookup
-        self._tried: set = set()                    # request ids looked up and not allocated in this step
+        self._live: set = set()                     # request ids arrived and not finished
+        self._pending: set = set()                  # request ids whose connector lookup is still pending
         self._last: dict[str, tuple] = {}           # session -> (finish time, tool or None, tokens held)
         self._held: dict[str, list] = {}            # session -> token ids of its last finished request
         self._arrival: dict[str, float] = {}        # session -> its program's first arrival
@@ -203,6 +213,7 @@ class ContinuumConnector(OffloadingConnector):
         now = self.clock()
         sess = session_of(_params(request).get("park_key"))
         self._waiting[request.request_id] = (now, sess, request)
+        self._live.add(request.request_id)
         if sess is None:
             return
         self._arrival.setdefault(sess, now)
@@ -216,8 +227,10 @@ class ContinuumConnector(OffloadingConnector):
     def get_num_new_matched_tokens(self, request, num_computed_tokens):
         self._local[request.request_id] = int(num_computed_tokens)
         out = super().get_num_new_matched_tokens(request, num_computed_tokens)
-        if out is not None and out[0] is not None:          # None: the lookup is still pending, vLLM skips it
-            self._tried.add(request.request_id)
+        if out is not None and out[0] is None:              # None: the lookup is still pending, vLLM skips it
+            self._pending.add(request.request_id)
+        else:
+            self._pending.discard(request.request_id)
         return out
 
     def update_state_after_alloc(self, request, blocks, num_external_tokens: int):
@@ -227,7 +240,7 @@ class ContinuumConnector(OffloadingConnector):
 
     def _admit(self, request):
         now = self.clock()
-        self._tried.discard(request.request_id)
+        self._pending.discard(request.request_id)
         w = self._waiting.pop(request.request_id, None)
         local = self._local.pop(request.request_id, None)
         if w is None:
@@ -243,7 +256,7 @@ class ContinuumConnector(OffloadingConnector):
         prev, cur = self._held.get(sess), getattr(request, "all_token_ids", None)
         if last is not None and prev is not None and cur is not None:
             shared = min(shared, _common_prefix(prev, cur))
-        evicted = last is not None and (local if local is not None else 0) + self.block_tokens <= shared
+        evicted = last is not None and (local if local is not None else 0) + self.hit_slack <= shared
         if evicted:
             self._waits.append((now, now - t_add))
             CT_STATE.counts["evicted_returns"] += 1
@@ -261,8 +274,8 @@ class ContinuumConnector(OffloadingConnector):
         now = self.clock()
         for job_id, job in getattr(meta, "load_jobs", {}).items():
             self._loads[job_id] = (now, len(job.src_spec.block_ids) * self.chunk_tokens)
-        blocked = bool(self._tried) and not getattr(scheduler_output, "total_num_scheduled_tokens", 0)
-        self._tried = set()
+        blocked = (not getattr(scheduler_output, "total_num_scheduled_tokens", 0) and bool(self._live)
+                   and not self._pending and not self._loads)
         _safe("unpin", self._step, now, blocked)
         return meta
 
@@ -317,7 +330,8 @@ class ContinuumConnector(OffloadingConnector):
         now = self.clock()
         self._waiting.pop(request.request_id, None)
         self._local.pop(request.request_id, None)
-        self._tried.discard(request.request_id)
+        self._pending.discard(request.request_id)
+        self._live.discard(request.request_id)
         params = _params(request)
         sess = session_of(params.get("park_key"))
         if sess is None:

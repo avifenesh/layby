@@ -100,8 +100,9 @@ def finish(r, blocks):
     pool.free_blocks(reversed(blocks))                    # the scheduler frees the request after the connector hook
 
 
-def step():
-    conn.build_connector_meta(NS())
+def step(ran=True):
+    """One scheduler step; ran: vLLM scheduled tokens in it (a deadlock needs a step that scheduled none)."""
+    conn.build_connector_meta(NS(total_num_scheduled_tokens=1 if ran else 0))
 
 
 # a tool turn pins: T = 0 and R = 160 tokens * 1000 B / 20 GB/s, so T + R < 1 and the cold-start TTL is 0; make the
@@ -159,8 +160,8 @@ clock[0] += conn._pins["q"]["tau"] + 0.01
 step()
 assert "q" not in conn._pins and pool.get_num_free_blocks() == FREE0
 
-# deadlock prevention (section 5.2): the scheduler looked up the head waiting request, could not allocate it and ran
-# nothing, so a pin goes, latest program arrival first, one per step (vLLM retries the request next step)
+# deadlock prevention (section 5.2): requests wait and vLLM scheduled nothing, with no connector lookup pending and no
+# CPU load in flight, so a pin goes, latest program arrival first, one per step (vLLM retries next step)
 def tried(r):
     """vLLM looked r up (its connector lookup finished) and did not allocate it: no update_state_after_alloc."""
     if r.request_id not in conn._waiting:
@@ -179,7 +180,7 @@ assert "s" in conn._pins and pool.get_num_free_blocks() == FREE0 - 50
 clock[0] += conn._pins["s"]["tau"] + 1.0
 s1 = req("s1", "s-1", 30 * BT, park_kind="tool", park_tool="Edit")   # 30 blocks > 13 free; old estimate 30 - 50 < 0
 tried(s1)
-step()
+step(ran=False)
 assert "s" not in conn._pins, f"the waiting program's own pin was kept while nothing could run: {set(conn._pins)}"
 assert pool.get_num_free_blocks() == FREE0 and CC.CT_STATE.counts["unpin_pressure"] == 1
 b1 = pool.get_new_blocks(30); conn.update_state_after_alloc(s1, NS(blocks=(b1,)), 0)   # admitted next step
@@ -201,15 +202,19 @@ conn.build_connector_meta(NS(total_num_scheduled_tokens=7))       # something ra
 assert set(conn._pins) == {"x", "y", "z"}, set(conn._pins)
 w.ext = None
 tried(w)
-step()
+step(ran=False)
 assert set(conn._pins) == {"x", "y", "z"}, "a pending connector lookup is not an allocation failure"
 del w.ext
-step()                                                    # no lookup this step: nothing to relieve
-assert set(conn._pins) == {"x", "y", "z"}
-tried(w); step()
+conn._loads[99] = (clock[0], 160)                         # a CPU load in flight: the engine waits on it, not on pins
+tried(w); step(ran=False)
+assert set(conn._pins) == {"x", "y", "z"}, "a load in flight is not a deadlock"
+del conn._loads[99]
+tried(w); step(ran=False)
 assert set(conn._pins) == {"x", "y"}, f"expected z (latest arrival) first, left {set(conn._pins)}"
-tried(w); step()
-assert set(conn._pins) == {"x"}, f"expected y next, left {set(conn._pins)}"
+# the start-block Gemma stall: the head waiting request already holds KV blocks (its CPU load done), so vLLM 0.31
+# stops at it without a connector lookup and never looks up the requests behind it; still a deadlock
+step(ran=False)
+assert set(conn._pins) == {"x"}, f"a step with no lookup must still relieve; left {set(conn._pins)}"
 bw = pool.get_new_blocks(free + 15)                       # now it fits: admitted, x keeps its pin
 conn.update_state_after_alloc(w, NS(blocks=(bw,)), 0)
 step()
@@ -255,5 +260,14 @@ for i, b in enumerate(bm1):
 finish(m1, bm1)
 assert CC.CT_STATE.counts["unpin_replace"] == 1 and all(b.ref_cnt == 0 for b in bm0)
 conn._unpin("m"); conn._waiting.clear()
+# vLLM's own hit rounding is not an eviction: Gemma 4 on vLLM 0.31 hits whole 32-token pages minus the 128 tokens
+# its sliding window replays (prefix_replay_tokens), so an intact return of 17,749 held tokens hits 17,600
+g = object.__new__(CC.ContinuumConnector)
+gcfg = NS(num_blocks=64, kv_cache_tensors=[NS(size=64 * 16 * 1000)], kv_cache_groups=[
+    NS(kv_cache_spec=NS(block_size=16, prefix_replay_tokens=128)), NS(kv_cache_spec=NS(block_size=32))])
+g._setup({"ct_eta": 1.0}, 16, gcfg, 16, clock=lambda: clock[0])
+assert g.hit_slack == 32 + 128 and conn.hit_slack == BT
+assert 17600 + g.hit_slack > 17749 and 17600 - 32 + g.hit_slack <= 17749   # one page more missing is an eviction
+CC.CT_STATE.conn = conn
 print("pin ok: tool turns pinned for the TTL, unpinned at admission, at expiry, and latest-arrival first under pressure")
 print("CT ok")
