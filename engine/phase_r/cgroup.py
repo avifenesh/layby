@@ -58,6 +58,7 @@ def block_device(runner, path, override=None):
         return {"source": override, "fstype": "given", "name": name, "majmin": mm, "ram": False}
     r = runner.run(["findmnt", "-no", "SOURCE,FSTYPE", "--target", path], fake="/dev/nvme1n1 ext4\n")
     src, fstype = (r.out.split() + ["", ""])[:2]
+    src = src.split("[", 1)[0]          # a bind mount's source names its subtree: /dev/vda1[/root]
     if fstype in ("tmpfs", "ramfs", "overlay") or not src.startswith("/dev/"):
         return {"source": src, "fstype": fstype, "name": None, "majmin": None, "ram": fstype in ("tmpfs", "ramfs")}
     name = os.path.basename(os.path.realpath(src)) if not runner.dry else os.path.basename(src)

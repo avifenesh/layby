@@ -121,6 +121,24 @@ class Cgroup(unittest.TestCase):
             self.assertFalse(os.path.exists(f"/sys/class/block/{d['name']}/partition"), "a partition, not its disk")
 
 
+    def test_block_device_of_a_bind_mount(self):
+        """findmnt names a bind mount's source with its subtree, /dev/vda1[/root] (the park container's /root and
+        /data); the device is vda1, not 'root]'."""
+        class Stub:
+            dry = True
+
+            def run(self, cmd, fake=""):
+                return type("R", (), {"out": "/dev/vda1[/root] ext4\n"})()
+
+            def read(self, path, fake=""):
+                self.path = path
+                return "252:1\n"
+        st = Stub()
+        d = cgroup.block_device(st, "/root")
+        self.assertEqual((d["source"], d["name"], d["majmin"]), ("/dev/vda1", "vda1", "252:1"))
+        self.assertEqual(st.path, "/sys/class/block/vda1/dev")
+
+
 class Shell(unittest.TestCase):
     def test_cg_exec_empty_runs_unconfined(self):
         r = subprocess.run([os.path.join(PR, "cg_exec.sh"), "", "echo", "hi"], capture_output=True, text=True)
