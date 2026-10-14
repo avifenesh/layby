@@ -192,6 +192,29 @@
    "ranking": "rank/t-qwen-c0-slow-s3.json"
   },
   "LM": {
+   "fast": {
+    "block": {
+     "attempt": 1,
+     "host": "tune-gemma2",
+     "repeat": 1
+    },
+    "carried": {
+     "C0": {
+      "budget": 8192,
+      "eviction": "lru"
+     }
+    },
+    "cell": "t-qwen-lm-fast-s3",
+    "knobs": {
+     "chunk": 784,
+     "eager": false,
+     "prefetch": "default"
+    },
+    "label": "LM_c784_default",
+    "p50": 0.750989,
+    "p95": 9.051971,
+    "ranking": "rank/t-qwen-lm-fast-s3.json"
+   },
    "slow": {
     "block": {
      "attempt": 1,

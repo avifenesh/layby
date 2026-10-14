@@ -1,0 +1,80 @@
+{
+ "cell": "t-qwen-lm-fast-s3",
+ "tuning": {
+  "model": "qwen38_27b",
+  "family": "LM",
+  "disk": "fast",
+  "stage": 3,
+  "workload": "qwen38_27b.tuning",
+  "grid": [
+   "LM_c784_default",
+   "LM_c784_default_eager",
+   "LM_c784_retain",
+   "LM_c784_retain_eager",
+   "LM_c1568_default",
+   "LM_c1568_default_eager",
+   "LM_c1568_retain",
+   "LM_c1568_retain_eager"
+  ],
+  "carried": {
+   "C0": {
+    "budget": 8192,
+    "eviction": "lru"
+   }
+  },
+  "dropped": [
+   "eviction ARC: LMCache 0.5.5's --eviction-policy takes LRU, IsolatedLRU or noop only (lmcache/v1/distributed/config.py); eviction stays LRU"
+  ]
+ },
+ "block": {
+  "host": "tune-gemma2",
+  "repeat": 1,
+  "attempt": 1,
+  "dir": "/home/avifenesh/park-predictor-data/phase_r/tune/gemma2/pr/t-qwen-lm-fast-s3/tune-gemma2/r1/a1"
+ },
+ "rule": "p95 TTFT on resumed turns (failed and censored +inf), ties by p50 then grid order",
+ "arms": [
+  {
+   "n": 333,
+   "served": 333,
+   "failed": 0,
+   "censored": 0,
+   "missing": 0,
+   "p50": 0.750989,
+   "p95": 9.051971,
+   "label": "LM_c784_default",
+   "rank": 1,
+   "code": "LM",
+   "knobs": {
+    "chunk": 784,
+    "prefetch": "default",
+    "eager": false
+   },
+   "grid_index": 0
+  },
+  {
+   "n": 333,
+   "served": 333,
+   "failed": 0,
+   "censored": 0,
+   "missing": 0,
+   "p50": 0.679503,
+   "p95": 10.213596,
+   "label": "LM_c1568_default",
+   "rank": 2,
+   "code": "LM",
+   "knobs": {
+    "chunk": 1568,
+    "prefetch": "default",
+    "eager": false
+   },
+   "grid_index": 4
+  }
+ ],
+ "unranked": [],
+ "complete": true,
+ "next_stage": null,
+ "advance": [],
+ "winner": "LM_c784_default",
+ "cell_spec": "/home/avifenesh/.cache/layby-wt/integ/engine/phase_r/cells/tune/t-qwen-lm-fast-s3.json"
+}
