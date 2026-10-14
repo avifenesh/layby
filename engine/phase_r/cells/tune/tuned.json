@@ -88,6 +88,37 @@
     "p95": 66.045024,
     "ranking": "rank/t-gemma-t-slow-s3.json"
    }
+  },
+  "T2": {
+   "fast": {
+    "block": {
+     "attempt": 1,
+     "host": "tune-gemma2",
+     "repeat": 1
+    },
+    "carried": {
+     "C0": {
+      "budget": null,
+      "eviction": "lru"
+     },
+     "T": {
+      "blocks_per_chunk": 16,
+      "fs_threads": 16
+     }
+    },
+    "cell": "t-gemma-t2-fast-s3",
+    "knobs": {
+     "blocks_per_chunk": 16,
+     "count": "request",
+     "decay_s": 600,
+     "fs_threads": 16,
+     "min_hits": 2
+    },
+    "label": "T2_n2_request",
+    "p50": 4.57911,
+    "p95": 32.551077,
+    "ranking": "rank/t-gemma-t2-fast-s3.json"
+   }
   }
  },
  "qwen38_27b": {
