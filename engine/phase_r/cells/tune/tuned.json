@@ -41,6 +41,29 @@
     "p50": 7.335942,
     "p95": 40.077863,
     "ranking": "rank/t-gemma-lm-fast-s3.json"
+   },
+   "slow": {
+    "block": {
+     "attempt": 1,
+     "host": "tune-gemma",
+     "repeat": 1
+    },
+    "carried": {
+     "C0": {
+      "budget": null,
+      "eviction": "lru"
+     }
+    },
+    "cell": "t-gemma-lm-slow-s3",
+    "knobs": {
+     "chunk": 512,
+     "eager": false,
+     "prefetch": "retain"
+    },
+    "label": "LM_c512_retain",
+    "p50": 20.660348,
+    "p95": 46.132721,
+    "ranking": "rank/t-gemma-lm-slow-s3.json"
    }
   },
   "T": {
