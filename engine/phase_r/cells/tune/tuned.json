@@ -38,6 +38,28 @@
    "ranking": "rank/t-qwen-c0-slow-s3.json"
   },
   "T": {
+   "fast": {
+    "block": {
+     "attempt": 1,
+     "host": "tune-qwen",
+     "repeat": 1
+    },
+    "carried": {
+     "C0": {
+      "budget": 8192,
+      "eviction": "lru"
+     }
+    },
+    "cell": "t-qwen-t-fast-s3",
+    "knobs": {
+     "blocks_per_chunk": 1,
+     "fs_threads": 16
+    },
+    "label": "T_b1_t16",
+    "p50": 0.46438,
+    "p95": 8.525693,
+    "ranking": "rank/t-qwen-t-fast-s3.json"
+   },
    "slow": {
     "block": {
      "attempt": 1,
