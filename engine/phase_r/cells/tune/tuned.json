@@ -128,6 +128,37 @@
     "p95": 14.384766,
     "ranking": "rank/t-qwen-t-slow-s3.json"
    }
+  },
+  "T2": {
+   "slow": {
+    "block": {
+     "attempt": 1,
+     "host": "tune-qwen",
+     "repeat": 1
+    },
+    "carried": {
+     "C0": {
+      "budget": 8192,
+      "eviction": "lru"
+     },
+     "T": {
+      "blocks_per_chunk": 1,
+      "fs_threads": 16
+     }
+    },
+    "cell": "t-qwen-t2-slow-s3",
+    "knobs": {
+     "blocks_per_chunk": 1,
+     "count": "request",
+     "decay_s": 600,
+     "fs_threads": 16,
+     "min_hits": 2
+    },
+    "label": "T2_n2_request",
+    "p50": 0.299795,
+    "p95": 9.92705,
+    "ranking": "rank/t-qwen-t2-slow-s3.json"
+   }
   }
  }
 }

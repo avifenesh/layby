@@ -1,0 +1,125 @@
+{
+ "cell": "t-gemma-t2-fast-s1",
+ "tuning": {
+  "model": "gemma4_31b",
+  "family": "T2",
+  "disk": "fast",
+  "stage": 1,
+  "workload": "gemma4_31b.tuning_20min",
+  "grid": [
+   "T2_n2_request",
+   "T2_n2_store",
+   "T2_n3_request",
+   "T2_n3_store"
+  ],
+  "carried": {
+   "C0": {
+    "budget": null,
+    "eviction": "lru"
+   },
+   "T": {
+    "blocks_per_chunk": 16,
+    "fs_threads": 16
+   }
+  },
+  "dropped": []
+ },
+ "block": {
+  "host": "tune-gemma2",
+  "repeat": 1,
+  "attempt": 1,
+  "dir": "/home/avifenesh/park-predictor-data/phase_r/tune/gemma2/pr/t-gemma-t2-fast-s1/tune-gemma2/r1/a1"
+ },
+ "rule": "p95 TTFT on resumed turns (failed and censored +inf), ties by p50 then grid order",
+ "arms": [
+  {
+   "n": 106,
+   "served": 106,
+   "failed": 0,
+   "censored": 0,
+   "missing": 0,
+   "p50": 16.387455,
+   "p95": 38.485816,
+   "label": "T2_n2_request",
+   "rank": 1,
+   "code": "T2",
+   "knobs": {
+    "blocks_per_chunk": 16,
+    "fs_threads": 16,
+    "min_hits": 2,
+    "count": "request",
+    "decay_s": 600
+   },
+   "grid_index": 0
+  },
+  {
+   "n": 106,
+   "served": 106,
+   "failed": 0,
+   "censored": 0,
+   "missing": 0,
+   "p50": 24.821855,
+   "p95": 42.117227,
+   "label": "T2_n3_request",
+   "rank": 2,
+   "code": "T2",
+   "knobs": {
+    "blocks_per_chunk": 16,
+    "fs_threads": 16,
+    "min_hits": 3,
+    "count": "request",
+    "decay_s": 600
+   },
+   "grid_index": 2
+  },
+  {
+   "n": 106,
+   "served": 106,
+   "failed": 0,
+   "censored": 0,
+   "missing": 0,
+   "p50": 20.305603,
+   "p95": 47.776978,
+   "label": "T2_n2_store",
+   "rank": 3,
+   "code": "T2",
+   "knobs": {
+    "blocks_per_chunk": 16,
+    "fs_threads": 16,
+    "min_hits": 2,
+    "count": "store",
+    "decay_s": 600
+   },
+   "grid_index": 1
+  },
+  {
+   "n": 106,
+   "served": 106,
+   "failed": 0,
+   "censored": 0,
+   "missing": 0,
+   "p50": 28.615619,
+   "p95": 58.19617,
+   "label": "T2_n3_store",
+   "rank": 4,
+   "code": "T2",
+   "knobs": {
+    "blocks_per_chunk": 16,
+    "fs_threads": 16,
+    "min_hits": 3,
+    "count": "store",
+    "decay_s": 600
+   },
+   "grid_index": 3
+  }
+ ],
+ "unranked": [],
+ "complete": true,
+ "next_stage": 3,
+ "advance": [
+  "T2_n2_request",
+  "T2_n3_request"
+ ],
+ "winner": null,
+ "cell_spec": "/home/avifenesh/.cache/layby-wt/integ/engine/phase_r/cells/tune/t-gemma-t2-fast-s1.json"
+}
