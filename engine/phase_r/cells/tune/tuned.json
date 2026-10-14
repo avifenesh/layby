@@ -191,6 +191,31 @@
    "p95": 11.019576,
    "ranking": "rank/t-qwen-c0-slow-s3.json"
   },
+  "LM": {
+   "slow": {
+    "block": {
+     "attempt": 1,
+     "host": "tune-qwen",
+     "repeat": 1
+    },
+    "carried": {
+     "C0": {
+      "budget": 8192,
+      "eviction": "lru"
+     }
+    },
+    "cell": "t-qwen-lm-slow-s3",
+    "knobs": {
+     "chunk": 1568,
+     "eager": false,
+     "prefetch": "default"
+    },
+    "label": "LM_c1568_default",
+    "p50": 3.197635,
+    "p95": 11.000939,
+    "ranking": "rank/t-qwen-lm-slow-s3.json"
+   }
+  },
   "T": {
    "fast": {
     "block": {
