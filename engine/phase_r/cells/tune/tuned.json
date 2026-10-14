@@ -17,6 +17,30 @@
    "p50": 10.991009,
    "p95": 49.340356,
    "ranking": "rank/t-gemma-c0-slow-s3.json"
+  },
+  "T": {
+   "fast": {
+    "block": {
+     "attempt": 1,
+     "host": "tune-gemma2",
+     "repeat": 1
+    },
+    "carried": {
+     "C0": {
+      "budget": null,
+      "eviction": "lru"
+     }
+    },
+    "cell": "t-gemma-t-fast-s3",
+    "knobs": {
+     "blocks_per_chunk": 16,
+     "fs_threads": 16
+    },
+    "label": "T_b16_t16",
+    "p50": 1.914874,
+    "p95": 32.693224,
+    "ranking": "rank/t-gemma-t-fast-s3.json"
+   }
   }
  },
  "qwen38_27b": {
