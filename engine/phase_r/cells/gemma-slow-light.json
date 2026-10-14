@@ -39,7 +39,8 @@
    "REPLAY_TIMEOUT": "4935",
    "BOOT_WAIT": "360",
    "MAXLEN": "32768",
-   "SERVE_ARGS": "--revision 842da3794eaa0b77d5f08bae87a17459d91ff475 --quantization fp8 --limit-mm-per-prompt {\"image\":0,\"audio\":0,\"video\":0} --max-num-batched-tokens 1024"
+   "SERVE_ARGS": "--revision 842da3794eaa0b77d5f08bae87a17459d91ff475 --quantization fp8 --limit-mm-per-prompt {\"image\":0,\"audio\":0,\"video\":0} --max-num-batched-tokens 1024",
+   "EVICTION": "lru"
   },
   "timeout_s": 6735
  },
@@ -70,20 +71,29 @@
   },
   {
    "label": "T",
-   "code": "T"
+   "code": "T",
+   "env": {
+    "BLOCKS_PER_CHUNK": "1",
+    "FS_THREADS": "16"
+   }
   },
   {
    "label": "T2",
    "code": "T2",
    "env": {
-    "T2_MIN_HITS": "2",
-    "T2_DECAY_S": "600",
-    "T2_COUNT": "request"
+    "BLOCKS_PER_CHUNK": "1",
+    "FS_THREADS": "16",
+    "T2_MIN_HITS": "3",
+    "T2_COUNT": "store",
+    "T2_DECAY_S": "600"
    }
   },
   {
    "label": "LM",
-   "code": "LM"
+   "code": "LMR",
+   "env": {
+    "LM_CHUNK": "512"
+   }
   },
   {
    "label": "CT",
@@ -132,5 +142,31 @@
   "rbps": "220200960",
   "wbps": "220200960"
  },
- "io_max_note": "network_ssd throttled to 210 MiB/s read and write (BENCH_PLAN draft 6): r about 0.3 on both models at the pilot's prefill rates"
+ "io_max_note": "network_ssd throttled to 210 MiB/s read and write (BENCH_PLAN draft 6): r about 0.3 on both models at the pilot's prefill rates",
+ "tuned": {
+  "file": "tuned.json",
+  "sha256": "d8c47902f8918449bc99fb755948e6642180ec7b31d3e4fdd907ca5ede3782e4",
+  "applied": {
+   "C0": {
+    "budget": null,
+    "eviction": "lru"
+   },
+   "T": {
+    "blocks_per_chunk": 1,
+    "fs_threads": 16
+   },
+   "T2": {
+    "blocks_per_chunk": 1,
+    "count": "store",
+    "decay_s": 600,
+    "fs_threads": 16,
+    "min_hits": 3
+   },
+   "LM": {
+    "chunk": 512,
+    "eager": false,
+    "prefetch": "retain"
+   }
+  }
+ }
 }

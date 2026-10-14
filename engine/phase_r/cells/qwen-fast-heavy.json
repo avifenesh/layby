@@ -39,9 +39,10 @@
    "REPLAY_TIMEOUT": "4802",
    "BOOT_WAIT": "360",
    "MAXLEN": "32768",
-   "SERVE_ARGS": "--revision 017b9c7af6b5689d5dd426a76e0bc077eb5ca20a",
+   "SERVE_ARGS": "--revision 017b9c7af6b5689d5dd426a76e0bc077eb5ca20a --max-num-batched-tokens 8192",
    "LM_CHUNK": "784",
-   "MAX_NUM_SEQS": "48"
+   "MAX_NUM_SEQS": "48",
+   "EVICTION": "lru"
   },
   "timeout_s": 6602
  },
@@ -72,20 +73,29 @@
   },
   {
    "label": "T",
-   "code": "T"
+   "code": "T",
+   "env": {
+    "BLOCKS_PER_CHUNK": "1",
+    "FS_THREADS": "16"
+   }
   },
   {
    "label": "T2",
    "code": "T2",
    "env": {
+    "BLOCKS_PER_CHUNK": "1",
+    "FS_THREADS": "16",
     "T2_MIN_HITS": "2",
-    "T2_DECAY_S": "600",
-    "T2_COUNT": "request"
+    "T2_COUNT": "store",
+    "T2_DECAY_S": "600"
    }
   },
   {
    "label": "LM",
-   "code": "LM"
+   "code": "LM",
+   "env": {
+    "LM_CHUNK": "784"
+   }
   },
   {
    "label": "K",
@@ -116,6 +126,32 @@
    "seq_read_Bps": 2041400456,
    "seq_write_Bps": 1412483080,
    "rand_read_Bps": 2141000000
+  }
+ },
+ "tuned": {
+  "file": "tuned.json",
+  "sha256": "d8c47902f8918449bc99fb755948e6642180ec7b31d3e4fdd907ca5ede3782e4",
+  "applied": {
+   "C0": {
+    "budget": 8192,
+    "eviction": "lru"
+   },
+   "T": {
+    "blocks_per_chunk": 1,
+    "fs_threads": 16
+   },
+   "T2": {
+    "blocks_per_chunk": 1,
+    "count": "store",
+    "decay_s": 600,
+    "fs_threads": 16,
+    "min_hits": 2
+   },
+   "LM": {
+    "chunk": 784,
+    "eager": false,
+    "prefetch": "default"
+   }
   }
  }
 }
