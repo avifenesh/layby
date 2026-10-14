@@ -1,0 +1,109 @@
+{
+ "cell": "t-gemma-t-slow-s1",
+ "tuning": {
+  "model": "gemma4_31b",
+  "family": "T",
+  "disk": "slow",
+  "stage": 1,
+  "workload": "gemma4_31b.tuning_20min",
+  "grid": [
+   "T_b1_t16",
+   "T_b1_t32",
+   "T_b16_t16",
+   "T_b16_t32"
+  ],
+  "carried": {
+   "C0": {
+    "budget": null,
+    "eviction": "lru"
+   }
+  },
+  "dropped": []
+ },
+ "block": {
+  "host": "tune-gemma",
+  "repeat": 1,
+  "attempt": 1,
+  "dir": "/home/avifenesh/park-predictor-data/phase_r/tune/gemma/pr/t-gemma-t-slow-s1/tune-gemma/r1/a1"
+ },
+ "rule": "p95 TTFT on resumed turns (failed and censored +inf), ties by p50 then grid order",
+ "arms": [
+  {
+   "n": 106,
+   "served": 106,
+   "failed": 0,
+   "censored": 0,
+   "missing": 0,
+   "p50": 21.009066,
+   "p95": 77.895955,
+   "label": "T_b1_t16",
+   "rank": 1,
+   "code": "T",
+   "knobs": {
+    "blocks_per_chunk": 1,
+    "fs_threads": 16
+   },
+   "grid_index": 0
+  },
+  {
+   "n": 106,
+   "served": 106,
+   "failed": 0,
+   "censored": 0,
+   "missing": 0,
+   "p50": 28.781868,
+   "p95": 85.496785,
+   "label": "T_b16_t32",
+   "rank": 2,
+   "code": "T",
+   "knobs": {
+    "blocks_per_chunk": 16,
+    "fs_threads": 32
+   },
+   "grid_index": 3
+  },
+  {
+   "n": 106,
+   "served": 106,
+   "failed": 0,
+   "censored": 0,
+   "missing": 0,
+   "p50": 27.26352,
+   "p95": 106.900012,
+   "label": "T_b16_t16",
+   "rank": 3,
+   "code": "T",
+   "knobs": {
+    "blocks_per_chunk": 16,
+    "fs_threads": 16
+   },
+   "grid_index": 2
+  },
+  {
+   "n": 106,
+   "served": 106,
+   "failed": 0,
+   "censored": 0,
+   "missing": 0,
+   "p50": 22.079379,
+   "p95": 122.63075,
+   "label": "T_b1_t32",
+   "rank": 4,
+   "code": "T",
+   "knobs": {
+    "blocks_per_chunk": 1,
+    "fs_threads": 32
+   },
+   "grid_index": 1
+  }
+ ],
+ "unranked": [],
+ "complete": true,
+ "next_stage": 3,
+ "advance": [
+  "T_b1_t16",
+  "T_b16_t32"
+ ],
+ "winner": null,
+ "cell_spec": "/home/avifenesh/.cache/layby-wt/integ/engine/phase_r/cells/tune/t-gemma-t-slow-s1.json"
+}
