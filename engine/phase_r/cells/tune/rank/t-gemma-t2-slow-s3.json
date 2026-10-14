@@ -1,0 +1,82 @@
+{
+ "cell": "t-gemma-t2-slow-s3",
+ "tuning": {
+  "model": "gemma4_31b",
+  "family": "T2",
+  "disk": "slow",
+  "stage": 3,
+  "workload": "gemma4_31b.tuning",
+  "grid": [
+   "T2_n2_request",
+   "T2_n2_store",
+   "T2_n3_request",
+   "T2_n3_store"
+  ],
+  "carried": {
+   "C0": {
+    "budget": null,
+    "eviction": "lru"
+   },
+   "T": {
+    "blocks_per_chunk": 1,
+    "fs_threads": 16
+   }
+  },
+  "dropped": []
+ },
+ "block": {
+  "host": "tune-gemma",
+  "repeat": 1,
+  "attempt": 1,
+  "dir": "/home/avifenesh/park-predictor-data/phase_r/tune/gemma/pr/t-gemma-t2-slow-s3/tune-gemma/r1/a1"
+ },
+ "rule": "p95 TTFT on resumed turns (failed and censored +inf), ties by p50 then grid order",
+ "arms": [
+  {
+   "n": 351,
+   "served": 351,
+   "failed": 0,
+   "censored": 0,
+   "missing": 0,
+   "p50": 5.492884,
+   "p95": 42.380214,
+   "label": "T2_n3_store",
+   "rank": 1,
+   "code": "T2",
+   "knobs": {
+    "blocks_per_chunk": 1,
+    "fs_threads": 16,
+    "min_hits": 3,
+    "count": "store",
+    "decay_s": 600
+   },
+   "grid_index": 3
+  },
+  {
+   "n": 351,
+   "served": 351,
+   "failed": 0,
+   "censored": 0,
+   "missing": 0,
+   "p50": 5.858293,
+   "p95": 75.951697,
+   "label": "T2_n2_request",
+   "rank": 2,
+   "code": "T2",
+   "knobs": {
+    "blocks_per_chunk": 1,
+    "fs_threads": 16,
+    "min_hits": 2,
+    "count": "request",
+    "decay_s": 600
+   },
+   "grid_index": 0
+  }
+ ],
+ "unranked": [],
+ "complete": true,
+ "next_stage": null,
+ "advance": [],
+ "winner": "T2_n3_store",
+ "cell_spec": "/home/avifenesh/.cache/layby-wt/integ/engine/phase_r/cells/tune/t-gemma-t2-slow-s3.json"
+}
