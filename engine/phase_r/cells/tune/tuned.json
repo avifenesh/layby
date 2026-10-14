@@ -18,6 +18,31 @@
    "p95": 49.340356,
    "ranking": "rank/t-gemma-c0-slow-s3.json"
   },
+  "LM": {
+   "fast": {
+    "block": {
+     "attempt": 1,
+     "host": "tune-gemma2",
+     "repeat": 1
+    },
+    "carried": {
+     "C0": {
+      "budget": null,
+      "eviction": "lru"
+     }
+    },
+    "cell": "t-gemma-lm-fast-s3",
+    "knobs": {
+     "chunk": 256,
+     "eager": true,
+     "prefetch": "default"
+    },
+    "label": "LM_c256_default_eager",
+    "p50": 7.335942,
+    "p95": 40.077863,
+    "ranking": "rank/t-gemma-lm-fast-s3.json"
+   }
+  },
   "T": {
    "fast": {
     "block": {
@@ -130,6 +155,35 @@
    }
   },
   "T2": {
+   "fast": {
+    "block": {
+     "attempt": 1,
+     "host": "tune-qwen",
+     "repeat": 1
+    },
+    "carried": {
+     "C0": {
+      "budget": 8192,
+      "eviction": "lru"
+     },
+     "T": {
+      "blocks_per_chunk": 1,
+      "fs_threads": 16
+     }
+    },
+    "cell": "t-qwen-t2-fast-s3",
+    "knobs": {
+     "blocks_per_chunk": 1,
+     "count": "store",
+     "decay_s": 600,
+     "fs_threads": 16,
+     "min_hits": 2
+    },
+    "label": "T2_n2_store",
+    "p50": 0.341917,
+    "p95": 10.137554,
+    "ranking": "rank/t-qwen-t2-fast-s3.json"
+   },
    "slow": {
     "block": {
      "attempt": 1,
