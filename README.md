@@ -5,7 +5,7 @@ disk, or nowhere. Agent and chat sessions go idle between turns for seconds to m
 recomputing it on return is what makes the next turn slow.
 
 Model: [Avifenesh/layby-dwell](https://huggingface.co/Avifenesh/layby-dwell) on Hugging Face. Paper: arXiv, link to
-follow. Author: [Avi Fenesh](https://github.com/avifenesh), [Tiyuvta](https://tiyuvta.ai).
+follow. Author: [Avi Fenesh](https://github.com/avifenesh).
 
 Layby has four parts:
 
