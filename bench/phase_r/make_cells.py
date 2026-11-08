@@ -56,6 +56,7 @@ NETWORK_SSD = dict(seq_read_Bps=449_519_063, seq_write_Bps=462_519_988, rand_rea
 NRD = dict(seq_read_Bps=2_041_400_456, seq_write_Bps=1_412_483_080, rand_read_Bps=2_141_000_000)
 WT_PER_TOKEN = {"qwen38_27b": 1.403, "gemma4_31b": 1.455}
 
+HOST = {}     # --host profile (bench/phase_r/hosts/HOST.json); empty for the Nebius VMs the cells were made for
 DRYRUN = {}   # workload -> its C0 dry run's makespan, s (c0_dryrun.json); the hard cap's basis once measured
 MAXLEN = {}   # --max-model-len per model, capacities.json max_model_len (the workloads' context cap)
 MODELS = {
@@ -143,7 +144,13 @@ def offered_write(key, man):
 
 
 def pilot_json(key, m, heavy, light, pressure):
+    """The pilot JSON regime.py reads; with --host, prefill_tok_s is that host's micro and the offered write rates
+    scale with it (a faster or slower prefill offers write-through's bytes at that rate)."""
     r = m["rss"]
+    pf = HOST["prefill_tok_s"][key] if HOST else m["prefill"]
+    if HOST:
+        k = pf / m["prefill"]
+        heavy, light, pressure = round(heavy * k), round(light * k), round(pressure * k)
     return {
         "_comment": (
             "Pilot 1 measurements (BENCH_PLAN draft 6, bench/phase_r/make_cells.py docstring). kv_bytes_per_token: "
@@ -156,13 +163,39 @@ def pilot_json(key, m, heavy, light, pressure):
         "arm_rss_bytes": {**{x: r["vllm"] for x in ("C0", "T", "T2", "PT", "CT", "K_ewma", "K_km")}, "K": r["k"],
                           "LM": {"vllm": r["lm_vllm"], "lmcache_server": r["lm_server"]}},
         "sidecar_rss_bytes": r["sidecar"],
-        "loads": {"heavy": {"prefill_tok_s": m["prefill"], "wt_offered_write_Bps": heavy},
-                  "light": {"prefill_tok_s": m["prefill"], "wt_offered_write_Bps": light},
-                  "pressure": {"prefill_tok_s": m["prefill"], "wt_offered_write_Bps": pressure}},
+        "loads": {"heavy": {"prefill_tok_s": pf, "wt_offered_write_Bps": heavy},
+                  "light": {"prefill_tok_s": pf, "wt_offered_write_Bps": light},
+                  "pressure": {"prefill_tok_s": pf, "wt_offered_write_Bps": pressure}},
     }
 
 
-def disk(regime, c):
+def host_disk(regime, c, key):
+    """The --host profile's slots and io.max (BENCH_PLAN draft 6.7): both regimes emulated so r matches Nebius,
+    io.max = the Nebius disk's rate x this host's prefill / Nebius's prefill for the model (slow: SLOW_IO_MAX read and
+    write; fast: the NRD's measured read and write)."""
+    if regime not in ("slow", "fast"):
+        raise ValueError(f"--host {HOST['host']}: regime {regime!r} has no emulation")
+    ratio = HOST["prefill_tok_s"][key] / MODELS[key]["prefill"]
+    if regime == "slow":
+        rb = wb = round(SLOW_IO_MAX * ratio)
+        src = "210 MiB/s"
+    else:
+        rb, wb = round(NRD["seq_read_Bps"] * ratio), round(NRD["seq_write_Bps"] * ratio)
+        src = "the NRD's measured read and write"
+    c["slots"] = [json.loads(json.dumps(s)) for s in HOST["slots"]]
+    c["io_max"] = {"rbps": str(rb), "wbps": str(wb)}
+    c["io_max_note"] = (f"{regime} regime emulated on {HOST['host']} (BENCH_PLAN draft 6.7): {src} x this host's "
+                        f"prefill {HOST['prefill_tok_s'][key]:g} / Nebius {MODELS[key]['prefill']:g} tok/s = "
+                        f"x{ratio:.4f}, so r is Nebius's")
+    c["dry_run"] = {"probe": dict(seq_read_Bps=12e9, seq_write_Bps=11e9, rand_read_Bps=10e9),
+                    "throttled_probe": dict(seq_read_Bps=rb, seq_write_Bps=wb, rand_read_Bps=rb)}
+    c["telemetry"]["housekeeping_cpus"] = HOST["housekeeping_cpus"]
+    c["host_profile"] = {"host": HOST["host"], "gpus": HOST["gpus"], "prefill_source": HOST["prefill_source"]}
+
+
+def disk(regime, c, key=None):
+    if HOST:
+        return host_disk(regime, c, key)
     slot = {"cuda": "0", "port": 8000, "park_port": 28765, "cpus": "2-23", "mems": "0"}
     if regime in ("slow", "medium"):
         # one slot name for the network_ssd: the host's first unthrottled probe holds both settings to it
@@ -233,7 +266,7 @@ def cell(name, key, man, caps, regime, load, wl, arms, ct_eta, cap_src, extra=No
     }
     if dry:
         c["c0_dryrun_makespan_s"] = dry
-    disk(regime, c)
+    disk(regime, c, key)
     if extra:
         c.update(extra)
     if tuned and tuned[0]:
@@ -247,16 +280,33 @@ def main():
     ap.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "engine",
                                                   "phase_r", "cells"))
     ap.add_argument("--tuned", help="tuned settings JSON (default OUT/tune/tuned.json when it exists)")
+    ap.add_argument("--host", help="host profile bench/phase_r/hosts/HOST.json (default: the Nebius VMs); cells go to "
+                                   "OUT/HOST")
     a = ap.parse_args()
     out = os.path.abspath(a.out)
+    hosts_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hosts")
+    if a.host:
+        HOST.update(json.load(open(os.path.join(hosts_dir, f"{a.host}.json"))))
+        miss = [k for k, v in HOST["prefill_tok_s"].items() if not v]
+        if miss:
+            ap.error(f"--host {a.host}: prefill_tok_s not measured for {miss} (run the host's micro first)")
+        for key in MODELS:
+            MODELS[key]["serve"] = f"{MODELS[key]['serve']} {HOST['serve_extra']}".strip()
+        global PLAN
+        PLAN = f"BENCH_PLAN draft 6.7 (host {a.host}; freeze commit to fill)"
+        tuned_default = os.path.join(out, "tune", "tuned.json")
+        out = os.path.join(out, a.host)
+    else:
+        tuned_default = os.path.join(out, "tune", "tuned.json")
     os.makedirs(out, exist_ok=True)
-    tuned_path = a.tuned or os.path.join(out, "tune", "tuned.json")
+    tuned_path = a.tuned or tuned_default
     tuned, tuned_sha = load_tuned(tuned_path)
     if a.tuned and tuned is None:
         ap.error(f"--tuned {a.tuned}: no such file")
     tune = (tuned, tuned_sha, tuned_path)
     C = json.load(open(os.path.join(a.workloads, "capacities.json")))
-    dr = os.path.join(os.path.dirname(os.path.abspath(__file__)), "c0_dryrun.json")
+    dr = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                      f"c0_dryrun_{a.host}.json" if a.host else "c0_dryrun.json")
     if os.path.exists(dr):
         DRYRUN.update({k: float(v) for k, v in json.load(open(dr)).items() if not k.startswith("_")})
     MAXLEN.update({k: int(v["max_model_len"]) for k, v in C["models"].items()})

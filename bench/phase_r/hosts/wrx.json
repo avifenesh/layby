@@ -1,0 +1,15 @@
+{
+ "_comment": "Phase R host profile for wrx, the owner's box (make_cells.py --host wrx; BENCH_PLAN draft 6.7). Threadripper PRO 9975WX (32 cores, one NUMA node), 1 TB RAM, 4x RTX PRO 6000 Blackwell Max-Q (PCIe 5 x16); Phase R uses GPUs 2 and 3 (power cap 280 W, as found; GPUs 0 and 1 belong to other work). Two slots run one arm each per round. Each slot has 11 physical cores with their SMT siblings (CPU n and n+32 share a core); 0-1 and 32-33 are telemetry housekeeping; 24-31 and 56-63 are left to other work. The tier of both slots is a directory on the Samsung 9100 PRO 8 TB (PCIe 5 x4; tier directories /mnt/Data/phase_r/s2 and s3, at the same path inside the container). Both regimes are emulated with cgroup io.max so that r matches Nebius: prefill_tok_s is this host's micro (the same commands as the Nebius pilots: Qwen batch 8 at 8,192 tokens, Gemma at its 1,024-token chunk), and io.max scales the Nebius read and write rates by this host's prefill over Nebius's (slow: 210 MiB/s; fast: the NRD's measured read and write).",
+ "host": "wrx",
+ "gpus": "RTX PRO 6000 Blackwell Max-Q Workstation Edition, power cap 280 W",
+ "serve_extra": "--host 127.0.0.1",
+ "housekeeping_cpus": "0-1,32-33",
+ "slots": [
+  {"name": "s2", "cuda": "2", "port": 8000, "park_port": 28765, "sidecar_port": 28766, "cpus": "2-12,34-44", "mems": "0",
+   "disk": {"mount": "/mnt/Data/phase_r/s2", "wipe": "fstrim"}, "env": {"LM_PORT": "6555"}},
+  {"name": "s3", "cuda": "3", "port": 8001, "park_port": 28775, "sidecar_port": 28776, "cpus": "13-23,45-55", "mems": "0",
+   "disk": {"mount": "/mnt/Data/phase_r/s3", "wipe": "fstrim"}, "env": {"LM_PORT": "6565"}}
+ ],
+ "prefill_tok_s": {"qwen38_27b": null, "gemma4_31b": null},
+ "prefill_source": null
+}
