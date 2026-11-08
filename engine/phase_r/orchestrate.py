@@ -202,7 +202,8 @@ def is_live(arm):
 def filler_arm(c):
     """The unscored neighbour of an arm that would run alone in a two-engine round: C0's runner on the same workload,
     C0's RSS (the cell's arm with code C0, else the label C0)."""
-    src = next((a["label"] for a in c["arms"] if a["code"].split(".")[0] == FILLER_CODE), FILLER_CODE)
+    src = next((a.get("rss_of") or a["label"] for a in c["arms"] if a["code"].split(".")[0] == FILLER_CODE),
+               FILLER_CODE)
     return {"label": order.FILLER, "code": FILLER_CODE, "env": {}, "filler": True, "rss_of": src}
 
 

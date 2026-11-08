@@ -75,6 +75,14 @@ SLOW_ARMS = ["C0", "T", "T2", "LM", "CT", "K", "K_ewma"]
 OTHER_ARMS = ["C0", "T", "T2", "LM", "K", "K_ewma"]
 T2_ENV = {"T2_MIN_HITS": "2", "T2_DECAY_S": "600", "T2_COUNT": "request"}   # the default until T2 is tuned
 TUNED_FAMILIES = ("T", "T2", "LM")   # tuned per disk; C0 once per model (slow disk), carried to every cell
+# readable arm labels (owner 2026-11-08: one-letter names are unreadable); the runner codes stay inside run_arms.sh.
+# Used for the --host cells; the Nebius cells keep the labels they were run with.
+NAMES = {"C0": "no-disk", "T": "write-through", "T2": "write-hot", "LM": "lmcache", "LMR": "lmcache-retain",
+         "CT": "continuum", "K": "layby", "K_km": "layby-avg", "K_ewma": "layby-ewma"}
+CODE_FAMILY = {"T": "T", "T2": "T2", "LM": "LM", "LMR": "LM"}   # the tuned family of a runner code
+# the --host campaign's matrix (BENCH_PLAN draft 6.8, owner 2026-11-08: a research question, not a qualification):
+# slow pressure with every arm (3 repeats), fast heavy with the four arms that answer "does Layby hurt on a fast disk"
+HOST_FAST_ARMS = ["C0", "T", "LM", "K"]
 
 
 def c0_env(key, knobs):
@@ -125,7 +133,7 @@ def apply_tuned(c, key, tuned, sha=None, path=None):
         c["runner"]["env"].update(c0_env(key, t["C0"]["knobs"]))
         applied["C0"] = t["C0"]["knobs"]
     for a in c["arms"]:
-        fam = a["label"]
+        fam = CODE_FAMILY.get(a["code"]) if HOST else a["label"]
         entry = (t.get(fam) or {}).get(c["regime"]) if fam in TUNED_FAMILIES else None
         if entry:
             code, env = family_arm(fam, entry["knobs"])
@@ -236,7 +244,7 @@ def cell(name, key, man, caps, regime, load, wl, arms, ct_eta, cap_src, extra=No
         if isinstance(x, dict):   # a built arm (make_tuning.py: grid points with their own labels and env)
             A.append(x)
             continue
-        a = {"label": x, "code": x}
+        a = {"label": NAMES.get(x, x) if HOST else x, "code": x}
         if x == "T2":
             a["env"] = dict(T2_ENV)
         if x == "CT":
@@ -271,6 +279,9 @@ def cell(name, key, man, caps, regime, load, wl, arms, ct_eta, cap_src, extra=No
         c.update(extra)
     if tuned and tuned[0]:
         apply_tuned(c, key, *tuned)
+    if HOST:   # the pilot's RSS table is keyed by runner code; readable labels point at it
+        for a in c["arms"]:
+            a.setdefault("rss_of", "LM" if a["code"] in ("LM", "LMR") else a["code"])
     return c
 
 
@@ -336,20 +347,27 @@ def main():
         caps = lambda wl: {"gpu_kv_bytes": str(mc["gpu_kv_bytes"]), "cpu_bytes": str(mc["cpu_bytes"]),   # noqa: E731
                            "disk_bytes": str(C["workloads"][wl]["disk_bytes"])}
         src = "capacities.json (GPU and CPU per model, disk per workload)"
-        for regime, load, wlk in (("slow", "heavy", "measured"), ("slow", "pressure", "sweep_1.5x"),
-                                  ("slow", "light", "light"), ("fast", "heavy", "measured")):
+        matrix = ((("slow", "pressure", "sweep_1.5x"), ("fast", "heavy", "measured")) if HOST else
+                  (("slow", "heavy", "measured"), ("slow", "pressure", "sweep_1.5x"),
+                   ("slow", "light", "light"), ("fast", "heavy", "measured")))
+        for regime, load, wlk in matrix:
             wl = f"{key}.{wlk}"
-            arms = (SLOW_ARMS if regime == "slow" else OTHER_ARMS) + (
+            other = HOST_FAST_ARMS if HOST else OTHER_ARMS
+            arms = (SLOW_ARMS if regime == "slow" else other) + (
                 ["K_km"] if m["kkm_cell"] == f"{regime}-{load}" else [])
             name = f"{m['tag']}-{regime}-{load}"
             put(f"{name}.json", cell(name, key, man(wl), caps(wl), regime, load, wl, arms, eta, src, tuned=tune))
         # start block (BENCH_PLAN draft 6.5): C0 dry runs on the slow disk for every workload a cell runs (each sets
         # its cells' hard cap, 1.5x its makespan), then CT and LM once on the pilot workload: the GPU checks of the CT
         # pin release (90d52d5, 9adb696) and of the whole-64 MiB CPU tier (6bea6ae), neither yet run on a GPU host
-        for load, wlk in (("heavy", "measured"), ("pressure", "sweep_1.5x"), ("light", "light")):
+        dry_loads = (("heavy", "measured"), ("pressure", "sweep_1.5x")) if HOST else (
+            ("heavy", "measured"), ("pressure", "sweep_1.5x"), ("light", "light"))
+        for load, wlk in dry_loads:
             wl = f"{key}.{wlk}"
             put(f"s-{m['tag']}-c0dry-{load}.json", cell(f"s-{m['tag']}-c0dry-{load}", key, man(wl), caps(wl), "slow",
                                                         load, wl, ["C0"], eta, src, tuned=tune))
+        if HOST:   # the CT and LM GPU checks passed on Nebius (start block, 2026-10-13); not repeated
+            continue
         wl = f"{key}.pilot"
         put(f"s-{m['tag']}-check.json", cell(f"s-{m['tag']}-check", key, man(wl), caps(wl), "slow", "heavy", wl,
                                              ["CT", "LM"], eta, src, tuned=tune))
