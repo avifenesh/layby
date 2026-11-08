@@ -11,13 +11,13 @@ Arms (run_arms.sh, run_arms_sglang.sh). The scripts take each arm by its runner 
 | no-disk | `C0` | stock engine, CPU tier only, no disk, LRU |
 | write-through | `T` | stock engine, CPU tier plus a disk tier written through, LRU |
 | layby | `K` | Layby: the cost rule in the engine, curves posted per turn |
-| layby-off | `K0` | the Layby adapter with no curves (the rule never runs): the adapter's own overhead |
+| layby-off | `K0` | the Layby adapter with no curves (the rule never runs): the adapter's own overhead (vLLM only) |
 | layby-write-through | `KW` | layby in write-through mode (vLLM only) |
-| layby-on-evict | `KD` | layby with write-back on CPU eviction (vLLM only; a negative result, see the README) |
+| layby-write-on-evict | `KD` | layby with write-back on CPU eviction (vLLM only; a negative result, see the README) |
 | lmcache | `LM` | LMCache 0.5.x with its defaults, every chunk written through to its disk tier (vLLM only) |
 | lmcache-retain | `LMR` | lmcache keeping what it restores from disk in its CPU tier (`--l2-prefetch-policy retain`), L1 eviction at 0.95 (vLLM only) |
 | lmcache-smoke | `LMS` | the lmcache stack under `smoke_restore.py` instead of a replay (vLLM only) |
-| smoke | `SM` | the restore gate: the layby-off server under `smoke_restore.py` instead of a replay (vLLM only) |
+| layby-smoke | `SM` | the restore gate: the Layby adapter with no curves under `smoke_restore.py` instead of a replay; `engine/smoke.sh` runs it in write-through mode (vLLM only) |
 
 A suffix marks a repeat: `C0.2` runs no-disk again and writes its files as `C0.2.*`.
 

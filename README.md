@@ -43,7 +43,7 @@ Two cells of ReturnBench, under a minute on 8 cores (`bench/README.md`):
     returnbench eval --rules wt cost --cells wildchat:120 swechat:18 --workloads 2 --seeds 1
 
 It prints this (its rows are a subset of the shipped reference run, `reference/rows.jsonl`, and match it bit for bit).
-In the tool's output, `C0` is no disk tier, `wt` is write-through and `cost` is Layby's rule:
+In the tool's output, `C0` is no-disk, `wt` is write-through and `cost` is Layby's cost rule:
 
     geomean over cells of the p95 TTFT ratio (per cell: geomean over workloads)
     rule      cells  p95/C0  worst  @0.5  @1.5  @3   p95/wt  @0.5  @1.5  @3
@@ -96,7 +96,8 @@ Time to first token of returning turns, p95, as a ratio to another arm. Below 1 
 - **no-disk**: stock vLLM or SGLang with a CPU tier and no disk tier.
 - **write-through**: the stock engine writing every chunk through to a disk tier.
 - **layby**: Layby's rule with Layby-Dwell's curves.
-- **lmcache**: LMCache 0.5.5 with its defaults; **lmcache-retain**: LMCache with `--l2-prefetch-policy retain`.
+- **lmcache**: LMCache 0.5.5 with its defaults; **lmcache-retain**: LMCache with `--l2-prefetch-policy retain` and a
+  0.95 L1 eviction watermark, the best setting we found for it.
 
 Three repeats, one box each, session bootstrap 95% intervals. Qwen3-8B on one A100, 16 GiB GPU KV, 28 GiB CPU tier.
 
@@ -157,11 +158,10 @@ The paper (arXiv, link to follow) has the method, the full tables and the engine
 
 Qwen3-8B on vLLM 0.31.0, one RTX PRO 6000 per VM, the A100 rounds' capacities (16 GiB GPU KV, 28 GiB CPU tier),
 ReturnBench mix36, and a disk tier on the VM's network SSD read with O_DIRECT at 0.48 GB/s. Three repeats per arm:
-repeats 1 and 2 on two VMs, one each; repeat 3 of every arm on one further VM. layby is the adapter after the local-hit fix
-(lesson 4); its repeat 3 shares the VM with the other arms' repeat 3, and its repeats 1 and 2 ran on VMs of the same
+repeats 1 and 2 on two VMs, one each; repeat 3 of every arm on one further VM. The layby arm is the adapter after the
+local-hit fix (lesson 4); its repeat 3 shares the VM with the other arms' repeat 3, and its repeats 1 and 2 ran on VMs of the same
 type, not the same box. The adapter before the fix (two repeats) is kept as its own row. This round ran without the
-wait cap, which was built after it. lmcache-retain also raises LMCache's L1 eviction watermark to 0.95, the best
-setting we found for it.
+wait cap, which was built after it.
 
 | arm | p50 (s) | p95 (s) | p99 (s) |
 |---|---|---|---|
