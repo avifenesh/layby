@@ -4,16 +4,22 @@ Every run replays a content-free workload (token counts, gaps, kinds and Layby-D
 server and records each turn's time to first token. An arm is one server configuration. A repeat is one box. Arms are
 compared inside a repeat, then pooled over repeats with a session bootstrap.
 
-Arms (run_arms.sh, run_arms_sglang.sh):
+Arms (run_arms.sh, run_arms_sglang.sh). The scripts take each arm by its runner code; the text uses the name:
 
-| arm | what runs |
-|---|---|
-| C0 | stock engine, CPU tier only, no disk, LRU |
-| T | stock engine, CPU tier plus a disk tier written through, LRU |
-| K | Layby: the cost rule in the engine, curves posted per turn |
-| K0 | the Layby adapter with no curves (the rule never runs): the adapter's own overhead |
-| KW | K in write-through mode (vLLM only) |
-| KD | K with write-back on CPU eviction (vLLM only; a negative result, see the README) |
+| arm | runner code | what runs |
+|---|---|---|
+| no-disk | `C0` | stock engine, CPU tier only, no disk, LRU |
+| write-through | `T` | stock engine, CPU tier plus a disk tier written through, LRU |
+| layby | `K` | Layby: the cost rule in the engine, curves posted per turn |
+| layby-off | `K0` | the Layby adapter with no curves (the rule never runs): the adapter's own overhead |
+| layby-write-through | `KW` | layby in write-through mode (vLLM only) |
+| layby-on-evict | `KD` | layby with write-back on CPU eviction (vLLM only; a negative result, see the README) |
+| lmcache | `LM` | LMCache 0.5.x with its defaults, every chunk written through to its disk tier (vLLM only) |
+| lmcache-retain | `LMR` | lmcache keeping what it restores from disk in its CPU tier (`--l2-prefetch-policy retain`), L1 eviction at 0.95 (vLLM only) |
+| lmcache-smoke | `LMS` | the lmcache stack under `smoke_restore.py` instead of a replay (vLLM only) |
+| smoke | `SM` | the restore gate: the layby-off server under `smoke_restore.py` instead of a replay (vLLM only) |
+
+A suffix marks a repeat: `C0.2` runs no-disk again and writes its files as `C0.2.*`.
 
 Workloads are in `workloads/`, with bytes, sha256, source pools and licenses per file in `workloads/MANIFEST.json`
 (`python scripts/verify_manifest.py` checks them; `box_run.sh` runs the check first). The private replay used in the
@@ -58,9 +64,10 @@ To add: driver and CUDA version of the A100 boxes (the image is pinned; the host
     bash engine/box_run.sh .2   T K C0      # repeat 2 on a second box
     bash engine/box_run.sh .3   K C0 T      # repeat 3 on a third box
 
-Outputs land in `$OUT` (default `$HOME/out`): `ARM.jsonl` per turn, `ARM.env.json` (GPUs, driver, torch and CUDA
-versions, repo commit, server version), `ARM.server.log`, `ARM.park_live.json` telemetry, `ARM.prof.json` and
-`ARM.profw.json` scheduler-thread profiles. Pool:
+Outputs land in `$OUT` (default `$HOME/out`), named by runner code (`ARM`): `ARM.jsonl` per turn, `ARM.env.json`
+(GPUs, driver, torch and CUDA versions, repo commit, server version), `ARM.server.log`, `ARM.park_live.json`
+telemetry, `ARM.prof.json` and `ARM.profw.json` scheduler-thread profiles. Pool (the pairs are layby vs no-disk,
+layby vs write-through and write-through vs no-disk):
 
     mkdir pooled && cp box1/{C0,T,K}.jsonl box2/{C0,T,K}.2.jsonl box3/{C0,T,K}.3.jsonl pooled/
     python engine/pool_arms.py pooled --pair K:C0 --pair K:T --pair T:C0 --out pooled/pooled.json

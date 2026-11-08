@@ -1,7 +1,9 @@
 # The simulator reference run
 
 `rows.jsonl` and `table.txt` are the ReturnBench reference table of the README and `bench/README.md`: 33 cells, 8
-workloads, 3 seeds, rules C0, wt, stk, cost and orc, on the shipped pools (`bench/pools/`, `bench/MANIFEST.json`).
+workloads, 3 seeds, rules `C0`, `wt`, `stk`, `cost` and `orc`, on the shipped pools (`bench/pools/`,
+`bench/MANIFEST.json`). The command and the files use these rule ids: `C0` is no-disk, `wt` is write-through, `stk`
+is the tuned thresholds, `cost` is Layby's cost rule and `orc` is the oracle.
 
 Command (about 6 minutes on 8 cores; `--out` appends, so start from no file):
 
@@ -27,8 +29,8 @@ seeds, no wall-clock input).
 | `warms` | 1-token prefetch requests the policy fired |
 
 `table.txt`: `returnbench table reference/rows.jsonl --per-cell` output: per cell and rule, p50 and p95 in seconds
-and their ratios to C0, then the summary (geometric mean over cells of the p95 ratio to C0 and to wt, overall and
-per disk speed). Its last block is the table in `bench/README.md`.
+and their ratios to no-disk, then the summary (geometric mean over cells of the p95 ratio to no-disk and to
+write-through, overall and per disk speed). Its last block is the table in `bench/README.md`.
 
 ## Check a rerun
 

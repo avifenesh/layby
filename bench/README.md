@@ -6,8 +6,8 @@ minutes, sometimes never. Between turns the KV can stay on the GPU, sit in a CPU
 dropped and recomputed. The choice decides the time to first token (TTFT) of the turn that comes back.
 
 The bench replays real sessions from four public trace datasets through a simulated engine and reports
-p50 and p95 TTFT of returning turns, as a ratio to vLLM's default (C0). Everything runs on a CPU. The
-full reference table takes about 6 minutes on 8 cores.
+p50 and p95 TTFT of returning turns, as a ratio to vLLM's default with no disk tier (no-disk). Everything
+runs on a CPU. The full reference table takes about 6 minutes on 8 cores.
 
 ```
 pip install -e .
@@ -15,14 +15,17 @@ returnbench eval --rules wt cost orc          # the 33-cell reference table
 returnbench eval --rules wt cost --cells wildchat:120 swechat:18 --workloads 2 --seeds 1   # a quick look
 ```
 
+The commands and the output use rule ids: `C0` is no-disk, `wt` is write-through, `cost` is Layby's cost rule and
+`orc` is the oracle. [Policies](#policies) lists them all.
+
 ## What is measured
 
 A **cell** is a pool, a session count n and a disk speed. A **workload** draws n sessions from the pool
 and starts them uniformly over 600 s; each session then runs closed loop: a turn is sent, it finishes,
 the session waits its real idle gap, the next turn is sent. Each workload runs under 3 engine seeds
 (step-time jitter). Per rule and workload: the median over seeds of p50 and p95 TTFT of every turn after
-a session's first. Per cell: the geometric mean over 8 workloads of the ratio to C0. The summary is the
-geometric mean over cells, overall and by disk speed, plus the same against write-through-to-disk (wt).
+a session's first. Per cell: the geometric mean over 8 workloads of the ratio to no-disk. The summary is
+the geometric mean over cells, overall and by disk speed, plus the same against write-through.
 
 The reference set is 33 cells: 11 (pool, n) pairs times disks of 0.5, 1.5 and 3 GB/s.
 
@@ -87,13 +90,13 @@ Sources, versions and licenses: [bench/LICENSES.md](LICENSES.md).
 
 ## Policies
 
-| Name | What it does |
+| Rule | What it does |
 |---|---|
-| `C0` | vLLM's default: LRU GPU cache, write-through LRU CPU tier, no disk tier. Every ratio is against it. |
-| `wt` | Every session written to disk at finish, LRU everywhere. What vLLM's tiered offloading and SGLang HiCache write-through do. |
+| `C0` | **no-disk**, vLLM's default: LRU GPU cache, write-through LRU CPU tier, no disk tier. Every ratio is against it. |
+| `wt` | **write-through**: every session written to disk at finish, LRU everywhere. What vLLM's tiered offloading and SGLang HiCache write-through do. |
 | `cost` | The Layby cost rule: the cheapest in expectation of none, ins, park and drop, from the survival curve and costs the engine measures while it runs. No fitted constants. `sim/rule.py`. |
-| `orc` | The cost rule fed a step curve at the true gap: perfect prediction, same costs. |
-| `stk` | Thresholds on the curve with 7 constants tuned in simulation. |
+| `orc` | **oracle**, the cost rule fed a step curve at the true gap: perfect prediction, same costs. |
+| `stk` | **tuned thresholds**: thresholds on the curve with 7 constants tuned in simulation. |
 | `cont` | Continuum (arXiv 2511.02230): GPU pin after a tool call for a TTL from the per-tool gap CDF. |
 | `cj` | Choi and Joshi (arXiv 2608.30830): GPU hold until the break-even time. |
 | `ka` | Serverless in the Wild (ATC '20): GPU keep-alive to the user's 99th percentile gap. |
@@ -104,23 +107,23 @@ Sources, versions and licenses: [bench/LICENSES.md](LICENSES.md).
 `returnbench eval --rules wt stk cost orc`, 33 cells, 8 workloads, 3 seeds. Geometric mean over cells
 of the p95 TTFT ratio. Rows: `reference/rows.jsonl`; per cell: `reference/table.txt`.
 
-| Rule | p95 vs C0 | Worst cell | @0.5 GB/s | @1.5 | @3 | p95 vs wt | @0.5 | @1.5 | @3 |
+| Rule | p95 vs no-disk | Worst cell | @0.5 GB/s | @1.5 | @3 | p95 vs write-through | @0.5 | @1.5 | @3 |
 |---|---|---|---|---|---|---|---|---|---|
-| C0 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.46 | 1.01 | 1.68 | 1.84 |
-| wt | 0.68 | 1.46 | 0.99 | 0.60 | 0.54 | 1.00 | 1.00 | 1.00 | 1.00 |
-| stk | 0.78 | 1.65 | 0.96 | 0.72 | 0.68 | 1.14 | 0.97 | 1.21 | 1.24 |
-| cost | 0.66 | 1.04 | 0.82 | 0.61 | 0.57 | 0.96 | 0.83 | 1.03 | 1.04 |
-| orc | 0.60 | 1.00 | 0.71 | 0.57 | 0.53 | 0.88 | 0.72 | 0.95 | 0.98 |
+| no-disk (`C0`) | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.46 | 1.01 | 1.68 | 1.84 |
+| write-through (`wt`) | 0.68 | 1.46 | 0.99 | 0.60 | 0.54 | 1.00 | 1.00 | 1.00 | 1.00 |
+| tuned thresholds (`stk`) | 0.78 | 1.65 | 0.96 | 0.72 | 0.68 | 1.14 | 0.97 | 1.21 | 1.24 |
+| cost rule (`cost`) | 0.66 | 1.04 | 0.82 | 0.61 | 0.57 | 0.96 | 0.83 | 1.03 | 1.04 |
+| oracle (`orc`) | 0.60 | 1.00 | 0.71 | 0.57 | 0.53 | 0.88 | 0.72 | 0.95 | 0.98 |
 
 How to read it:
 
-- Most of the gain over C0 comes from having a disk tier at all. On a fast disk, writing everything (wt)
-  is within 2 to 5% of the oracle.
-- On a slow disk, writing everything floods the link: wt reaches 1.46x C0's p95 in the worst cell.
-- The cost rule is at most 4% worse than C0 in any cell; wt and stk reach 1.46 and 1.65. On a
-  0.5 GB/s disk it cuts p95 by 18%, where wt gains nothing and stk 4%. It trails wt by 3 to 4% on fast
-  disks.
-- The oracle bounds what prediction can add: 0.88 of wt overall, 0.72 on the slow disk.
+- Most of the gain over no-disk comes from having a disk tier at all. On a fast disk, writing everything
+  (write-through) is within 2 to 5% of the oracle.
+- On a slow disk, writing everything floods the link: write-through reaches 1.46x no-disk's p95 in the worst cell.
+- The cost rule is at most 4% worse than no-disk in any cell; write-through and the tuned thresholds reach 1.46 and
+  1.65. On a 0.5 GB/s disk it cuts p95 by 18%, where write-through gains nothing and the tuned thresholds 4%. It
+  trails write-through by 3 to 4% on fast disks.
+- The oracle bounds what prediction can add: 0.88 of write-through overall, 0.72 on the slow disk.
 
 The run is deterministic: the same command gives the same rows, bit for bit. The exact command, the commit and
 date of the shipped files, the row fields and the diff check are in [reference/README.md](../reference/README.md).
@@ -165,8 +168,8 @@ extracts idle boundaries, applies the same split and user hold-out as the Layby 
 writes the pools. Steps from the boundary files on reproduce the shipped pools exactly on all four
 sources; TraceLab also reproduces end to end from the raw download. See [bench/build/README.md](build/README.md).
 
-The survival curves need Layby-Dwell. Without it the rebuilt pools have no curves, and only `C0`, `wt`,
-`cont`, `cj` and `ka` can run on them.
+The survival curves need Layby-Dwell. Without it the rebuilt pools have no curves, and only the rules `C0`,
+`wt`, `cont`, `cj` and `ka` can run on them.
 
 ## Limits
 

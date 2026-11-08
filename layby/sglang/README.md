@@ -53,8 +53,10 @@ Hint port, the same API as `layby/vllm/server.py` (the same server, given this a
 
 ## Arms
 
-`engine/run_arms_sglang.sh WORKLOAD OUTDIR GPU_KV_BYTES CPU_BYTES DISK_DIR ARM...` runs C0 (HiCache
-host tier, LRU, write_through), T (+ file storage, every node written through) and K (park). It uses
+`engine/run_arms_sglang.sh WORKLOAD OUTDIR GPU_KV_BYTES CPU_BYTES DISK_DIR ARM...` runs no-disk
+(`C0`: HiCache host tier, LRU, write_through), write-through (`T`: + file storage, every node
+written through) and layby (`K`: park). `ARM` is the runner code in parentheses;
+`engine/REPRODUCE.md` lists every code. It uses
 the same capacity arguments as `engine/run_arms.sh`: GPU KV bytes become `--max-total-tokens` (bytes / BPT),
 host bytes become `--hicache-ratio`, and the disk directory becomes the file backend directory.
 Every arm uses the Python TreeCore (`TREE_CORE`) and page size 64 (`PAGE`). Replay:
@@ -122,8 +124,8 @@ and vLLM servers, with and without `--window`.
 
 1. Install as above. `python -c "import sglang"`, and confirm `sglang-kernel` loads on the card's
    arch.
-2. Start arm K with a small model and `--log-level info`. The log should show `Applied 1 hook(s)` for
-   the 5 targets, `Tree cache initialized: source=registered('park') impl=ParkRadixCache`,
+2. Start the layby arm (`K`) with a small model and `--log-level info`. The log should show
+   `Applied 1 hook(s)` for the 5 targets, `Tree cache initialized: source=registered('park') impl=ParkRadixCache`,
    `Init Unified Radix Cache ... Tree Core: UnifiedTreeCore`, `park: cache up`, `park: host ...
    storage True`, and `park: hint port 8765`.
 3. `curl localhost:8765/health`, then `curl localhost:8765/live`: capacities match the flags
@@ -131,15 +133,15 @@ and vLLM servers, with and without `--window`.
    bytes per token per rank).
 4. Send one `/generate` with `custom_params.park_key` and `park_surv` (15 values). `/live` counts one
    decision. Send a second request with only `park_key`, then POST its curve: `late` = 1.
-5. Run a short replay (`run_arms_sglang.sh` with WINDOW=300, arms C0 T K) at a GPU size that forces
+5. Run a short replay (`run_arms_sglang.sh` with WINDOW=300, arms `C0 T K`) at a GPU size that forces
    host eviction. In `K.park_live.json`: `ne_g` and `ne_c` > 0, `resid_c` not all 1, `n_cpu` and
    `n_disk` > 0, `speeds.cpu_gbps` and `disk_gbps` measured (not the 20 / 1.5 defaults), `miss_g` or
    `miss_c` > 0, the decision mix not all one option, `write_late` > 0 and `write_skipped` > 0. The
-   storage dir holds files in K and grows faster in T.
-6. Correctness under eviction: the K server log has no `park: ... failed` line and no SGLang
-   assertion. Outputs are deterministic (temperature 0, ignore_eos), so a fixed prompt gives the same
-   ids in C0 and K.
-7. Overhead: the K step time (`/live` t0) is within noise of C0 at the same load. The Python TreeCore
-   is in every arm, so the baselines pay it too.
-8. TP=2, only if TP>1 is in scope: K starts, `/live` is served once (rank 0), and a replay with heavy
-   eviction raises no TP divergence assertion (`write_back duplicate-reclaim`, rank consensus checks).
+   storage dir holds files in layby and grows faster in write-through.
+6. Correctness under eviction: the layby server log (`K.server.log`) has no `park: ... failed` line
+   and no SGLang assertion. Outputs are deterministic (temperature 0, ignore_eos), so a fixed prompt
+   gives the same ids in no-disk and layby.
+7. Overhead: the layby step time (`/live` t0) is within noise of no-disk at the same load. The Python
+   TreeCore is in every arm, so the baselines pay it too.
+8. TP=2, only if TP>1 is in scope: the layby arm starts, `/live` is served once (rank 0), and a
+   replay with heavy eviction raises no TP divergence assertion (`write_back duplicate-reclaim`, rank consensus checks).
