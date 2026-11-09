@@ -93,9 +93,10 @@
   },
   {
    "label": "lmcache",
-   "code": "LMR",
+   "code": "LM",
    "env": {
-    "LM_CHUNK": "512"
+    "LM_CHUNK": "256",
+    "LM_EAGER": "1"
    },
    "rss_of": "LM"
   },
@@ -177,7 +178,7 @@
  },
  "tuned": {
   "file": "tuned.json",
-  "sha256": "d8c47902f8918449bc99fb755948e6642180ec7b31d3e4fdd907ca5ede3782e4",
+  "sha256": "b9f4478402ba6ce152719e1804260dbde6e0276f943d20844f18c0381e4b1626",
   "applied": {
    "C0": {
     "budget": null,
@@ -195,9 +196,9 @@
     "min_hits": 3
    },
    "LM": {
-    "chunk": 512,
-    "eager": false,
-    "prefetch": "retain"
+    "chunk": 256,
+    "eager": true,
+    "prefetch": "default"
    }
   }
  }

@@ -22,7 +22,7 @@
    "fast": {
     "block": {
      "attempt": 1,
-     "host": "tune-gemma2",
+     "host": "wrx",
      "repeat": 1
     },
     "carried": {
@@ -33,13 +33,13 @@
     },
     "cell": "t-gemma-lm-fast-s3",
     "knobs": {
-     "chunk": 256,
+     "chunk": 512,
      "eager": true,
      "prefetch": "default"
     },
-    "label": "LM_c256_default_eager",
-    "p50": 7.335942,
-    "p95": 40.077863,
+    "label": "lmcache-c512-default-eager",
+    "p50": 12.612279,
+    "p95": 54.481538,
     "ranking": "rank/t-gemma-lm-fast-s3.json"
    },
    "slow": {
