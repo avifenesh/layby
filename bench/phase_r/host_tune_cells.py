@@ -39,6 +39,8 @@ def port(host, path):
     for a in c["arms"]:
         a.setdefault("rss_of", "LM" if a["code"] in ("LM", "LMR") else a["code"])
         a["label"] = readable(a["label"])
+    if "tuning" in c:   # tune_rank.py checks the arm labels against the grid
+        c["tuning"]["grid"] = [readable(g) for g in c["tuning"]["grid"]]
     c["plan"] = f"BENCH_PLAN draft 6.8 (host {host}; close-call rerun of {c['cell']})"
     c["_comment"] = f"{c.get('_comment', '')} Ported to host {host} by bench/phase_r/host_tune_cells.py."
     out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "engine", "phase_r", "cells", host,

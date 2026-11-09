@@ -309,6 +309,8 @@ def main():
         PLAN = f"BENCH_PLAN draft 6.7 (host {a.host}; freeze commit to fill)"
         tuned_default = os.path.join(out, "tune", "tuned.json")
         out = os.path.join(out, a.host)
+        if os.path.exists(os.path.join(out, "tune", "tuned.json")):   # the host's own close-call reruns
+            tuned_default = os.path.join(out, "tune", "tuned.json")
     else:
         tuned_default = os.path.join(out, "tune", "tuned.json")
     os.makedirs(out, exist_ok=True)

@@ -147,14 +147,14 @@
   "stage": 3,
   "workload": "gemma4_31b.tuning",
   "grid": [
-   "LM_c256_default",
-   "LM_c256_default_eager",
-   "LM_c256_retain",
-   "LM_c256_retain_eager",
-   "LM_c512_default",
-   "LM_c512_default_eager",
-   "LM_c512_retain",
-   "LM_c512_retain_eager"
+   "lmcache-c256-default",
+   "lmcache-c256-default-eager",
+   "lmcache-c256-retain",
+   "lmcache-c256-retain-eager",
+   "lmcache-c512-default",
+   "lmcache-c512-default-eager",
+   "lmcache-c512-retain",
+   "lmcache-c512-retain-eager"
   ],
   "carried": {
    "C0": {
