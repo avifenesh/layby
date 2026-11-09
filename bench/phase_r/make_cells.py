@@ -228,6 +228,8 @@ def cell(name, key, man, caps, regime, load, wl, arms, ct_eta, cap_src, extra=No
     m = MODELS[key]
     proj = man.get("c0_projection") or {}
     projected = proj.get("makespan_s") or man["load"]["est_makespan_s"]
+    if HOST:   # the projection assumed Nebius's prefill; the workloads are prefill-bound, so scale by this host's
+        projected = round(projected * m["prefill"] / HOST["prefill_tok_s"][key], 1)
     dry = None if name.startswith("s-") else DRYRUN.get(wl)   # the start block's cells are the dry runs themselves
     mk = dry or projected
     cap = int(math.ceil(1.5 * mk))

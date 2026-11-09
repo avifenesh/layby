@@ -5,11 +5,42 @@
  "serve_extra": "--host 127.0.0.1",
  "housekeeping_cpus": "0-1,32-33",
  "slots": [
-  {"name": "s2", "cuda": "2", "port": 8000, "park_port": 28765, "sidecar_port": 28766, "cpus": "2-12,34-44", "mems": "0",
-   "disk": {"mount": "/mnt/Data/phase_r/s2", "wipe": "fstrim"}, "env": {"LM_PORT": "6555"}},
-  {"name": "s3", "cuda": "3", "port": 8001, "park_port": 28775, "sidecar_port": 28776, "cpus": "13-23,45-55", "mems": "0",
-   "disk": {"mount": "/mnt/Data/phase_r/s3", "wipe": "fstrim"}, "env": {"LM_PORT": "6565"}}
+  {
+   "name": "s2",
+   "cuda": "2",
+   "port": 8000,
+   "park_port": 28765,
+   "sidecar_port": 28766,
+   "cpus": "2-12,34-44",
+   "mems": "0",
+   "disk": {
+    "mount": "/mnt/Data/phase_r/s2",
+    "wipe": "fstrim"
+   },
+   "env": {
+    "LM_PORT": "6555"
+   }
+  },
+  {
+   "name": "s3",
+   "cuda": "3",
+   "port": 8001,
+   "park_port": 28775,
+   "sidecar_port": 28776,
+   "cpus": "13-23,45-55",
+   "mems": "0",
+   "disk": {
+    "mount": "/mnt/Data/phase_r/s3",
+    "wipe": "fstrim"
+   },
+   "env": {
+    "LM_PORT": "6565"
+   }
+  }
  ],
- "prefill_tok_s": {"qwen38_27b": null, "gemma4_31b": null},
- "prefill_source": null
+ "prefill_tok_s": {
+  "qwen38_27b": 6739.6,
+  "gemma4_31b": 4104.1
+ },
+ "prefill_source": "micro_wrx.sh 2026-11-09 05:00-05:22 UTC: micro_bench.py batch 8 at 8,192 tokens, mean of GPUs 2 and 3 (Qwen 6,819.5 / 6,659.8, Gemma 4,088.6 / 4,119.6 tok/s), both models served at once, then the GPUs swapped; Nebius: Qwen 10,477.5, Gemma 6,201.4 (x0.6432, x0.6618)"
 }
