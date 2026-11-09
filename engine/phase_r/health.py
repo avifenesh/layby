@@ -31,8 +31,8 @@ After the arm (on the replay window, cut by the runner's replay_start and replay
     per arm. The weights' clean cache from loading is reclaimed at replay_start (arm_hook.sh), before the window
   - engine stall: requests in flight and no first token or completion for engine_stall_s (300 s) or more in the
     replay (the engine hung while /health still answered); counted as an engine crash
-Covariates logged: SM clock per GPU (median and min in the window), software power-cap time, max temperature, io PSI,
-the tier's peak size, the page-cache maxima, the connection-failure fraction.
+Covariates logged: SM clock per GPU (median and min in the window), software power-cap time, max temperature,
+max fan speed, io PSI, the tier's peak size, the page-cache maxima, the connection-failure fraction.
 """
 import csv
 import hashlib
@@ -77,11 +77,14 @@ def mask_of(v):
 def gpu_fields(runner):
     """The query fields this driver accepts: counters only when it has them, the old throttle name on old drivers."""
     h = runner.run(["nvidia-smi", "--help-query-gpu"], kind="gpu",
-                   fake='"clocks_event_reasons.active"\n' + "\n".join(f'"{c}"' for c in COUNTER_FIELDS)).out
+                   fake='"clocks_event_reasons.active"\n' + "\n".join(f'"{c}"' for c in COUNTER_FIELDS)
+                   + '\n"fan.speed"').out
     fields = list(GPU_FIELDS)
     if '"clocks_event_reasons.active"' not in h:
         fields[-1] = "clocks_throttle_reasons.active"
     fields += [c for c in COUNTER_FIELDS if f'"{c}"' in h]
+    if '"fan.speed"' in h:      # last, so the earlier columns keep their places
+        fields.append("fan.speed")
     return fields
 
 
@@ -327,10 +330,12 @@ def verdict(*, markers, cg_before, cg_after, tel_rows, cg_name, gpu_rows, runner
             pc = [float(r[f]) for r in rs for f in ["clocks_event_reasons_counters.sw_power_cap"]
                   if r.get(f) not in (None, "", "[N/A]")]
             temp = [float(r["temperature.gpu"]) for r in rs if r.get("temperature.gpu") not in (None, "", "[N/A]")]
+            fan = [float(r["fan.speed"]) for r in rs if r.get("fan.speed") not in (None, "", "[N/A]")]
             cov[f"gpu{g}"] = {"sm_clock_median": statistics.median(sm) if sm else None, "sm_clock_min": min(sm, default=None),
                               "sw_power_cap_s": (pc[-1] - pc[0]) / 1e6 if len(pc) >= 2 else None,
                               "sw_power_cap_samples": sum(1 for r in rs if r["mask"] & 0x4),
-                              "temp_max": max(temp, default=None), "samples": len(rs)}
+                              "temp_max": max(temp, default=None), "fan_max": max(fan, default=None),
+                              "samples": len(rs)}
         cov["window_s"] = t1 - t0
     if engine == "vllm" and regime in ("slow", "medium") and ODIRECT_FALLBACK in server_log:
         reasons.append("vLLM fell back to buffered I/O on the disk tier (O_DIRECT probe failed)")
