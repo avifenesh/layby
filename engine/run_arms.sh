@@ -206,7 +206,8 @@ for arm in "$@"; do
   [ -n "${ARM_HOOK:-}" ] && $ARM_HOOK replay_end "$arm" "$O"
   case ${arm%%.*} in K|K_km|K_ewma|K0|KW|KD|SM) curl -sf localhost:$PARK_PORT/live > $O/$arm.park_live.json
                               curl -sf localhost:$PARK_PORT/prof > $O/$arm.prof.json
-                              curl -sf localhost:$PARK_PORT/prof/windows > $O/$arm.profw.json ;;
+                              curl -sf localhost:$PARK_PORT/prof/windows > $O/$arm.profw.json
+                              curl -sf localhost:$PARK_PORT/log > $O/$arm.park_log.json ;;
     CT) curl -sf localhost:$PARK_PORT/live > $O/$arm.ct_live.json
         curl -sf localhost:$PARK_PORT/log > $O/$arm.ct_log.json ;; esac
   echo "arm $arm rc=$rc $(grep -c ttft $O/$arm.jsonl) turns"

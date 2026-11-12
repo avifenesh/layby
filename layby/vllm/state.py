@@ -37,7 +37,8 @@ class ParkState:
         # idle periods that ended since the last flush: (tier, evicted) -> ages. vLLM reports them per block
         # and per chunk (thousands per admission); folding them into the estimators once per step keeps
         # that out of the scheduler's hot path
-        self.ended = {("g", False): [], ("g", True): [], ("c", False): [], ("c", True): []}
+        # ("c", "first"): CPU evictions of chunks the rule placed first out (park, drop)
+        self.ended = {("g", False): [], ("g", True): [], ("c", False): [], ("c", True): [], ("c", "first"): []}
         self.hints: "queue.SimpleQueue" = queue.SimpleQueue()   # (key, surv) from the hint server
         self.counts = dict(none=0, ins=0, park=0, drop=0, hints=0, late=0, no_entry=0, spill=0, defer_giveup=0)
         self.last_decisions: list = []
@@ -72,7 +73,14 @@ class ParkState:
         for (tier, ev), ages in self.ended.items():
             if ages:
                 w = self.block_tokens if tier == "g" else self.chunk_tokens
-                self.live.end_idle_many(now, tier, ages, w, ev)
+                if ev == "first":
+                    # the rule's own eviction: censored for the residency of kept copies and left out of the
+                    # evicted weight the holding price divides by; still an eviction event (first-out copies
+                    # stay until the tier's next eviction)
+                    self.live.end_idle_many(now, tier, ages, w, False)
+                    self.live.add(now, **{"ne_" + tier: float(len(ages))})
+                else:
+                    self.live.end_idle_many(now, tier, ages, w, ev)
                 ages.clear()
 
     def snapshot(self):

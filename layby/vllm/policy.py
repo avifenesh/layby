@@ -73,6 +73,9 @@ class ParkCachePolicy(CachePolicy):
         self.live: dict[str, tuple[float | None, set[OffloadKey]]] = {}  # req id -> (park_eta, touched keys)
         self.idle_since: dict[OffloadKey, float] = {}   # idle chunk -> when its last live request finished
         self.c_evicted: dict[OffloadKey, float] = {}    # chunk -> when it was evicted while idle
+        # chunks evicted while placed first out (park, drop): the rule chose to lose them, so a return that misses
+        # them prices that decision, not the tier's pressure (they stay out of the holding price and the residency)
+        self.c_first: set[OffloadKey] = set()
         # write-on-evict (layby.vllm.demote): victims kept resident until their disk write completes
         self.demoter = None
         self.demoting: set[OffloadKey] = set()          # chosen as victims, being written, not evictable
@@ -134,6 +137,7 @@ class ParkCachePolicy(CachePolicy):
         if not self._in_use(key):
             self.idle_since[key] = now      # e.g. the final store of a request that already finished
         self.c_evicted.pop(key, None)
+        self.c_first.discard(key)
 
     def remove(self, key: OffloadKey) -> None:
         self._drop(key)
@@ -202,6 +206,7 @@ class ParkCachePolicy(CachePolicy):
         self.chunks.clear(); self.evictable.clear(); self.hinted.clear(); self.heap.clear(); self.lru.clear()
         self.hseq.clear()
         self.expiry.clear(); self.live.clear(); self.idle_since.clear(); self.c_evicted.clear()
+        self.c_first.clear()
         self.demoting.clear(); self.pending_demote.clear()
 
     def _top_hinted(self, protected: set[OffloadKey], skipped: list):
@@ -266,9 +271,11 @@ class ParkCachePolicy(CachePolicy):
         STATE.note_burst(now, n)
         for key in out:
             t = self.idle_since.get(key)
-            STATE.ended[("c", True)].append(now - t if t is not None else 0.0)
+            first = self.hinted.get(key) == NEVER       # placed first out: evicted by the rule's choice
+            STATE.ended[("c", "first" if first else True)].append(now - t if t is not None else 0.0)
             STATE.spill.pop(key, None)
             self.c_evicted[key] = now
+            (self.c_first.add if first else self.c_first.discard)(key)
             self._drop(key)
         for key in demoted:
             # stays in the CPU tier (a lookup still hits it) but cannot be evicted until its write completes;

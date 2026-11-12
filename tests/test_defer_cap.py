@@ -76,7 +76,7 @@ def build(n_chunks, root):
     conn = object.__new__(C.ParkConnector)
     conn.connector_scheduler, conn.connector_worker = cs, None
     conn.__dict__["_bounding_group_ids"] = ()          # every group is offloaded: no bound on the load
-    conn._waiting, conn._deferred, conn._local, conn._giveups = {}, {}, {}, {}
+    conn._waiting, conn._deferred, conn._local, conn._giveups, conn._ready = {}, {}, {}, {}, {}
     conn._loads, conn._finished, conn._early, conn._hints_on = {}, {}, {}, False
     return conn, cs, mgr, prim, fs, prim._policy
 
@@ -269,6 +269,34 @@ try:
     assert STATE.live.acc["n_giveup"] == 3.0, STATE.live.acc
     assert STATE.live.acc["giveup_saved"] > saved, "no saving recorded for a promotion that completed after the give-up"
     assert not conn._giveups, conn._giveups
-    print("defer cap ok: base defers forever; rule admits at the cap with 0 or the ready prefix; promotions land safely")
+
+    # --- 6. a promotion that lands under the cap: the restore costs the promotion, not the admission queue --------
+    # Phase R (Gemma fast heavy, wrx): the wait from first deferral to admission had p50 4.4 s for a 1.9 s transfer;
+    # the rule read that as the disk's restore time, on top of the admission wait Q it prices separately
+    store(mgr, "c-3", [key(h) for h in hashes("e", 8)])   # evicts a again
+    settle(mgr, fs)
+    assert not any(k in pol.chunks for k in A) and all(k in fs._on_disk for k in A)
+    seen = []
+    real_add = STATE.live.add
+    STATE.live.add = lambda now, **kw: (seen.append(kw), real_add(now, **kw))[1]
+    r3 = request("r3", HP, 5 * T)
+    conn.on_new_request(r3)
+    t_first = clock[0]
+    assert lookup(conn, cs, mgr, r3)[0] is None
+    promo = recompute_cost(5 * T) * 0.2
+    clock[0] += promo
+    real_submit_load(held.pop())
+    settle(mgr, fs)
+    out = lookup(conn, cs, mgr, r3)
+    assert out == (4 * T, True), f"the landed prefix should load: {out}"
+    clock[0] += 50.0                                     # the scheduler admits it 50 s later (queue)
+    conn.update_state_after_alloc(r3, blocks_for(4 * T), 4 * T)
+    STATE.live.add = real_add
+    d = [kw["defer"] for kw in seen if "defer" in kw]
+    assert len(d) == 1 and abs(d[0] - promo) < 1e-6, f"defer sample {d}: expected the promotion {promo:.3f} s, not +50 s"
+    row = STATE.rlog[-1]
+    assert abs(row["promo"] - promo) < 1e-3 and abs(row["defer"] - (clock[0] - t_first)) < 1e-3, row
+    print("defer cap ok: base defers forever; rule admits at the cap with 0 or the ready prefix; promotions land safely;"
+          " a landed promotion is measured to its landing")
 finally:
     shutil.rmtree(root, ignore_errors=True)

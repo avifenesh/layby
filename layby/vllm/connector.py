@@ -163,6 +163,7 @@ class ParkConnector(OffloadingConnector):
         STATE.gpu_tokens = kv_cache_config.num_blocks * STATE.block_tokens
         self._waiting: dict[str, float] = {}           # request id -> time added, until admitted
         self._deferred: dict[str, float] = {}          # request id -> first lookup that deferred it
+        self._ready: dict[str, float] = {}             # request id -> first lookup after its deferral that could load
         # request id -> its give-up (the deferral it stopped), until the promotion it waited on resolves
         self._giveups: dict[str, dict] = {}
         # request id -> the GPU-local prefix hit (tokens) vLLM passed to the last lookup. vLLM calls
@@ -220,6 +221,8 @@ class ParkConnector(OffloadingConnector):
         self._local[rid] = int(num_computed_tokens)
         out = super().get_num_new_matched_tokens(request, num_computed_tokens)
         if out[0] is not None:
+            if rid in self._deferred and rid not in self._ready:
+                self._ready[rid] = time.monotonic()      # the promotion it waited on has landed
             return out
         now = time.monotonic()
         t0 = self._deferred.get(rid)
@@ -300,6 +303,7 @@ class ParkConnector(OffloadingConnector):
     def _admit(self, request, num_external_tokens):
         t = self._waiting.pop(request.request_id, None)
         td = self._deferred.pop(request.request_id, None)
+        tr = self._ready.pop(request.request_id, None)
         local = self._local.pop(request.request_id, None)
         g = self._giveups.get(request.request_id)
         if g is not None:
@@ -309,21 +313,25 @@ class ParkConnector(OffloadingConnector):
                 g["admitted"] = True
         if td is not None:
             now = time.monotonic()
-            # a return whose prefix was on disk paid the wait, and after a give-up the recompute too
-            STATE.live.add(now, n_defer=1.0, defer=now - td + (g["x"] if g is not None else 0.0))
+            # a restore from disk costs the promotion: first deferral to the first lookup that could load (the wait
+            # for admission after that is the queue every request pays, priced by the rule as Q); after a give-up,
+            # the wait until it gave up plus the recompute
+            STATE.live.add(now, n_defer=1.0, defer=(tr if tr is not None else now) - td + (g["x"] if g is not None else 0.0))
         if t is not None:
             now = time.monotonic()
             STATE.live.add(now, n_adm=1.0, qwait=now - t)
             self._account_misses(request, num_external_tokens, now,
                                  request.num_computed_tokens if local is None else max(local, request.num_computed_tokens),
-                                 g)
+                                 g, qwait=now - t, defer=None if td is None else now - td,
+                                 promo=None if td is None or tr is None else tr - td)
 
     def update_state_after_alloc(self, request, blocks, num_external_tokens: int):
         out = super().update_state_after_alloc(request, blocks, num_external_tokens)
         _safe("admission", self._admit, request, num_external_tokens)
         return out
 
-    def _account_misses(self, request, ext: int, now: float, local: int, giveup=None) -> None:
+    def _account_misses(self, request, ext: int, now: float, local: int, giveup=None, qwait=None, defer=None,
+                        promo=None) -> None:
         """The latency this admission loses to KV the GPU and the CPU tier evicted (and how long
         ago): the load of what comes from outside the GPU, at the CPU link's measured speed and wait,
         and the recompute of what comes from nowhere, at the measured prefill speed; each counted with
@@ -333,6 +341,12 @@ class ParkConnector(OffloadingConnector):
         rec = max(prompt - local - ext, 0)
         params = getattr(request, "kv_transfer_params", None) or {}
         row = dict(t=round(now, 3), sess=session_of(params.get("park_key")), P=prompt, local=local, ext=ext, rec=rec)
+        if qwait is not None:
+            row["qwait"] = round(qwait, 3)          # add to admission
+        if defer is not None:
+            row["defer"] = round(defer, 3)          # first deferral (a promotion from disk) to admission
+        if promo is not None:
+            row["promo"] = round(promo, 3)          # first deferral to the promotion landing
         if giveup is not None:
             row.update(giveup=True, wait=round(giveup["waited"], 3), cap=round(giveup["cap"], 3), ready=giveup["ready"])
         STATE.rlog.append(row)
@@ -359,11 +373,14 @@ class ParkConnector(OffloadingConnector):
         if pol is not None and req_status is not None and rec > 0:
             keys = [k for g, gs in zip(self.connector_scheduler.config.kv_group_configs, req_status.group_states)
                     for k in gs.offload_keys[(local + ext) // g.tokens_per_chunk: prompt // g.tokens_per_chunk]]
-            tc = [pol.c_evicted[k] for k in keys if k in pol.c_evicted]
-            if tc:
-                # loss beyond what loading the same tokens from a CPU copy would have cost
-                lost_c = max(full - rec * p.bytes_per_token / (p.cpu_gbps * 1e9), 0.0)
-                L.miss(now, "c", now - max(tc), lost_c)
+            ev = [k for k in keys if k in pol.c_evicted]
+            kept = [k for k in ev if k not in pol.c_first]
+            if kept:
+                # loss beyond what loading the same tokens from a CPU copy would have cost, for the share of the
+                # missing chunks the tier evicted under pressure; chunks the rule placed first out (park, drop)
+                # were lost by that decision, which prices them itself, so they do not raise the holding price
+                lost_c = max(full - rec * p.bytes_per_token / (p.cpu_gbps * 1e9), 0.0) * len(kept) / len(ev)
+                L.miss(now, "c", now - max(pol.c_evicted[k] for k in kept), lost_c)
                 L.add(now, miss_c=lost_c)
 
     # --- steps and the CPU link --------------------------------------------------------
@@ -427,6 +444,7 @@ class ParkConnector(OffloadingConnector):
         now = time.monotonic()
         self._waiting.pop(request.request_id, None)
         self._deferred.pop(request.request_id, None)
+        self._ready.pop(request.request_id, None)
         ids = block_ids[0] if block_ids and isinstance(block_ids[0], (list, tuple)) else block_ids
         pool = getattr(self, "_pool", None)
         for bid in ids or ():
@@ -512,6 +530,8 @@ class ParkConnector(OffloadingConnector):
             old = [k for k, t in d.items() if now - t > HORIZON]
             for k in old:
                 del d[k]
+        if STATE.policy is not None:
+            STATE.policy.c_first.intersection_update(STATE.policy.c_evicted)
         while self._finished:
             k, e = next(iter(self._finished.items()))
             if now - e["t"] <= HORIZON:
