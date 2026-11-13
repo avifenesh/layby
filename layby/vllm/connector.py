@@ -30,7 +30,8 @@ queue rank (ParkCachePolicy.hold): evicted after every idle chunk, the last-arri
 held again at the head of the queue. Counts held.
 
 Prefetch: each step, the waiting requests whose held chunks fit in the CPU tier's room (queue order) have the
-disk -> CPU promotion of their prefix (and of each windowed group's window at its end) started once, so a disk restore runs during the queue wait. An admission
+disk -> CPU promotion of their prefix past what the GPU prefix cache holds (and of each windowed group's window at its
+end) started once, so a disk restore runs during the queue wait. An admission
 whose prefetch restored its prefix before the scheduler reached it is a disk restore that cost no wait (defer 0).
 Counts prefetch (chunks).
 
@@ -317,6 +318,7 @@ class ParkConnector(OffloadingConnector):
         promotions started."""
         groups = list(zip(self.connector_scheduler.config.kv_group_configs, rs.group_states))
         n = 0
+        local = self._gpu_prefix_tokens(rs)    # vLLM loads only past the prefix its GPU cache still holds
 
         def one(k):
             nonlocal n
@@ -330,8 +332,9 @@ class ParkConnector(OffloadingConnector):
         for g, gs in groups:
             if g.sliding_window_size_in_chunks is not None:
                 continue
-            hit = 0
-            for k in gs.offload_keys:
+            start = local // g.tokens_per_chunk
+            hit = start
+            for k in gs.offload_keys[start:]:
                 if one(k) is LookupResult.MISS:
                     break
                 hit += 1
@@ -346,6 +349,24 @@ class ParkConnector(OffloadingConnector):
             for k in ks[max(end - (w or 0), 0):end]:
                 one(k)
         return n
+
+    def _gpu_prefix_tokens(self, rs) -> int:
+        """Tokens of the request's prefix whose blocks the GPU prefix cache holds now, in every full-attention group
+        (vLLM's local hit; the offload lookup starts past it). 0 without a bound block pool."""
+        pool = getattr(self, "_pool", None)
+        req = getattr(rs, "req", None)
+        if pool is None or req is None or not hasattr(pool, "get_cached_block"):
+            return 0
+        gids = [g.group_idx for g in self.connector_scheduler.config.kv_group_configs
+                if g.sliding_window_size_in_chunks is None]
+        if not gids:
+            return 0
+        n = 0
+        for h in req.block_hashes:
+            if pool.get_cached_block(h, gids) is None:
+                break
+            n += 1
+        return n * STATE.hash_tokens
 
     def get_num_new_matched_tokens(self, request, num_computed_tokens):
         rid = request.request_id

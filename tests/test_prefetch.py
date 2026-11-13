@@ -62,6 +62,30 @@ try:
 
     fs.shutdown()
 
+    # the GPU prefix cache still holds the first 2 of a's 4 chunks: vLLM loads only past them, so the prefetch
+    # promotes chunks 2 and 3 only (before: all 4, measured on wrx 2026-11-13: 57,688 promotions, about 63 per
+    # waiting request, most of them for prefixes the GPU still held)
+    conn, cs, mgr, prim, fs, pol = build(8, root + "/g")
+    A = [key(h) for h in hashes("a", 4)]
+    store(mgr, "a-1", A)
+    fs.queue_write(A)
+    settle(mgr, fs); settle(mgr, fs)
+    store(mgr, "c-1", [key(h) for h in hashes("c", 8)])
+    settle(mgr, fs)
+    assert not any(k in pol.chunks for k in A)
+    HA = hashes("a", 4)
+    from types import SimpleNamespace as NS
+    conn._pool = NS(get_cached_block=lambda h, gids: [object()] if h in HA[:2] else None)
+    r3 = request("r3", HA + hashes("p", 1), 5 * T)
+    conn.on_new_request(r3)
+    conn._prefetch()
+    assert conn._prefetched.get("r3") == 2, conn._prefetched
+    end_schedule(mgr)
+    settle(mgr, fs)
+    assert [k in pol.chunks for k in A] == [False, False, True, True], [k in pol.chunks for k in A]
+    check(prim, pol)
+    fs.shutdown()
+
     # room: in an 8-chunk tier, a waiting request of 4 chunks and one of 5 behind it; the second is not prefetched
     conn, cs, mgr, prim, fs, pol = build(8, root)
     r1 = request("r1", hashes("x", 4), 4 * T)
