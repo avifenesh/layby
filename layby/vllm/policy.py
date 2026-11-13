@@ -120,11 +120,12 @@ class ParkCachePolicy(CachePolicy):
             self._set_hint(key, r, expire=False)
 
     def hold(self, req_id: str, keys, rank: float) -> None:
-        """A waiting request's chunks, placed by its queue rank (lower = admitted sooner) until unhold."""
+        """A waiting request's chunks (prefix order), placed by its queue rank (lower = admitted sooner) until
+        unhold."""
         self.unhold(req_id)
         keys = list(keys)
         self.held[req_id] = (rank, keys)
-        for k in keys:
+        for k in reversed(keys):        # equal ranks evict in hint order: the tail first, the prefix last
             self.held_t.setdefault(k, {})[req_id] = rank
             if k in self.chunks:
                 self._set_hint(k, self._rank(k), expire=False)

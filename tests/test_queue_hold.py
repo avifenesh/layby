@@ -16,6 +16,7 @@ Run: PYTHONPATH=. python tests/test_queue_hold.py
 """
 from types import SimpleNamespace as NS
 
+from vllm.v1.kv_offload.base import LookupResult
 from vllm.v1.kv_offload.cpu.policies.base import ChunkStatus
 
 import layby.vllm.connector as C
@@ -107,14 +108,37 @@ clock[0] = 1200.0
 got = order(pol, 11)
 assert got.endswith("AAAA"), got
 
+# within a held request the tail goes before the prefix (a prefix is used only as a contiguous run)
+pol = setup()
+pol.hold("ra", keys("A"), 1003.0)
+got = [k for k, _ in pol.evict(10, set())]
+assert got[8:] == [("A", 3), ("A", 2)], got
+
 # the connector holds at arrival and releases at admission and at the finish
+present = set()
+mgr = NS(lookup=lambda k, ctx: LookupResult.HIT if k in present else LookupResult.MISS)
+STATE.fs_tier = None
 STATE.policy = pol = setup()
 conn = object.__new__(C.ParkConnector)
-rs = NS(update_offload_keys=lambda: None, group_states=[NS(offload_keys=keys("A"))])
-conn.connector_scheduler = NS(_req_status={"ra": rs})
+FA = NS(sliding_window_size_in_chunks=None, tokens_per_chunk=16)
+rs = NS(update_offload_keys=lambda: None, group_states=[NS(offload_keys=keys("A"))], req_context=NS())
+conn.connector_scheduler = NS(_req_status={"ra": rs}, config=NS(kv_group_configs=[FA]), manager=mgr)
 conn._prefetched = {}
 conn._hold("ra", 1003.0)
-assert set(pol.held) == {"ra"} and STATE.counts["held"] == 1
+assert set(pol.held) == {"ra"} and pol.held["ra"][1] == keys("A") and STATE.counts["held"] == 1
 conn._unhold("ra")
 assert not pol.held
+
+# a hybrid model: every full-attention chunk is held, but of the Mamba states (window 1) only the one where the
+# full-attention prefix in the CPU tier or on disk ends; older states are never loaded
+F6, M6 = [("f", i) for i in range(6)], [("m", i) for i in range(6)]
+present.clear(); present.update(F6[:4] + M6)
+pos = {k: 16 * (k[1] + 1) for k in F6 + M6}
+rs = NS(update_offload_keys=lambda: None, group_states=[NS(offload_keys=F6), NS(offload_keys=M6)],
+        req_context=NS(get_offload_key_position=pos.get))
+MB = NS(sliding_window_size_in_chunks=1, tokens_per_chunk=16)
+conn.connector_scheduler = NS(_req_status={"rh": rs}, config=NS(kv_group_configs=[FA, MB]), manager=mgr)
+got = conn._hold_keys(rs)
+assert sorted(got) == sorted(F6 + [("m", 3)]), got
+assert [pos[k] for k in got] == sorted(pos[k] for k in got), "held keys not in prefix order"
 print("queue hold ok: waiting requests outlast idle sessions, the queue's head longest; admission releases")

@@ -71,6 +71,20 @@ try:
     conn._prefetch()
     assert "r1" in conn._prefetched and "r2" not in conn._prefetched, conn._prefetched
     check(prim, pol)
+    # a hybrid model: the prefetch promotes the full-attention prefix up to the first chunk no tier has, and of the
+    # Mamba states (window 1) only the one where that prefix ends
+    from types import SimpleNamespace as NS
+    from vllm.v1.kv_offload.base import LookupResult as LR
+    F6, M6 = [("f", i) for i in range(6)], [("m", i) for i in range(6)]
+    disk = set(F6[:4] + M6)
+    seen = []
+    mgr2 = NS(lookup=lambda k, c: (seen.append(k), LR.HIT_PENDING if k in disk else LR.MISS)[1])
+    prim2 = NS(lookup=lambda k, c: LR.MISS)
+    FA, MB = NS(sliding_window_size_in_chunks=None, tokens_per_chunk=T), NS(sliding_window_size_in_chunks=1, tokens_per_chunk=T)
+    conn.connector_scheduler = NS(config=NS(kv_group_configs=[FA, MB]))
+    rs2 = NS(group_states=[NS(offload_keys=F6), NS(offload_keys=M6)], req_context=None)
+    n = conn._prefetch_req(rs2, mgr2, prim2)
+    assert n == 5 and seen == F6[:5] + [("m", 3)], (n, seen)
 finally:
     fs.shutdown() if "fs" in dir() else None
     shutil.rmtree(root, ignore_errors=True)

@@ -30,7 +30,7 @@ queue rank (ParkCachePolicy.hold): evicted after every idle chunk, the last-arri
 held again at the head of the queue. Counts held.
 
 Prefetch: each step, the waiting requests whose held chunks fit in the CPU tier's room (queue order) have the
-disk -> CPU promotion of their prefix started once, so a disk restore runs during the queue wait. An admission
+disk -> CPU promotion of their prefix (and of each windowed group's window at its end) started once, so a disk restore runs during the queue wait. An admission
 whose prefetch restored its prefix before the scheduler reached it is a disk restore that cost no wait (defer 0).
 Counts prefetch (chunks).
 
@@ -236,9 +236,45 @@ class ParkConnector(OffloadingConnector):
         if pol is None or rs is None or not hasattr(pol, "hold"):
             return
         rs.update_offload_keys()
-        pol.hold(rid, _request_keys(rs), rank)
+        pol.hold(rid, self._hold_keys(rs), rank)
         self._prefetched.pop(rid, None)        # a preempted request is prefetched again
         STATE.counts["held"] += 1
+
+    def _hold_keys(self, rs) -> list:
+        """The chunks a load of this request can use, in prefix order (by end token across groups): every
+        full-attention chunk, and for each windowed group (sliding window, Mamba state) only the window that ends
+        where the full-attention prefix in the CPU tier or on disk ends; older windows are never loaded."""
+        cs = self.connector_scheduler
+        mgr = cs.manager
+        prim = getattr(mgr, "primary_tier", mgr)
+        fs = STATE.fs_tier
+        ctx = rs.req_context
+        present = lambda k: prim.lookup(k, ctx) is not LookupResult.MISS or (fs is not None and k in fs._on_disk)
+        groups = list(zip(cs.config.kv_group_configs, rs.group_states))
+        out, bound = [], None
+        for g, gs in groups:
+            if g.sliding_window_size_in_chunks is not None:
+                continue
+            ks = list(gs.offload_keys)
+            out += ks
+            last = next((i for i in range(len(ks) - 1, -1, -1) if present(ks[i])), -1)
+            t = (last + 1) * g.tokens_per_chunk
+            bound = t if bound is None else min(bound, t)
+        for g, gs in groups:
+            if g.sliding_window_size_in_chunks is None:
+                continue
+            ks = list(gs.offload_keys)
+            if bound is None:
+                end = next((i + 1 for i in range(len(ks) - 1, -1, -1) if present(ks[i])), 0)
+            else:
+                end = min(bound // g.tokens_per_chunk, len(ks))
+            w = (g.load_window_size_in_chunks(end * g.tokens_per_chunk) if hasattr(g, "load_window_size_in_chunks")
+                 else g.sliding_window_size_in_chunks) or 0
+            out += ks[max(end - w, 0):end]
+        pos = getattr(ctx, "get_offload_key_position", None)
+        if pos is not None and len(groups) > 1:
+            out.sort(key=lambda k: pos(k) or 0)
+        return out
 
     def _unhold(self, rid: str) -> None:
         pol = STATE.policy
@@ -270,21 +306,46 @@ class ParkConnector(OffloadingConnector):
             rs = cs._req_status.get(rid)
             if rs is None or rs.transfer_jobs:
                 continue
-            n = 0
-            for g, gs in zip(cs.config.kv_group_configs, rs.group_states):
-                ks = gs.offload_keys
-                w = g.sliding_window_size_in_chunks
-                if w is not None:
-                    ks = ks[-w:] if w else []       # a sliding-window group loads only its last window
-                for k in ks:
-                    before = prim.lookup(k, rs.req_context)
-                    r = mgr.lookup(k, rs.req_context)
-                    if r is LookupResult.MISS:
-                        break                       # a prefix stops at the first chunk no tier has
-                    if before is LookupResult.MISS and r is LookupResult.HIT_PENDING:
-                        n += 1
+            n = self._prefetch_req(rs, mgr, prim)
             self._prefetched[rid] = n
             STATE.counts["prefetch"] += n
+
+    def _prefetch_req(self, rs, mgr, prim) -> int:
+        """Look up a waiting request's chunks as the scheduler will (the tiering manager starts a promotion for each
+        one only the disk has): full-attention groups along the prefix up to the first chunk no tier has, then each
+        windowed group (sliding window, Mamba state) over the window that ends at that prefix. Returns the
+        promotions started."""
+        groups = list(zip(self.connector_scheduler.config.kv_group_configs, rs.group_states))
+        n = 0
+
+        def one(k):
+            nonlocal n
+            before = prim.lookup(k, rs.req_context)
+            r = mgr.lookup(k, rs.req_context)
+            if before is LookupResult.MISS and r is LookupResult.HIT_PENDING:
+                n += 1
+            return r
+
+        bound = None                                # tokens of the prefix every full-attention group has
+        for g, gs in groups:
+            if g.sliding_window_size_in_chunks is not None:
+                continue
+            hit = 0
+            for k in gs.offload_keys:
+                if one(k) is LookupResult.MISS:
+                    break
+                hit += 1
+            bound = hit * g.tokens_per_chunk if bound is None else min(bound, hit * g.tokens_per_chunk)
+        for g, gs in groups:
+            if g.sliding_window_size_in_chunks is None:
+                continue
+            ks = gs.offload_keys
+            end = len(ks) if bound is None else min(bound // g.tokens_per_chunk, len(ks))
+            w = (g.load_window_size_in_chunks(end * g.tokens_per_chunk) if hasattr(g, "load_window_size_in_chunks")
+                 else g.sliding_window_size_in_chunks)
+            for k in ks[max(end - (w or 0), 0):end]:
+                one(k)
+        return n
 
     def get_num_new_matched_tokens(self, request, num_computed_tokens):
         rid = request.request_id
