@@ -17,17 +17,25 @@ Config (secondary_tiers entry):
   {"type": "ParkFsTier", "module_path": "layby.vllm.fs_tier", "root_dir": ..., "n_read_threads": 16,
    "n_write_threads": 16}
 
+Parallel I/O: each load (promotion) and store job is split into up to n_read_threads / n_write_threads tasks of
+consecutive chunks, where vLLM 0.31's fs tier runs a job as one task (one thread reading or writing the job's
+files one after another). Phase R, Gemma fast heavy (wrx, 2026-11-12): restores ran at about 0.7 GB/s at the
+median on a disk capped at 1.35 GB/s for reads.
+
 Arm PT (pilot only): "write_all": true writes every chunk the CPU tier stores, as vLLM's own fs tier does in arm T,
 with no cost rule (run it beside the stock OffloadingConnector and LRU). It compares this tier's I/O path (its
 in-memory index for lookups, its dedup of chunks on disk or in flight, its link telemetry) with the native one. The
 default (false) leaves the tier as above.
 """
 import dataclasses
+import functools
 import itertools
+import threading
 import time
 
 from vllm.v1.kv_offload.base import LookupResult, OffloadPolicy, ReqContext, RequestOffloadingContext
 from vllm.v1.kv_offload.tiering.fs.manager import FileSystemTierManager
+from vllm.v1.kv_offload.tiering.fs import io as fs_io
 
 from layby.live import PROBE_BYTES, probe_disk
 from layby.vllm.state import STATE
@@ -64,6 +72,12 @@ class ParkFsTier(FileSystemTierManager):
 
     def __init__(self, *args, write_all=False, **kwargs):
         super().__init__(*args, **kwargs)
+        # parallel I/O within a job: vLLM 0.31's fs tier runs each job's chunk files as one task on one thread
+        # (queue depth 1), so a session's restore read its files one after another while the other read threads
+        # idled. Each job is split into up to this many tasks over consecutive chunks
+        self._split_load = max(int(kwargs.get("n_read_threads", 16)), 1)
+        self._split_store = max(int(kwargs.get("n_write_threads", 16)), 1)
+        self._progress_lock = threading.Lock()
         self._write_all = bool(write_all)   # arm PT: every stored chunk, no rule
         self._on_disk = set()           # chunks whose write completed
         self._inflight = set()          # chunks being written
@@ -129,7 +143,49 @@ class ParkFsTier(FileSystemTierManager):
     def submit_load(self, job_metadata) -> None:
         self._loading[job_metadata.job_id] = list(job_metadata.keys)
         self._track(job_metadata)
-        super().submit_load(job_metadata)
+        if not self._split_io(job_metadata, load=True):
+            super().submit_load(job_metadata)
+
+    def _split_io(self, job, load: bool) -> bool:
+        """Run a job's chunk files as up to n_read_threads (loads) or n_write_threads (stores) tasks of consecutive
+        chunks; the pool completes the job when every task has. A load that fails keeps the chunks before the first
+        failed one, as the base's single task does. False: not split (one chunk, or a vLLM without these fields)."""
+        keys = list(job.keys)
+        n = len(keys)
+        k = min(getattr(self, "_split_load" if load else "_split_store", 1), n)
+        if k <= 1 or not all(hasattr(self, a) for a in ("_pool", "file_mapper", "_job_block_counts", "_block_size",
+                                                         "_primary_kv_view", "_use_o_direct", "_load_progress",
+                                                         "_progress_lock")):
+            return False
+        job_id = job.job_id
+        paths = [self.file_mapper.get_file_name(key) for key in keys]
+        offsets = [int(cid) * self._block_size for cid in job.chunk_ids]
+        bounds = [n * i // k for i in range(k + 1)]
+        view, size, odirect = self._primary_kv_view, self._block_size, self._use_o_direct
+        self._job_block_counts[job_id] = n
+        if load:
+            if hasattr(self, "_load_job_keys"):
+                self._load_job_keys[job_id] = keys
+
+            def part(lo, hi):
+                def task():
+                    try:
+                        fs_io.batch_load_block(paths[lo:hi], view, offsets[lo:hi], size, odirect)
+                    except OSError as exc:
+                        done = lo + getattr(exc, "num_succeeded", 0)
+                        with self._progress_lock:   # the job keeps the chunks before its first failure
+                            cur = self._load_progress.get(job_id)
+                            self._load_progress[job_id] = done if cur is None else min(cur, done)
+                        raise
+                return task
+            self._pool.enqueue_load(job_id, k, [part(bounds[i], bounds[i + 1]) for i in range(k)])
+        else:
+            if getattr(self, "events", None) is not None:
+                self._store_job_keys[job_id] = keys
+            tasks = [functools.partial(fs_io.batch_store_block, paths[bounds[i]:bounds[i + 1]], view,
+                                       offsets[bounds[i]:bounds[i + 1]], size, odirect) for i in range(k)]
+            self._pool.enqueue_store(job_id, k, tasks)
+        return True
 
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
         if _parked(req_context):
@@ -155,7 +211,9 @@ class ParkFsTier(FileSystemTierManager):
             self._writing[job_metadata.job_id] = list(job_metadata.keys)
             self._inflight.update(job_metadata.keys)
             self._track(job_metadata)
-            return super().submit_store(job_metadata)
+            if not self._split_io(job_metadata, load=False):
+                super().submit_store(job_metadata)
+            return
         ParkFsTier.skipped_jobs += 1
         # complete through the normal pool path with no I/O
         self._pool.enqueue_store(job_metadata.job_id, 1, [lambda: None])
