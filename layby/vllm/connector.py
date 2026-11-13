@@ -25,6 +25,15 @@ Measured here, fed to layby.vllm.state.STATE:
   misses        at admission, the latency a request loses to KV evicted from the GPU and from the CPU
                 tier, against the time since that eviction (Live.miss, the source of the holding price)
 
+Queue hold: from its arrival to its admission (or its end), a request's chunks are held in the CPU tier at its
+queue rank (ParkCachePolicy.hold): evicted after every idle chunk, the last-arrived first. A preempted request is
+held again at the head of the queue. Counts held.
+
+Prefetch: each step, the waiting requests whose held chunks fit in the CPU tier's room (queue order) have the
+disk -> CPU promotion of their prefix started once, so a disk restore runs during the queue wait. An admission
+whose prefetch restored its prefix before the scheduler reached it is a disk restore that cost no wait (defer 0).
+Counts prefetch (chunks).
+
 Decision: when a request finishes its curve may already be there (kv_transfer_params["park_surv"]);
 otherwise the request is remembered under its park_key and decided when POST /hint delivers the curve.
 The decision sets the CPU tier's predicted next use of the request's chunks (park_eta; first out for
@@ -164,6 +173,7 @@ class ParkConnector(OffloadingConnector):
         self._waiting: dict[str, float] = {}           # request id -> time added, until admitted
         self._deferred: dict[str, float] = {}          # request id -> first lookup that deferred it
         self._ready: dict[str, float] = {}             # request id -> first lookup after its deferral that could load
+        self._prefetched: dict[str, int] = {}          # waiting request id -> promotions its prefetch started
         # request id -> its give-up (the deferral it stopped), until the promotion it waited on resolves
         self._giveups: dict[str, dict] = {}
         # request id -> the GPU-local prefix hit (tokens) vLLM passed to the last lookup. vLLM calls
@@ -213,8 +223,68 @@ class ParkConnector(OffloadingConnector):
 
     # --- admission and misses -----------------------------------------------------------
     def on_new_request(self, request) -> None:
-        self._waiting[request.request_id] = time.monotonic()
+        now = time.monotonic()
+        self._waiting[request.request_id] = now
         super().on_new_request(request)
+        _safe("hold", self._hold, request.request_id, now)
+
+    def _hold(self, rid: str, rank: float) -> None:
+        """Queue hold: the CPU tier keeps a waiting request's chunks by its queue rank until admission
+        (ParkCachePolicy.hold)."""
+        pol = STATE.policy
+        rs = self.connector_scheduler._req_status.get(rid)
+        if pol is None or rs is None or not hasattr(pol, "hold"):
+            return
+        rs.update_offload_keys()
+        pol.hold(rid, _request_keys(rs), rank)
+        self._prefetched.pop(rid, None)        # a preempted request is prefetched again
+        STATE.counts["held"] += 1
+
+    def _unhold(self, rid: str) -> None:
+        pol = STATE.policy
+        if pol is not None and hasattr(pol, "unhold"):
+            pol.unhold(rid)
+
+    def _prefetch(self) -> None:
+        """Prefetch: start the disk -> CPU promotion of waiting requests' prefixes while they queue, so a restore
+        from disk overlaps the queue wait instead of starting when the scheduler reaches the request. In queue
+        order, while the chunks held by the requests up to this one fit in the CPU tier's room (its capacity less
+        the chunks in use), once per request; the scheduler's own lookup at admission handles anything that is not
+        ready. The tiering manager submits the promotions at the end of this schedule."""
+        pol = STATE.policy
+        if pol is None or not getattr(pol, "held", None) or STATE.fs_tier is None:
+            return
+        cs = self.connector_scheduler
+        mgr = cs.manager
+        prim = getattr(mgr, "primary_tier", None)
+        if prim is None:
+            return
+        room = pol.cache_capacity - (len(pol.chunks) - len(pol.evictable))
+        used = 0
+        for rid, (_, keys) in sorted(pol.held.items(), key=lambda kv: kv[1][0]):
+            used += len(keys)
+            if used > room:
+                break
+            if rid in self._prefetched:
+                continue
+            rs = cs._req_status.get(rid)
+            if rs is None or rs.transfer_jobs:
+                continue
+            n = 0
+            for g, gs in zip(cs.config.kv_group_configs, rs.group_states):
+                ks = gs.offload_keys
+                w = g.sliding_window_size_in_chunks
+                if w is not None:
+                    ks = ks[-w:] if w else []       # a sliding-window group loads only its last window
+                for k in ks:
+                    before = prim.lookup(k, rs.req_context)
+                    r = mgr.lookup(k, rs.req_context)
+                    if r is LookupResult.MISS:
+                        break                       # a prefix stops at the first chunk no tier has
+                    if before is LookupResult.MISS and r is LookupResult.HIT_PENDING:
+                        n += 1
+            self._prefetched[rid] = n
+            STATE.counts["prefetch"] += n
 
     def get_num_new_matched_tokens(self, request, num_computed_tokens):
         rid = request.request_id
@@ -301,6 +371,8 @@ class ParkConnector(OffloadingConnector):
             del self._giveups[rid]
 
     def _admit(self, request, num_external_tokens):
+        self._unhold(request.request_id)
+        pf = self._prefetched.pop(request.request_id, 0)
         t = self._waiting.pop(request.request_id, None)
         td = self._deferred.pop(request.request_id, None)
         tr = self._ready.pop(request.request_id, None)
@@ -317,6 +389,9 @@ class ParkConnector(OffloadingConnector):
             # for admission after that is the queue every request pays, priced by the rule as Q); after a give-up,
             # the wait until it gave up plus the recompute
             STATE.live.add(now, n_defer=1.0, defer=(tr if tr is not None else now) - td + (g["x"] if g is not None else 0.0))
+        elif pf and num_external_tokens > 0:
+            # a restore from disk its prefetch finished during the queue wait: it cost the admission nothing
+            STATE.live.add(time.monotonic(), n_defer=1.0, defer=0.0)
         if t is not None:
             now = time.monotonic()
             STATE.live.add(now, n_adm=1.0, qwait=now - t)
@@ -390,6 +465,10 @@ class ParkConnector(OffloadingConnector):
         _safe("hints", self._drain_hints, now)
         _safe("giveups", self._settle_giveups, now)
         _safe("step", self._step, scheduler_output, now)
+        for rid in getattr(scheduler_output, "preempted_req_ids", None) or ():
+            # back in the queue at its head (vLLM resumes preempted requests first): ranks before every arrival
+            _safe("hold", self._hold, rid, -now)
+        _safe("prefetch", self._prefetch)
         meta = super().build_connector_meta(scheduler_output)
         for job_id, job in meta.load_jobs.items():
             self._loads[job_id] = (now, len(job.src_spec.block_ids))
@@ -442,6 +521,8 @@ class ParkConnector(OffloadingConnector):
 
     def _on_finish(self, request, block_ids) -> None:
         now = time.monotonic()
+        self._unhold(request.request_id)          # finished or aborted while waiting
+        self._prefetched.pop(request.request_id, None)
         self._waiting.pop(request.request_id, None)
         self._deferred.pop(request.request_id, None)
         self._ready.pop(request.request_id, None)

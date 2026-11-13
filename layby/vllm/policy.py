@@ -12,6 +12,13 @@ and lives in a heap; an unhinted chunk is ordered LRU and its next use is estima
 (time since last use). Eviction takes the chunk predicted to be needed last. A hint GRACE seconds past
 due without a touch returns the chunk to LRU order.
 
+Queue hold (hold/unhold, from layby.vllm.connector): a request that arrived and waits for admission holds its
+chunks at its queue rank (arrival time; a preempted request ranks before every arrival, as vLLM resumes it first)
+until it is admitted or ends. Held chunks go after every idle chunk, the last-arrived first, and do not expire.
+Without it a waiting request's chunks carried the hint of its previous finish, expired to LRU GRACE seconds later
+and, being the oldest, went first: the request next in line lost its prefix (Phase R, wrx, 2026-11-12: returns
+that queued more than 20 s recomputed 86% of their cached tokens on Qwen slow pressure, 31% on Gemma fast heavy).
+
 Write-on-evict (layby.vllm.demote, park_write "demand"): with a demoter installed, a victim the rule wants on
 disk is kept resident and pinned by its disk write while the next victim frees the slot; once written it goes
 first at the next eviction. Without a demoter, evict() is unchanged.
@@ -54,6 +61,7 @@ def _stock_lru_on_evictable() -> bool:
 
 _LRU_ON_EVICTABLE = _stock_lru_on_evictable()
 GRACE = 2.0
+HELD = 1e12      # held chunks rank below every hint and LRU estimate (monotonic times are far smaller)
 
 
 class ParkCachePolicy(CachePolicy):
@@ -80,17 +88,63 @@ class ParkCachePolicy(CachePolicy):
         self.demoter = None
         self.demoting: set[OffloadKey] = set()          # chosen as victims, being written, not evictable
         self.pending_demote: list[OffloadKey] = []      # demoted by the current evict, write not yet submitted
+        # queue hold: a request that arrived and waits for admission needs its chunks at its admission, before any
+        # idle session that has not come back yet, and the queue admits in order. Its chunks are placed by their
+        # queue rank (the arrival time, earlier = needed sooner; a preempted request goes to the front) until it is
+        # admitted or ends, and never expire to LRU while it waits
+        self.held: dict[str, tuple[float, list]] = {}              # waiting request id -> (rank, keys)
+        self.held_t: dict[OffloadKey, dict[str, float]] = {}       # chunk -> {waiting request id: rank}
         STATE.policy = self
 
     # --- bookkeeping -------------------------------------------------------------------
-    def _set_hint(self, key: OffloadKey, t: float) -> None:
+    def _set_hint(self, key: OffloadKey, t: float, expire: bool = True) -> None:
         self.lru.pop(key, None)
         self.hinted[key] = t
         s = next(self.seq)
         self.hseq[key] = s
         heapq.heappush(self.heap, (-t, s, key))
-        if t < NEVER:
+        if expire and t < NEVER:
             heapq.heappush(self.expiry, (t, s, key))
+
+    def _rank(self, key: OffloadKey) -> float | None:
+        """The hint of a held chunk: its earliest waiting request's rank, below every other hint (HELD)."""
+        h = self.held_t.get(key)
+        return min(h.values()) - HELD if h else None
+
+    def _place(self, key: OffloadKey, now: float) -> None:
+        """A chunk with no hint of its own: by its queue rank while a waiting request holds it, else LRU."""
+        r = self._rank(key)
+        if r is None:
+            self._set_lru(key, now)
+        else:
+            self._set_hint(key, r, expire=False)
+
+    def hold(self, req_id: str, keys, rank: float) -> None:
+        """A waiting request's chunks, placed by its queue rank (lower = admitted sooner) until unhold."""
+        self.unhold(req_id)
+        keys = list(keys)
+        self.held[req_id] = (rank, keys)
+        for k in keys:
+            self.held_t.setdefault(k, {})[req_id] = rank
+            if k in self.chunks:
+                self._set_hint(k, self._rank(k), expire=False)
+
+    def unhold(self, req_id: str, now: float | None = None) -> None:
+        """Admitted, finished or aborted: chunks no other waiting request holds go back to LRU, in use from now
+        (vLLM's own recency for them comes at the request's finish)."""
+        e = self.held.pop(req_id, None)
+        if e is None:
+            return
+        now = time.monotonic() if now is None else now
+        for k in e[1]:
+            h = self.held_t.get(k)
+            if h is None:
+                continue
+            h.pop(req_id, None)
+            if not h:
+                del self.held_t[k]
+            if k in self.chunks:
+                self._place(k, now)
 
     def _set_lru(self, key: OffloadKey, now: float) -> None:
         self.hinted.pop(key, None)
@@ -133,7 +187,7 @@ class ParkCachePolicy(CachePolicy):
         if chunk.ref_cnt == 0:
             self.evictable.add(key)
         now = time.monotonic()
-        self._set_lru(key, now)
+        self._place(key, now)               # a promotion for a waiting request lands held
         if not self._in_use(key):
             self.idle_since[key] = now      # e.g. the final store of a request that already finished
         self.c_evicted.pop(key, None)
@@ -162,7 +216,7 @@ class ParkCachePolicy(CachePolicy):
                 t = self.idle_since.pop(key, None)
                 if t is not None:
                     STATE.ended[("c", False)].append(now - t)              # reuse ends the idle period
-                self._set_lru(key, now)
+                self._place(key, now)       # a shared prefix stays held for the request still waiting on it
 
     def on_request_finished(self, key_groups, insertion_only_keys, reused_keys, req_context: ReqContext) -> None:
         """vLLM >= 0.31 moves a request's recency update to its finish (the base hook calls touch(), which would
@@ -197,7 +251,7 @@ class ParkCachePolicy(CachePolicy):
         t = NEVER if eta < 0 else now + eta
         n = 0
         for key in reversed(list(keys)):    # equal predictions evict in hint order: the tail first, the prefix last
-            if key in self.chunks and not self._in_use(key):
+            if key in self.chunks and not self._in_use(key) and key not in self.held_t:
                 self._set_hint(key, t)
                 n += 1
         return n
@@ -208,6 +262,7 @@ class ParkCachePolicy(CachePolicy):
         self.expiry.clear(); self.live.clear(); self.idle_since.clear(); self.c_evicted.clear()
         self.c_first.clear()
         self.demoting.clear(); self.pending_demote.clear()
+        self.held.clear(); self.held_t.clear()
 
     def _top_hinted(self, protected: set[OffloadKey], skipped: list):
         while self.heap:
@@ -265,7 +320,7 @@ class ParkCachePolicy(CachePolicy):
         if len(out) < n:
             for key in out:  # atomic: restore the hinted entries popped above
                 if key in self.hinted:
-                    self._set_hint(key, self.hinted[key])
+                    self._set_hint(key, self.hinted[key], expire=key not in self.held_t)
             return None
         res = [(key, self.chunks[key]) for key in out]
         STATE.note_burst(now, n)
@@ -288,7 +343,7 @@ class ParkCachePolicy(CachePolicy):
             self.heap = [(-t, next(self.seq), k) for k, t in self.hinted.items()]
             self.hseq = {k: s for _, s, k in self.heap}
             heapq.heapify(self.heap)
-            self.expiry = [(t, s, k) for (nt, s, k) in self.heap for t in (-nt,) if t < NEVER]
+            self.expiry = [(t, s, k) for (nt, s, k) in self.heap for t in (-nt,) if t < NEVER and k not in self.held_t]
             heapq.heapify(self.expiry)
         return res
 
@@ -298,7 +353,10 @@ class ParkCachePolicy(CachePolicy):
             if key in self.demoting:
                 # its disk write ended: it was chosen as a victim, so it goes first at the next eviction
                 self.demoting.discard(key)
-                self._set_hint(key, NEVER)
+                if key in self.held_t:
+                    self._place(key, time.monotonic())     # its request came back meanwhile and waits
+                else:
+                    self._set_hint(key, NEVER)
                 return
             if _LRU_ON_EVICTABLE and key not in self.hinted:
                 # as this vLLM's own LRU policy: an unhinted chunk ranks by when it became evictable (its store or
@@ -314,7 +372,10 @@ class ParkCachePolicy(CachePolicy):
             if key in self.demoting and key in self.chunks and self.chunks[key].ref_cnt == 0:
                 self.demoting.discard(key)
                 self.evictable.add(key)
-                self._set_hint(key, NEVER)
+                if key in self.held_t:
+                    self._place(key, time.monotonic())
+                else:
+                    self._set_hint(key, NEVER)
 
 
 _base_request_finished = CPUOffloadingManager.on_request_finished
