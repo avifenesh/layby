@@ -99,7 +99,8 @@ for arm in "$@"; do
     SCPORT=${SIDECAR_PORT:-$((PARK_PORT + 1))}
     PYTHONPATH=$REPO:${PYTHONPATH:-} setsid ${SERVER_WRAP:-} $VENV/bin/python -m layby.sidecar.proxy \
       --upstream http://127.0.0.1:$PORT --listen $SCPORT --engine sglang --hint-url http://127.0.0.1:$PARK_PORT/hint \
-      --ckpt "$SIDECAR_CKPT" --calib "$SIDECAR_CALIB" ${SIDECAR_DEVICE:+--device $SIDECAR_DEVICE} > $O/$arm.sidecar.log 2>&1 &
+      --ckpt "$SIDECAR_CKPT" --calib "$SIDECAR_CALIB" ${SIDECAR_DEVICE:+--device $SIDECAR_DEVICE} \
+      ${SIDECAR_ENCODER:+--encoder $SIDECAR_ENCODER} > $O/$arm.sidecar.log 2>&1 &
     SCP=$!
     # shellcheck disable=SC2064  # the trap takes this arm's process groups now
     trap "kill -9 -- -$SP -$SCP 2>/dev/null" EXIT INT TERM
@@ -117,6 +118,7 @@ for arm in "$@"; do
   du -sb $DISK 2>/dev/null | cut -f1 > $O/$arm.tier_bytes
   [ -n "${ARM_HOOK:-}" ] && $ARM_HOOK replay_end "$arm" "$O"
   [ -n "$client" ] && curl -sf localhost:$PARK_PORT/live > $O/$arm.park_live.json
+  [ -n "$SCP" ] && curl -sf localhost:${SIDECAR_PORT:-$((PARK_PORT + 1))}/park/stats > $O/$arm.sidecar_stats.json || true
   echo "arm $arm rc=$rc $(grep -c ttft $O/$arm.jsonl) turns"
   [ -n "$SCP" ] && kill -9 -- -$SCP 2>/dev/null
   kill $SP; sleep 10

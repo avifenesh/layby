@@ -64,6 +64,12 @@ def _through(req_context: ReqContext | None) -> bool:
     return sess is not None and sess in STATE.thru
 
 
+def _sess_of(req_context: ReqContext | None) -> str | None:
+    params = (req_context.kv_transfer_params if req_context is not None else None) or {}
+    key = params.get("park_key")
+    return None if key is None else str(key).rsplit("-", 1)[0]
+
+
 class ParkFsTier(FileSystemTierManager):
     parked_jobs = 0
     skipped_jobs = 0
@@ -86,6 +92,7 @@ class ParkFsTier(FileSystemTierManager):
         self._load_key_job = {}         # key -> the unfinished load job that reads it
         self._load_mark = None          # start of the not yet accounted load-queue busy period
         self._load_bytes = 0            # load bytes completed since _load_mark
+        self._load_io_times = {}        # job id -> [t_start, t_end] measured inside worker threads
         self._submit = {}               # job id -> (submit time, n keys) for link telemetry
         self._mark = None               # start of the not yet accounted part of the busy period
         self._bytes = 0                 # bytes completed since _mark
@@ -116,17 +123,31 @@ class ParkFsTier(FileSystemTierManager):
         results = super().get_finished_jobs()
         now = time.monotonic()
         loads_done = False
+        io_start, io_end = None, None
         lkj = getattr(self, "_load_key_job", None)
+        io_times = getattr(self, "_load_io_times", None)
+        lock = getattr(self, "_progress_lock", None)
         for r in results:
             sub = self._submit.pop(r.job_id, None)
             is_load = r.job_id in self._loading
             is_write = r.job_id in self._writing
+            t_io = None
+            if is_load and io_times is not None:
+                if lock is not None:
+                    with lock:
+                        t_io = io_times.pop(r.job_id, None)
+                else:
+                    t_io = io_times.pop(r.job_id, None)
+                if t_io is not None and t_io[1] > t_io[0]:
+                    io_start = t_io[0] if io_start is None else min(io_start, t_io[0])
+                    io_end = t_io[1] if io_end is None else max(io_end, t_io[1])
             if sub is not None:
                 t_sub, n = sub
                 nbytes = n * self._block_size
                 self._bytes += nbytes
                 x = nbytes / (STATE.speeds.gbps("disk") * 1e9)
-                wait = max(now - t_sub - x, 0.0)
+                t_done = t_io[1] if (t_io is not None and t_io[1] >= t_sub) else now
+                wait = max(t_done - t_sub - x, 0.0)
                 kw = dict(n_disk=1.0, wait_disk=wait)
                 if is_load:
                     kw.update(n_disk_r=1.0, wait_disk_r=wait)
@@ -167,7 +188,10 @@ class ParkFsTier(FileSystemTierManager):
             if span > 0:
                 STATE.speeds.link(now, "drain", self._load_bytes, span)
                 if self._load_bytes:
-                    STATE.speeds.link(now, "disk", self._load_bytes, span)
+                    # prefer exact worker-thread I/O span when non-zero (avoids scheduler-step polling bias
+                    # on large models where a step takes ~0.5-1s while NVMe finishes in ~0.06s)
+                    io_span = (io_end - io_start) if (io_start is not None and io_end is not None and io_end > io_start) else span
+                    STATE.speeds.link(now, "disk", self._load_bytes, min(io_span, span))
             self._load_bytes = 0
             self._load_mark = now if self._loading else None
         return results
@@ -221,9 +245,10 @@ class ParkFsTier(FileSystemTierManager):
         if not load and self._loading:
             max_k = 1
         k = min(max_k, n)
-        if k <= 1 or not all(hasattr(self, a) for a in ("_pool", "file_mapper", "_job_block_counts", "_block_size",
-                                                         "_primary_kv_view", "_use_o_direct", "_load_progress",
-                                                         "_progress_lock")):
+        min_k = 1 if load else 2
+        if k < min_k or not all(hasattr(self, a) for a in ("_pool", "file_mapper", "_job_block_counts", "_block_size",
+                                                           "_primary_kv_view", "_use_o_direct", "_load_progress",
+                                                           "_progress_lock")):
             return False
         job_id = job.job_id
         paths = [self.file_mapper.get_file_name(key) for key in keys]
@@ -234,9 +259,11 @@ class ParkFsTier(FileSystemTierManager):
         if load:
             if hasattr(self, "_load_job_keys"):
                 self._load_job_keys[job_id] = keys
+            io_times = self.__dict__.setdefault("_load_io_times", {})
 
             def part(lo, hi):
                 def task():
+                    t0 = time.monotonic()
                     try:
                         fs_io.batch_load_block(paths[lo:hi], view, offsets[lo:hi], size, odirect)
                     except OSError as exc:
@@ -245,6 +272,17 @@ class ParkFsTier(FileSystemTierManager):
                             cur = self._load_progress.get(job_id)
                             self._load_progress[job_id] = done if cur is None else min(cur, done)
                         raise
+                    finally:
+                        t1 = time.monotonic()
+                        with self._progress_lock:
+                            prev = io_times.get(job_id)
+                            if prev is None:
+                                io_times[job_id] = [t0, t1]
+                            else:
+                                if t0 < prev[0]:
+                                    prev[0] = t0
+                                if t1 > prev[1]:
+                                    prev[1] = t1
                 return task
             self._pool.enqueue_load(job_id, k, [part(bounds[i], bounds[i + 1]) for i in range(k)])
         else:
@@ -262,21 +300,71 @@ class ParkFsTier(FileSystemTierManager):
             return RequestOffloadingContext(policy=OffloadPolicy.REQUEST_LEVEL)
         return RequestOffloadingContext()
 
+    def _should_stream(self, req_context: ReqContext | None, n_keep: int) -> bool:
+        """Adaptive streaming in default 'rule' mode: write incremental CHUNK_LEVEL prefill stores directly
+        to disk when disk speed strictly beats GPU recompute, disk reads are idle, CPU pinning headroom is
+        safe (zero afal risk), and either the cost rule already placed this session on disk (STATE.thru) or
+        tight CPU capacity risks evicting running prompts before turn end (without overriding STATE.nowrite)."""
+        if STATE.write_mode != "rule" or n_keep <= 0:
+            return False
+        pol = STATE.policy
+        if pol is None or pol.cache_capacity <= 0:
+            return False
+        bpt = STATE.bytes_per_token
+        d_gbps = STATE.speeds.gbps("disk")
+        f0 = STATE.speeds.f0()
+        if bpt <= 0 or d_gbps <= 0 or f0 <= 0:
+            return False
+        # hardware physics: only stream when disk transfer per token strictly beats GPU recompute (fast disk)
+        if bpt / (d_gbps * 1e9) >= f0:
+            return False
+        # read-priority and zero-afal CPU headroom guard
+        if self._loading:
+            return False
+        cap = pol.cache_capacity
+        max_inflight = max(cap // 4, 1)
+        if len(self._inflight) + n_keep > max_inflight:
+            return False
+        pinned = len(pol.chunks) - len(pol.evictable)
+        avail = cap - pinned
+        if avail <= max(cap // 2, max_inflight):
+            return False
+        sess = _sess_of(req_context)
+        if sess is not None and sess in STATE.nowrite:
+            return False
+        if sess is not None and sess in STATE.thru:
+            return True
+        # cold / turn-0 CPU overflow protection: if GPU >= CPU or active running/pinned chunks already occupy
+        # >50% of CPU while the rule is writing the majority of turns (or during initial cold start), stream
+        # incremental chunks so long prompts are not evicted from CPU before post-turn late_write runs
+        c = STATE.counts
+        n_disk = c["ins"] + c["park"]
+        n_dec = n_disk + c["none"] + c["drop"]
+        if n_dec >= 4 and n_disk < n_dec * 0.5:
+            return False
+        gpu_tok, cpu_tok = STATE.gpu_tokens, STATE.cpu_tokens
+        if gpu_tok > 0 and cpu_tok > 0 and gpu_tok >= cpu_tok:
+            return True
+        pinned = len(pol.chunks) - len(pol.evictable)
+        pmem = pol.pending_mem_count() if hasattr(pol, "pending_mem_count") else 0
+        return STATE.evictions > 0 and (pinned + pmem) > cap // 2
+
     def submit_store(self, job_metadata) -> None:
         parked = _parked(job_metadata.req_context)
         thru = _through(job_metadata.req_context)
         write_all = getattr(self, "_write_all", False)
-        if parked or thru or write_all:
+        keys = list(job_metadata.keys)
+        keep = [i for i, k in enumerate(keys) if k not in self._on_disk and k not in self._inflight]
+        stream = (not (parked or thru or write_all)) and self._should_stream(job_metadata.req_context, len(keep))
+        if parked or thru or write_all or stream:
             # write only chunks not on disk and not being written: a request-level tier gets every chunk of
             # the request again on each turn (vLLM cascades the chunks already in the CPU tier), which
             # rewrote whole contexts per turn and saturated the disk. The parent releases the job's chunks
             # by job id, so writing a subset is safe.
-            keys = list(job_metadata.keys)
             pol = STATE.policy
             if parked and pol is not None and hasattr(pol, "release_pending_write"):
                 # late-write chunks are now pinned (ref_cnt >= 1) by create_store_job: apply deferred ins/park hint
                 pol.release_pending_write(keys)
-            keep = [i for i, k in enumerate(keys) if k not in self._on_disk and k not in self._inflight]
             if not keep:
                 ParkFsTier.dedup_jobs += 1
                 self._pool.enqueue_store(job_metadata.job_id, 1, [lambda: None])
@@ -322,9 +410,14 @@ class ParkFsTier(FileSystemTierManager):
         max_inflight = max(pol.cache_capacity // 4, 1) if pol is not None else 0
         keep = []
         for idx, (t, keys) in enumerate(self._late):
-            if self._writing and max_inflight and len(self._inflight) >= max_inflight:
-                keep.extend(self._late[idx:])
-                break
+            pinned = (len(pol.chunks) - len(pol.evictable)) if pol is not None else 0
+            idle_all = (pinned == 0 and not self._loading and not self._inflight)
+            if not idle_all and max_inflight and pol is not None:
+                write_room = max_inflight - len(self._inflight)
+                total_room = max(pol.cache_capacity // 2, 1) - pinned
+                if min(write_room, total_room) <= 0:
+                    keep.extend(self._late[idx:])
+                    break
             ctx = ReqContext(req_id=f"park-write-{next(self._seq)}", kv_transfer_params={"park_disk": True})
             parent.on_new_request(ctx)
             hit, wait = [], []
@@ -336,6 +429,18 @@ class ParkFsTier(FileSystemTierManager):
                     hit.append(k)
                 elif now - t < LATE_TTL:
                     wait.append(k)          # not stored on CPU yet (final stores run after finish)
+            if hit:
+                # under any active load/pins, strictly enforce <=25% write pinning AND <=50% total CPU pinning
+                # so slow-disk late writes can never pile up with promotions to cause CPU allocation failures
+                if not idle_all and max_inflight and pol is not None:
+                    pinned_now = len(pol.chunks) - len(pol.evictable)
+                    budget = min(max_inflight - len(self._inflight), max(pol.cache_capacity // 2, 1) - pinned_now)
+                    if budget <= 0:
+                        wait = hit + wait
+                        hit = []
+                    elif len(hit) > budget:
+                        wait = hit[budget:] + wait
+                        hit = hit[:budget]
             if hit:
                 job = parent.create_store_job(hit, ctx)
                 ParkFsTier.late_jobs += 1

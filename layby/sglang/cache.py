@@ -33,6 +33,7 @@ from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.mem_cache.utils import compute_node_hash_values, get_hash_str
 
+from layby.live import PROBE_BYTES, probe_disk
 from layby.rule import TG, decide, interp_surv
 from layby.sglang import policy
 from layby.sglang.state import NEVER, STATE, logger, safe
@@ -133,6 +134,16 @@ class ParkRadixCache(UnifiedRadixCache):
                 return self._park_disk_job(transfer, op, getattr(op, "start_time", None))
 
             cc._page_backup, cc._page_transfer = _page_backup, _page_transfer
+            storage_dir = getattr(getattr(cc, "storage_backend", None), "file_path", None)
+            if storage_dir and STATE.leader:
+                try:
+                    g = probe_disk(storage_dir, cold=True)
+                    if g:
+                        STATE.speeds.d["disk_gbps"] = g
+                        STATE.speeds.d["disk_probe_bytes"] = PROBE_BYTES
+                        logger.info("park: disk probe %.2f GB/s read under %s", g, storage_dir)
+                except OSError as e:
+                    logger.warning("park: disk probe failed (%s); disk speed starts at the default", e)
         logger.info("park: host %d tokens, %.0f bytes/token, storage %s", STATE.cpu_tokens,
                     STATE.bytes_per_token, bool(getattr(cc, "enable_storage", False)))
 
@@ -155,8 +166,9 @@ class ParkRadixCache(UnifiedRadixCache):
         d = self._park_disk
         now = time.monotonic()
         nbytes = 0.0
+        is_load = hasattr(op, "request_id")
         try:
-            if hasattr(op, "request_id"):
+            if is_load:
                 # a prefetch: its completed tokens arrive later through the sync thread; it read the
                 # pages the hit query found unless the scheduler terminated it
                 tokens = 0 if op.is_terminated() else len(op.hash_value) * STATE.page_size
@@ -166,7 +178,7 @@ class ParkRadixCache(UnifiedRadixCache):
         finally:
             leader = STATE.leader                       # only the leader drains the events
             if leader:
-                STATE.thread_events.put(("disk_job", now, t_sub if t_sub is not None else t0, nbytes))
+                STATE.thread_events.put(("disk_job", now, t_sub if t_sub is not None else t0, nbytes, is_load, max(now - t0, 0.0)))
             with self._park_disk_lock:
                 d["bytes"] += nbytes
                 d["n"] -= 1
@@ -228,6 +240,15 @@ class ParkRadixCache(UnifiedRadixCache):
             cap, self._park_cap = self._park_cap, None
         safe("finish", self._park_finish, req, up_to, cap)
 
+    def checkpoint(self, req, *, up_to: int, **kwargs) -> None:
+        # SGLang 0.5.23 renamed insert_req -> checkpoint with the same signature.
+        self._park_cap = []
+        try:
+            super().checkpoint(req, up_to=up_to, **kwargs)
+        finally:
+            cap, self._park_cap = self._park_cap, None
+        safe("finish", self._park_finish, req, up_to, cap)
+
     def _park_finish(self, req, up_to, cap) -> None:
         if not cap or cap[0] is None or cap[0].last_device_node is None:
             return
@@ -250,8 +271,8 @@ class ParkRadixCache(UnifiedRadixCache):
             if surv is not None or early is not None:
                 decide_entry(key, entry, surv if surv is not None else early[1], time.monotonic())
 
-    def on_release(self, req, *, inserted: bool) -> None:
-        super().on_release(req, inserted=inserted)
+    def on_release(self, req, **kwargs) -> None:
+        super().on_release(req, **kwargs)
         safe("release", self._park_release, req)
 
     def _park_release(self, req) -> None:
@@ -298,6 +319,8 @@ class ParkRadixCache(UnifiedRadixCache):
     def _park_remove(self, node, medium) -> None:
         gpu = medium is None or medium == StorageMedium.GPU
         gone = not gpu or not node.backuped              # the node leaves the tree
+        h = STATE.next_use.get(node.id)
+        first = (not gpu) and h is not None and h[0] == NEVER
         if gone:
             STATE.next_use.pop(node.id, None)
             STATE.disk_ok.discard(node.id)
@@ -307,11 +330,17 @@ class ParkRadixCache(UnifiedRadixCache):
         tier, idle, ev = ("g", STATE.g_idle, STATE.g_evicted) if gpu else ("c", STATE.c_idle, STATE.c_evicted)
         r = idle.pop(node.id, None)
         w = float(len(node.key))
-        STATE.live.end_idle(now, tier, now - r[0] if r is not None else 0.0, w, True)
+        age = now - r[0] if r is not None else 0.0
+        if first:
+            # placed first out (park/drop): censored for kept residency, still an eviction event (matches vLLM)
+            STATE.live.end_idle(now, tier, age, w, False)
+            STATE.live.add(now, ne_c=1.0)
+        else:
+            STATE.live.end_idle(now, tier, age, w, True)
         if gpu and gone:
             STATE.c_idle.pop(node.id, None)              # deleted without a host copy
-        for h in self.park_hashes(node):
-            ev[h] = now
+        for h_val in self.park_hashes(node):
+            ev[h_val] = now
 
     # --- paths and pages --------------------------------------------------------------
     def park_path(self, node_id):

@@ -164,7 +164,8 @@ def test_plugin_registers_and_hooks_resolve():
     assert "park" in RADIX_EVICTION_POLICY_CHOICES and get_radix_cache_factory("park") is not None
     assert type(get_eviction_strategy("park", {"port": 8765})).__name__ == "ParkStrategy"
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-    for m in ("insert", "insert_req", "on_release", "inc_lock_ref", "loading_check", "init_hicache",
+    assert callable(getattr(UnifiedRadixCache, "insert_req", None)) or callable(getattr(UnifiedRadixCache, "checkpoint", None))
+    for m in ("insert", "on_release", "inc_lock_ref", "loading_check", "init_hicache",
               "_log_write_ack_metrics", "write_backup_storage"):
         assert callable(getattr(UnifiedRadixCache, m)), m
 
@@ -424,3 +425,19 @@ def test_link_telemetry_from_storage_jobs_and_load_acks():
     cache._park_load_ack(ack)
     assert abs(STATE.speeds.gbps("cpu") - 20.0) < 1e-9
     assert abs(STATE.live.acc["n_cpu"] - 1.0) < 0.01 and 0.9 < STATE.live.acc["wait_cpu"] < 1.0
+
+
+def test_account_misses_uses_read_only_disk_wait():
+    from layby.sglang import hooks
+    cache, _ = make_cache()
+    STATE.page_size, STATE.bytes_per_token = 64, 1000.0
+    now = time.monotonic()
+    # Background write had huge wait (50s), foreground read had tiny wait (0.05s)
+    STATE.live.add(now, n_disk=2.0, wait_disk=50.05, n_disk_r=1.0, wait_disk_r=0.05, n_disk_w=1.0)
+    STATE.g_evicted["h0"] = now - 5.0
+    cache.park_prompt_hashes = lambda req: ["h0"]
+    req = SimpleNamespace(origin_input_ids=list(range(64)), cached_tokens_device=0,
+                          cached_tokens_host=0, cached_tokens_storage=64)
+    hooks._account_misses(req, now)
+    # Loss must reflect ~0.05s read wait (not 25s combined write+read wait)
+    assert STATE.live.acc["miss_g"] < 1.0, f"miss_g polluted by write wait: {STATE.live.acc['miss_g']}"

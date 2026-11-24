@@ -65,10 +65,11 @@ def _stock_lru_on_evictable() -> bool:
 
 _LRU_ON_EVICTABLE = _stock_lru_on_evictable()
 GRACE = 2.0
-HELD_MEM = 2e12      # CPU-only held chunks (no disk copy): highest protection, evicted last
-PENDING_DISK = 1.5e12  # decided ins/park chunks awaiting ParkFsTier pin: outrank disk-backed holds
-HELD = 1e12          # disk-backed held chunks: outrank running/idle chunks, recoverable from disk
-PENDING = 5e11       # running-request / pending-hint chunks: below held, above all idle chunks
+HELD_MEM = 2.5e12      # CPU-only held chunks (no disk copy): highest protection, evicted last
+PENDING_DISK = 2.0e12  # decided ins/park chunks awaiting ParkFsTier pin (no disk copy yet)
+PENDING_MEM = 1.5e12   # running-request / pending-hint chunks not yet on disk (losing = recompute)
+HELD = 1.0e12          # disk-backed held chunks: recoverable from disk without recompute
+PENDING = 5e11         # running-request / pending-hint chunks already backed on disk
 
 
 class ParkCachePolicy(CachePolicy):
@@ -90,6 +91,7 @@ class ParkCachePolicy(CachePolicy):
         self.seq = itertools.count()
         self.live: dict[str, tuple[float | None, set[OffloadKey]]] = {}  # req id -> (park_eta, touched keys)
         self._live_cnt: dict[OffloadKey, int] = {}      # O(1) live-request ref count per chunk
+        self._step_protected: set[OffloadKey] = set()   # step-scoped guard against lookup->promotion evicting HITs before prepare_load
         self.idle_since: dict[OffloadKey, float] = {}   # idle chunk -> when its last live request finished
         self.c_evicted: dict[OffloadKey, float] = {}    # chunk -> when it was evicted while idle
         # chunks evicted while placed first out (park, drop): the rule chose to lose them, so a return that misses
@@ -123,24 +125,36 @@ class ParkCachePolicy(CachePolicy):
         if expire and t < NEVER:
             heapq.heappush(self.expiry, (t, s, key))
 
-    def _pending_t(self, now: float, eta: float | None) -> float:
-        return now - (PENDING_DISK if eta is not None else PENDING)
+    def _pending_t(self, now: float, eta: float | None, key: OffloadKey | None = None) -> float:
+        if eta is not None:
+            return now - PENDING_DISK
+        fs = STATE.fs_tier
+        if key is not None and fs is not None and key in getattr(fs, "_on_disk", ()):
+            return now - PENDING
+        return now - PENDING_MEM
+
+    def pending_mem_count(self) -> int:
+        """Count of resident CPU chunks currently protected as unwritten running/pending-disk data."""
+        if not self._pending_write:
+            return 0
+        fs = STATE.fs_tier
+        on_disk = getattr(fs, "_on_disk", ()) if fs is not None else ()
+        return sum(1 for k in self._pending_write if k in self.chunks and k not in on_disk)
 
     def mark_pending_write(self, keys, now: float | None = None, ttl: float = 30.0,
                            eta: float | None = -1.0) -> None:
-        """Protect chunks awaiting a sidecar hint (eta=None, short TTL), running-request offload, or
+        """Protect chunks awaiting a sidecar hint (eta=None, step-scaled TTL), running-request offload, or
         ParkFsTier store pin (ins/park, eta!=None) below idle chunks until resolved. Registers keys even before
         insert() so chunks stored mid-prefill land protected via _place()."""
         now = time.monotonic() if now is None else now
         exp = now + ttl
-        pt = self._pending_t(now, eta)
         for k in reversed(list(keys)):  # equal priority evicts tail first, prefix chunk 0 last
             self._pending_write[k] = (exp, eta)
             s = next(self.seq)
             self._pw_seq[k] = s
             heapq.heappush(self._pw_exp, (exp, s, k))
             if k in self.chunks and k not in self.held_t:
-                self._set_hint(k, pt, expire=False)
+                self._set_hint(k, self._pending_t(now, eta, k), expire=False)
 
     def clear_pending_write(self, keys, restore_lru: bool = False, now: float | None = None) -> None:
         """Drop pending-hint / pending-write protection (optionally restoring LRU when no apply follows)."""
@@ -182,7 +196,7 @@ class ParkCachePolicy(CachePolicy):
         if r is not None:
             self._set_hint(key, r, expire=False)
         elif key in self._pending_write and now < self._pending_write[key][0]:
-            self._set_hint(key, self._pending_t(now, self._pending_write[key][1]), expire=False)
+            self._set_hint(key, self._pending_t(now, self._pending_write[key][1], key), expire=False)
         else:
             self._set_lru(key, now)
 
@@ -305,11 +319,16 @@ class ParkCachePolicy(CachePolicy):
     def _refresh(self, keys: list, now: float) -> None:
         # last key first, so a request's prefix ends most recent: vLLM reuses a prefix only as a contiguous run
         # from the first chunk, so the tail must go before the prefix (as vLLM's own LRU policy does)
+        fs = STATE.fs_tier
+        on_disk = getattr(fs, "_on_disk", ()) if fs is not None else ()
         for key in reversed(keys):
             if key in self.chunks:
                 self.demoting.discard(key)       # a request came back during its disk write: keep it as a live chunk
-                self._pending_write.pop(key, None)
-                self._pw_seq.pop(key, None)
+                pw = self._pending_write.get(key)
+                # preserve decided PENDING_DISK protection across shared-prefix accesses until ParkFsTier pins it
+                if pw is not None and (pw[1] is None or key in on_disk):
+                    self._pending_write.pop(key, None)
+                    self._pw_seq.pop(key, None)
                 t = self.idle_since.pop(key, None)
                 if t is not None:
                     STATE.ended[("c", False)].append(now - t)              # reuse ends the idle period
@@ -403,6 +422,8 @@ class ParkCachePolicy(CachePolicy):
             return []
         if len(self.evictable) < n:
             return None
+        if self._step_protected:
+            protected = (protected | self._step_protected) if protected else set(self._step_protected)
         now = time.monotonic()
         self._expire(now)
         out, skipped, skipped_exp, exp_popped = [], [], [], []

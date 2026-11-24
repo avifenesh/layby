@@ -173,8 +173,8 @@ def test_bug_d_park_write_protection_and_read_priority():
         fs._loading[999] = [key(hashes("z", 1)[0])]
         fake_job = NS(job_id=777, keys=A, chunk_ids=[0, 1, 2])
         assert fs._split_io(fake_job, load=False) is False, "store job split across write threads while load active!"
-        # Late write pins A immediately even while load 999 is active, then writes A and marks NEVER
-        settle(mgr, fs); settle(mgr, fs)
+        # Late write stays within cap//4 (=1 chunk for cap=6) per active slice under load, writes all 3 chunks, and marks NEVER
+        settle(mgr, fs); settle(mgr, fs); settle(mgr, fs); settle(mgr, fs)
         fs._loading.pop(999)
         assert all(k in fs._on_disk for k in A), "protected park chunks did not reach disk"
         assert all(pol.hinted.get(k) == P.NEVER for k in A), f"park chunks not marked first-out after write: {pol.hinted}"
@@ -245,11 +245,11 @@ def test_wave2_bounded_prefetch_and_redefer_reset():
                 f"prefetch did not bound to 1 req/step: {conn._prefetched}"
             )
             settle(mgr, fs); settle(mgr, fs)
-            # 3. Re-deferral clock reset: r1's earlier promotion landed (rid in _ready), then waited 40s
-            #    in GPU queue and was evicted -> fresh deferral must reset _deferred[rid] instead of
-            #    immediately firing a bogus safety give-up on a 40s-old timestamp!
+            # 3. Re-deferral clock reset: r1's earlier promotion landed fast (0.01s < 0.033s recompute cap),
+            #    then waited 40s in GPU queue and was evicted -> fresh deferral accumulates only 0.01s real
+            #    deferral (NOT 40s GPU queue wait!) so it does not falsely give up!
             conn._deferred["r1"] = clk[0] - 40.0
-            conn._ready["r1"] = clk[0] - 39.0
+            conn._ready["r1"] = clk[0] - 39.99
             conn.__dict__.setdefault("_est0", {})["r1"] = (clk[0] - 40.0, 0.5, 0.5)
             # Evict r1's prefetched chunks so lookup defers again
             conn._unhold("r1")
@@ -470,25 +470,38 @@ def test_wave4_no_disk_gpu_blk_roofline_f0_running_protect_and_backpressure():
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
-    # 5. Promotion-livelock guard: when active disk loads already pin >=75% of CPU tier, a new request
-    #    gets resident CPU prefix directly (_ReadyOnly) instead of starting another competing promotion
+    # 5. Promotion-livelock guard: when active disk loads already pin >=75% of CPU tier on slow/saturated disk
+    #    (est_wait > cap), a new request gets resident CPU prefix directly (_ReadyOnly); on fast disk (est_wait <= cap)
+    #    it defers cleanly without starting an overlapping promotion or throwing away cached tokens!
     root = tempfile.mkdtemp(prefix="pp_v2w4_live_", dir=os.path.expanduser("~/.cache"))
     try:
         conn, cs, mgr, prim, fs, pol = build(8, root)
+        STATE.bytes_per_token = 163840.0
+        STATE.speeds.d["disk_gbps"] = 0.14
+        STATE.speeds.d["disk_probe_bytes"] = float("inf")
+        STATE.speeds.d["f0"] = 0.00032
         HA = hashes("a", 3); A = [key(h) for h in HA]
         store(mgr, "a-1", A)
         fs.queue_write(A)
         settle(mgr, fs); settle(mgr, fs)
         store(mgr, "z-1", [key(h) for h in hashes("z", 8)])
         settle(mgr, fs)
-        # Simulate active load + 6/8 (75%) CPU chunks pinned (not evictable)
+        # Simulate active load + 6/8 (75%) CPU chunks pinned (not evictable) on slow disk -> gives up immediately
         fs._loading[999] = [A[0]]
         for k in list(pol.evictable)[:6]:
             pol.mark_non_evictable(k)
         r0 = request("r0", HA + hashes("p", 1), 4 * T)
         conn.on_new_request(r0)
         out = conn.get_num_new_matched_tokens(r0, 0)
-        assert out == (0, False) and "r0" not in conn._deferred, f"livelock guard failed: out={out}"
+        assert out == (0, False) and "r0" not in conn._deferred, f"slow-disk livelock guard failed: out={out}"
+        # On fast NVMe (12 GB/s), pinned >= 75% defers cleanly without starting a promotion OR throwing away cache!
+        STATE.speeds.d["disk_gbps"] = 12.0
+        r1 = request("r1", HA + hashes("p2", 1), 4 * T)
+        conn.on_new_request(r1)
+        out1 = conn.get_num_new_matched_tokens(r1, 0)
+        assert out1 == (None, False) and "r1" in conn._pin_deferred and not mgr._pending_load_submissions, (
+            f"fast-disk pin guard wrongly admitted ext=0 or launched promotion: out={out1}"
+        )
         fs._loading.pop(999)
         fs.shutdown()
     finally:
@@ -525,18 +538,19 @@ def test_wave4_no_disk_gpu_blk_roofline_f0_running_protect_and_backpressure():
         ev3 = [k for k, _ in pol2.evict(2, set())]
         assert ev3 == [("q", 3), ("q", 2)], f"unhold evicted prefix before tail: {ev3}"
 
-        # 7. Eviction hierarchy: CPU-only HELD < pending disk write < disk-backed HELD < running/pending-hint
+        # 7. Eviction hierarchy (true recovery cost):
+        #    CPU-only HELD_MEM < PENDING_DISK < unwritten running PENDING_MEM < disk-backed HELD < on-disk PENDING
         pol3 = P.ParkCachePolicy(10)
-        k_hmem, k_pdisk, k_hdisk, k_run = ("hmem", 0), ("pdisk", 0), ("hdisk", 0), ("run", 0)
-        for k in (k_hmem, k_pdisk, k_hdisk, k_run):
+        k_hmem, k_pdisk, k_rmem, k_hdisk, k_rdisk = ("hmem", 0), ("pdisk", 0), ("rmem", 0), ("hdisk", 0), ("rdisk", 0)
+        for k in (k_hmem, k_pdisk, k_rmem, k_hdisk, k_rdisk):
             pol3.insert(k, mk2())
-        STATE.fs_tier = NS(_on_disk={k_hdisk})
+        STATE.fs_tier = NS(_on_disk={k_hdisk, k_rdisk})
         pol3.hold("r-mem", [k_hmem], clk[0])
         pol3.hold("r-disk", [k_hdisk], clk[0])
-        pol3.mark_pending_write([k_pdisk], now=clk[0], ttl=30.0, eta=10.0)   # decided ins/park write
-        pol3.mark_pending_write([k_run], now=clk[0], ttl=30.0, eta=None)     # undecided running chunk
-        ev4 = [k for k, _ in pol3.evict(4, set())]
-        assert ev4 == [k_run, k_hdisk, k_pdisk, k_hmem], f"wrong protection hierarchy: {ev4}"
+        pol3.mark_pending_write([k_pdisk], now=clk[0], ttl=30.0, eta=10.0)    # decided ins/park write
+        pol3.mark_pending_write([k_rmem, k_rdisk], now=clk[0], ttl=30.0, eta=None)  # running: unwritten vs on-disk
+        ev4 = [k for k, _ in pol3.evict(5, set())]
+        assert ev4 == [k_rdisk, k_hdisk, k_rmem, k_pdisk, k_hmem], f"wrong recovery-cost hierarchy: {ev4}"
         STATE.fs_tier = None
 
         # 8. Cold-start tie-breaker in layby.rule: fast disk (own['d'] < own['r']) breaks W==0 tie to ins;
@@ -553,6 +567,291 @@ def test_wave4_no_disk_gpu_blk_roofline_f0_running_protect_and_backpressure():
         P.time = orig_p_time
 
 
+def test_wave6_general_streaming_cumulative_defer_prefetch_and_io_timing():
+    """Wave 6 general first-principles fixes:
+    1. Adaptive streaming in 'rule' mode streams incremental stores ONLY on fast disk (bpt/disk_bps < f0),
+       respecting STATE.nowrite, read-priority (_loading), and CPU pin/evictable headroom; NEVER on slow disk.
+    2. Shared-prefix _refresh preserves decided PENDING_DISK protection until ParkFsTier pins it.
+    3. Cumulative deferral budget (_defer_accum) stops slow-disk re-deferral loops while still excluding
+       pure GPU queue wait; sticky _gave_up prevents re-launching doomed promotions; _check_ready ignores
+       failed MISS promotions; CPU-pin-budget guard prevents overlapping promotions exceeding evictable slots.
+    4. Profitable headroom-aware _prefetch skips unprofitable slow-disk reads and protects running chunks.
+    5. Step-scaled pending-hint TTL survives large-model (>0.25s) scheduler steps.
+    6. Worker-thread disk load I/O timing measures true NVMe speed rather than scheduler step interval."""
+    root = tempfile.mkdtemp(prefix="pp_v2w6_", dir=os.path.expanduser("~/.cache"))
+    try:
+        clk = [__import__("time").monotonic()]
+        orig_c_time, orig_p_time = C.time, P.time
+        C.time = NS(monotonic=lambda: clk[0])
+        P.time = NS(monotonic=lambda: clk[0])
+        try:
+            # --- 1. Adaptive streaming physics & backpressure ---
+            conn, cs, mgr, prim, fs, pol = build(16, root + "/stream")
+            STATE.gpu_tokens = 20000
+            STATE.cpu_tokens = 10000    # tight CPU (GPU >= CPU, e.g. 320B MoE)
+            STATE.bytes_per_token = 25000.0
+            STATE.speeds.d["f0"] = 1e-4            # 10k tok/s prefill (100 us/tok)
+            STATE.speeds.d["disk_gbps"] = 2.5      # 10 us/tok -> 10x faster than recompute (fast disk)
+            STATE.speeds.d["disk_probe_bytes"] = float("inf")  # keep synthetic test disk speed clean
+            store(mgr, "fill", [key(h) for h in hashes("f", 12)])
+            settle(mgr, fs)
+            ctx_s1 = ReqContext(req_id="r-s1", kv_transfer_params={"park_key": "s1-0"})
+            assert fs._should_stream(ctx_s1, 2) is True, "fast disk tight CPU should stream turn 0"
+            # STATE.nowrite must veto streaming even on fast disk
+            STATE.nowrite.add("s1")
+            assert fs._should_stream(ctx_s1, 2) is False, "STATE.nowrite did not veto streaming"
+            STATE.nowrite.discard("s1")
+            # Active disk read must veto streaming (read priority)
+            fs._loading[1] = [key(hashes("z", 1)[0])]
+            assert fs._should_stream(ctx_s1, 2) is False, "active load did not veto streaming"
+            fs._loading.pop(1)
+            # Tight available CPU headroom must veto streaming (zero afal): fill to 16, pin 12 -> avail=4 <= max_inflight=4
+            store(mgr, "fill2", [key(h) for h in hashes("g", 4)])
+            settle(mgr, fs)
+            for k in list(pol.evictable)[:12]:
+                pol.mark_non_evictable(k)
+            assert fs._should_stream(ctx_s1, 2) is False, "low available headroom did not veto streaming"
+            for k in list(pol.chunks):
+                pol.mark_evictable(k)
+            # Slow disk (bpt / disk_bps >= f0) must NEVER stream, even for STATE.thru sessions!
+            STATE.thru.add("s1")
+            STATE.speeds.d["disk_gbps"] = 0.14     # 178 us/tok > 100 us/tok (slow disk)
+            assert fs._should_stream(ctx_s1, 2) is False, "slow disk wrongly enabled streaming!"
+            # Fast disk + standard CPU (GPU < CPU): streams for STATE.thru sessions only
+            STATE.speeds.d["disk_gbps"] = 2.5
+            STATE.gpu_tokens = 10000
+            STATE.cpu_tokens = 20000
+            assert fs._should_stream(ctx_s1, 2) is True, "fast disk STATE.thru session should stream"
+            ctx_s2 = ReqContext(req_id="r-s2", kv_transfer_params={"park_key": "s2-0"})
+            assert fs._should_stream(ctx_s2, 2) is False, "undecided session streamed on generous CPU"
+            fs.shutdown()
+
+            # --- 2. Shared-prefix _refresh preserves PENDING_DISK ---
+            pol_r = P.ParkCachePolicy(8)
+            def mk():
+                c = ChunkStatus.__new__(ChunkStatus); c.ref_cnt = 0; return c
+            k_sh = ("sh", 0)
+            pol_r.insert(k_sh, mk())
+            STATE.fs_tier = NS(_on_disk=set())
+            pol_r.mark_pending_write([k_sh], now=clk[0], ttl=30.0, eta=10.0)
+            pol_r._refresh([k_sh], clk[0])
+            assert k_sh in pol_r._pending_write and pol_r._pending_write[k_sh][1] == 10.0, (
+                f"_refresh wiped PENDING_DISK protection: {pol_r._pending_write}"
+            )
+            STATE.fs_tier = None
+
+            # --- 3. Cumulative deferral cap + sticky give-up + pin-budget guard + _check_ready ---
+            conn, cs, mgr, prim, fs, pol = build(8, root + "/defer")
+            STATE.bytes_per_token = 163840.0       # Gemma-4-like 164 KB/tok
+            STATE.speeds.d["disk_gbps"] = 0.14     # slow disk: 1.17 ms/tok
+            STATE.speeds.d["f0"] = 0.00032         # recompute: 0.32 ms/tok (3.6x faster than disk at npf=0)
+            HA = hashes("a", 4); A = [key(h) for h in HA]
+            HB = hashes("b", 4); Bk = [key(h) for h in HB]
+            store(mgr, "a-1", A); fs.queue_write(A); settle(mgr, fs); settle(mgr, fs)
+            store(mgr, "b-1", Bk); fs.queue_write(Bk); settle(mgr, fs); settle(mgr, fs)
+            store(mgr, "c-1", [key(h) for h in hashes("c", 8)]); settle(mgr, fs)
+            # Slow-disk _prefetch must skip unprofitable promotions when disk_s >= recompute_cost
+            r_slow = request("r_slow", HA + hashes("p", 1), 5 * T)
+            conn.on_new_request(r_slow)
+            before_pf = STATE.counts["prefetch"]
+            conn._prefetch()
+            assert STATE.counts["prefetch"] == before_pf, "prefetch fired unprofitable slow-disk read!"
+            # Cumulative deferral across re-deferrals: prior 1.0s deferral accumulates, does not reset to 0
+            conn._deferred["r_slow"] = clk[0] - 5.0
+            conn._ready["r_slow"] = clk[0] - 4.0   # 1.0s real deferral + 4.0s GPU queue wait
+            held = []
+            fs.submit_load = lambda j: held.append(j)
+            # Still need > cap to trigger; here cap is tiny (~0.045s) so 1.0s accumulated immediately gives up!
+            out = lookup(conn, mgr, r_slow)
+            assert out == (0, False) and "r_slow" in conn._gave_up, f"cumulative defer cap failed: {out}"
+            # Subsequent lookup must stay sticky _ReadyOnly (not re-defer)
+            out2 = lookup(conn, mgr, r_slow)
+            assert out2 == (0, False) and STATE.counts["defer_giveup"] == 1
+            # _check_ready must NOT stamp _ready when missing chunk dropped to MISS while still on disk
+            r_miss = request("r_miss", HB + hashes("q", 1), 5 * T)
+            conn.on_new_request(r_miss)
+            conn._deferred["r_miss"] = clk[0]
+            conn._local["r_miss"] = 0
+            conn._check_ready(clk[0] + 1.0)
+            assert "r_miss" not in conn._ready, "_check_ready falsely stamped _ready on failed MISS promotion!"
+            # Pin-budget guard (non-75% case): pinned=5 < 6 (75%), avail=3 < 4 chunks needed -> blocked!
+            conn_p, cs_p, mgr_p, prim_p, fs_p, pol_p = build(8, root + "/pin")
+            STATE.bytes_per_token = 163840.0
+            STATE.speeds.d["disk_gbps"] = 0.14
+            STATE.speeds.d["disk_probe_bytes"] = float("inf")
+            STATE.speeds.d["f0"] = 0.00032
+            store(mgr_p, "b-1", Bk); fs_p.queue_write(Bk); settle(mgr_p, fs_p); settle(mgr_p, fs_p)
+            store(mgr_p, "c-1", [key(h) for h in hashes("c", 8)]); settle(mgr_p, fs_p)
+            fs_p._loading[777] = [Bk[0]]
+            for k in list(pol_p.evictable)[:5]:
+                pol_p.mark_non_evictable(k)
+            r_pin = request("r_pin", HB + hashes("r", 1), 5 * T)
+            conn_p.on_new_request(r_pin)
+            out_pin = conn_p.get_num_new_matched_tokens(r_pin, 0)
+            assert out_pin == (0, False) and "r_pin" in conn_p._gave_up, f"pin-budget guard failed: {out_pin}"
+            fs_p._loading.pop(777)
+            fs_p.shutdown()
+            fs.shutdown()
+
+            # --- 4. Step-scaled pending-hint TTL survives 0.7s 320B MoE steps ---
+            conn, cs, mgr, prim, fs, pol = build(8, root + "/ttl")
+            conn._finished = __import__("collections").OrderedDict()
+            conn._hints_on = True
+            conn._step_dt = 0.70   # 320B MoE prefill step
+            A2 = [key(h) for h in hashes("t", 2)]
+            store(mgr, "t-1", A2); settle(mgr, fs)
+            req_t = request("rt", hashes("t", 2), 2 * T)
+            conn.on_new_request(req_t)
+            conn._on_finish(req_t, [0, 1])
+            exp_t = pol._pending_write[A2[0]][0]
+            assert exp_t - clk[0] >= 2.8 - 1e-3, f"pending-hint TTL too short for 0.7s step: {exp_t - clk[0]:.2f}s"
+            fs.shutdown()
+
+            # --- 5. True worker-thread disk I/O timing ignores scheduler-step polling delay ---
+            conn, cs, mgr, prim, fs, pol = build(8, root + "/io")
+            fs._block_size = 100 << 20    # 100 MB per chunk
+            STATE.speeds.d["disk_probe_bytes"] = 0.0
+            t_sub = clk[0]
+            fs._loading[1] = ["k0"]
+            fs._submit[1] = (t_sub, 1)
+            fs._load_mark = t_sub
+            fs._load_io_times[1] = [t_sub + 0.01, t_sub + 0.02]   # 100 MB in 10 ms = 10.0 GB/s!
+            # Scheduler polls 0.70s later (large-model step delay)
+            orig_ft = F.time
+            F.time = NS(monotonic=lambda: t_sub + 0.70)
+            try:
+                orig_gfj = F.FileSystemTierManager.get_finished_jobs
+                F.FileSystemTierManager.get_finished_jobs = lambda self: [
+                    __import__("vllm.v1.kv_offload.tiering.base", fromlist=["JobResult"]).JobResult(job_id=1, success=True)
+                ]
+                try:
+                    fs.get_finished_jobs()
+                finally:
+                    F.FileSystemTierManager.get_finished_jobs = orig_gfj
+            finally:
+                F.time = orig_ft
+            gbps = STATE.speeds.gbps("disk")
+            assert gbps > 8.0, f"disk_gbps polluted by 0.7s step polling delay: got {gbps:.2f} GB/s"
+            fs.shutdown()
+
+            # --- 6. Step-scoped _step_protected prevents vLLM 0.34 lookup->_initiate_promotion->prepare_load crash ---
+            conn, cs, mgr, prim, fs, pol = build(8, root + "/stepprot")
+            HA = hashes("sa", 4); Ak = [key(h) for h in HA]
+            HB = hashes("sb", 4); Bk = [key(h) for h in HB]
+            HC = hashes("sc", 4); Ck = [key(h) for h in HC]
+            store(mgr, "s1", Ak + Bk); settle(mgr, fs)   # fills all 8 CPU slots
+            # Put C on disk then evict C (already absent) by writing via a temporary full store
+            # Simulate C on disk + A, B resident in CPU (all 8 slots evictable)
+            fs._on_disk.update(Ck)
+            ra = request("ra", HA + hashes("ra_t", 1), 5 * T)
+            conn.on_new_request(ra)
+            out_a = conn.get_num_new_matched_tokens(ra, 0)
+            assert out_a[0] == 4 * T, f"expected 4-chunk CPU hit for ra, got {out_a}"
+            assert all(k in pol._step_protected for k in Ak), "matched HIT chunks of ra not step-protected"
+            # Competing store/promotion in the SAME scheduler step tries to evict 6 chunks (would eat Ak!)
+            assert pol.evict(6, set()) is None, "evict() violated _step_protected and evicted ra HIT chunks!"
+            # Evicting only the 4 non-protected Bk chunks still succeeds, leaving Ak intact for prepare_load!
+            ev4 = pol.evict(4, set())
+            assert ev4 is not None and len(ev4) == 4 and all(k in pol.chunks for k in Ak)
+            # prepare_load(Ak) succeeds with ZERO AssertionError!
+            spec = mgr.prepare_load(Ak, cs._req_status["ra"].req_context)
+            assert spec is not None
+            mgr.complete_load(Ak, cs._req_status["ra"].req_context)
+            # Strict write pin cap under active load (<= cap//4 = 2 chunks for cap=8):
+            fs._loading[99] = [Ck[0]]
+            fs.queue_write(Ak)
+            fs.serve_external_requests(mgr)
+            assert len(fs._inflight) <= 2, f"late write exceeded cap//4 pin limit under load: {len(fs._inflight)}"
+            fs._loading.pop(99)
+            pol._step_protected.clear()
+            fs.shutdown()
+
+            # --- 7. Same-step _pending_load_submissions serialization & FCFS queue-head residency protection ---
+            conn, cs, mgr, prim, fs, pol = build(8, root + "/qorder")
+            STATE.bytes_per_token = 25000.0
+            STATE.speeds.d["disk_gbps"] = 12.0
+            STATE.speeds.d["disk_probe_bytes"] = float("inf")
+            STATE.speeds.d["f0"] = 1e-4
+            H1 = hashes("q1", 5); K1 = [key(h) for h in H1]
+            H2 = hashes("q2", 5); K2 = [key(h) for h in H2]
+            store(mgr, "q1s", K1); fs.queue_write(K1); settle(mgr, fs); settle(mgr, fs); settle(mgr, fs)
+            store(mgr, "q2s", K2); fs.queue_write(K2); settle(mgr, fs); settle(mgr, fs); settle(mgr, fs)
+            store(mgr, "qev", [key(h) for h in hashes("qe", 8)]); settle(mgr, fs)
+            r1 = request("rq1", H1 + hashes("t1", 1), 6 * T)
+            r2 = request("rq2", H2 + hashes("t2", 1), 6 * T)
+            conn.on_new_request(r1)
+            clk[0] += 0.1
+            conn.on_new_request(r2)
+            # Same-step: r1 queues 5-chunk promotion (_pending_load_submissions=5, fs._loading still empty!)
+            out1 = conn.get_num_new_matched_tokens(r1, 0)
+            assert out1 == (None, False) and conn._pending_promo_chunks() == 5
+            # r2 in the SAME step must NOT launch overlapping 5-chunk promotion (would hit promo_afal!)
+            out2 = conn.get_num_new_matched_tokens(r2, 0)
+            assert out2 == (None, False) and conn._pending_promo_chunks() == 5, (
+                f"same-step overlap not serialized: pending={conn._pending_promo_chunks()}"
+            )
+            # _prefetch must also skip while same-step pending promotion exists
+            pf_before = STATE.counts["prefetch"]
+            conn._prefetch()
+            assert STATE.counts["prefetch"] == pf_before, "prefetch stacked onto same-step pending promotion!"
+            # Finish r1's promotion so r1 holds 5/8 CPU chunks waiting for GPU blocks (active_promo==0 now)
+            settle(mgr, fs); settle(mgr, fs)
+            assert all(k in pol.chunks for k in K1) and conn._pending_promo_chunks() == 0
+            # r2 (5 + 5 = 10 > cap=8) must defer WITHOUT evicting r1's chunks and WITHOUT starting _deferred clock!
+            out2b = conn.get_num_new_matched_tokens(r2, 0)
+            assert out2b == (None, False) and "rq2" not in conn._deferred and all(k in pol.chunks for k in K1), (
+                f"queue-head residency violated: out2b={out2b} def={conn._deferred}"
+            )
+            # Once r1 is admitted (unheld), r2 immediately promotes cleanly!
+            conn._unhold("rq1")
+            out2c = conn.get_num_new_matched_tokens(r2, 0)
+            assert out2c == (None, False) and conn._pending_promo_chunks() == 5, (
+                f"r2 did not promote after r1 unheld: pending={conn._pending_promo_chunks()}"
+            )
+            fs.shutdown()
+
+            # --- 8. Slow-disk queue_overflow prices ahead_disk_chunks + pin_ceil prevents over-pinning ---
+            conn, cs, mgr, prim, fs, pol = build(8, root + "/slowq")
+            STATE.bytes_per_token = 163840.0
+            STATE.speeds.d["disk_gbps"] = 0.145
+            STATE.speeds.d["disk_probe_bytes"] = float("inf")
+            STATE.speeds.d["f0"] = 3e-4
+            # Moderate pf (~2.0): single own_disk_s (~0.090s) < cap (~0.147s), but queued ahead + own (~0.181s) > cap!
+            STATE.live.tick(clk[0])
+            clk[0] += 10.0
+            STATE.live.add(clk[0], pf=19.2)
+            HS1 = hashes("sq1", 5); KS1 = [key(h) for h in HS1]
+            HS2 = hashes("sq2", 5); KS2 = [key(h) for h in HS2]
+            store(mgr, "sq1s", KS1); fs.queue_write(KS1); settle(mgr, fs); settle(mgr, fs); settle(mgr, fs)
+            store(mgr, "sq2s", KS2); fs.queue_write(KS2); settle(mgr, fs); settle(mgr, fs); settle(mgr, fs)
+            store(mgr, "sqev", [key(h) for h in hashes("sqe", 8)]); settle(mgr, fs)
+            rs1 = request("rsq1", HS1 + hashes("st1", 1), 6 * T)
+            rs2 = request("rsq2", HS2 + hashes("st2", 1), 6 * T)
+            conn.on_new_request(rs1)
+            clk[0] += 0.1
+            conn.on_new_request(rs2)
+            # Without starting rs1's promotion yet, rs2 sees ahead_disk_chunks=5 + own=5: slow disk wait exceeds cap -> immediate give-up!
+            out_s2 = conn.get_num_new_matched_tokens(rs2, 0)
+            assert out_s2 == (0, False) and "rsq2" in conn._gave_up, (
+                f"slow-disk queue_overflow failed to price ahead_disk_chunks: out={out_s2} gave_up={conn._gave_up}"
+            )
+            # And when 3 chunks are already pinned (e.g. GPU->CPU stores) on cap=8 (pin_ceil=7),
+            # a 5-chunk slow-disk promotion (3 + 5 = 8 > 7) must NOT over-pin CPU!
+            ev_keys = list(pol.evictable)[:3]
+            for ek in ev_keys:
+                pol.mark_non_evictable(ek)
+            STATE.live.add(clk[0], pf=500.0)   # raise cap so est_wait <= cap -> must defer via pin_block, not start!
+            out_s1 = conn.get_num_new_matched_tokens(rs1, 0)
+            assert out_s1 == (None, False) and conn._pending_promo_chunks() == 0, (
+                f"pin_ceil did not guard over-pinning when pinned>0: out={out_s1} pending={conn._pending_promo_chunks()}"
+            )
+            fs.shutdown()
+        finally:
+            C.time, P.time = orig_c_time, orig_p_time
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 if __name__ == "__main__":
     test_bug_b_token_proportional_defer_and_ghost_decay()
     test_bug_a_hybrid_on_disk_no_overcount()
@@ -563,4 +862,5 @@ if __name__ == "__main__":
     test_wave2_bounded_prefetch_and_redefer_reset()
     test_wave3_pending_hint_ins_protection_thru_and_ready()
     test_wave4_no_disk_gpu_blk_roofline_f0_running_protect_and_backpressure()
-    print("layby v2 engine fixes ok: wave1-wave4 all verified")
+    test_wave6_general_streaming_cumulative_defer_prefetch_and_io_timing()
+    print("layby v2 engine fixes ok: wave1-wave6 all verified")
