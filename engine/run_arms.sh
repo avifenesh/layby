@@ -165,7 +165,7 @@ for arm in "$@"; do
     LMX=""; [ ${arm%%.*} = LMR ] && LMX="--l2-prefetch-policy retain --eviction-trigger-watermark 0.95 --eviction-ratio 0.1"
     L2="{\"type\":\"nixl_store_dynamic\",\"backend\":\"POSIX\",\"backend_params\":{\"file_path\":\"$DISK\",\"use_direct_io\":\"true\",\"max_capacity_gb\":\"$L2GB\"},\"persist_enabled\":false,\"eviction\":{\"eviction_policy\":\"LRU\",\"trigger_watermark\":0.9,\"eviction_ratio\":0.1}}"
     setsid ${SERVER_WRAP:-} lmcache server --port ${LM_PORT:-6555} --http-port $(( ${LM_PORT:-6555} + 100 )) --chunk-size ${LM_CHUNK:-256} --separate-object-groups \
-      --l1-size-gb $L1GB --eviction-policy LRU $LMX --l2-adapter "$L2" > $O/$arm.lmcache.log 2>&1 &
+      --l1-size-gb $L1GB --eviction-policy ${LM_EVICTION:-LRU} $LMX --l2-adapter "$L2" > $O/$arm.lmcache.log 2>&1 &
     LMP=$!; sleep 20 ;;
   esac
   echo "=== arm $arm $(date -u +%H:%M:%S)"
@@ -181,7 +181,7 @@ for arm in "$@"; do
     SCPORT=${SIDECAR_PORT:-$((PARK_PORT + 1))}
     setsid ${SERVER_WRAP:-} $VENV/bin/python -m layby.sidecar.proxy --upstream http://127.0.0.1:$PORT --listen $SCPORT \
       --engine vllm --hint-url http://127.0.0.1:$PARK_PORT/hint --ckpt "$SIDECAR_CKPT" --calib "$SIDECAR_CALIB" \
-      ${SIDECAR_DEVICE:+--device $SIDECAR_DEVICE} > $O/$arm.sidecar.log 2>&1 &
+      ${SIDECAR_DEVICE:+--device $SIDECAR_DEVICE} ${SIDECAR_ENCODER:+--encoder $SIDECAR_ENCODER} > $O/$arm.sidecar.log 2>&1 &
     SCP=$!
     # shellcheck disable=SC2064  # the trap takes this arm's process groups now
     trap "kill -9 -- -$SP ${LMP:+-$LMP} -$SCP 2>/dev/null" EXIT INT TERM
@@ -211,7 +211,7 @@ for arm in "$@"; do
     CT) curl -sf localhost:$PARK_PORT/live > $O/$arm.ct_live.json
         curl -sf localhost:$PARK_PORT/log > $O/$arm.ct_log.json ;; esac
   echo "arm $arm rc=$rc $(grep -c ttft $O/$arm.jsonl) turns"
-  [ -n "$SCP" ] && kill -9 -- -$SCP 2>/dev/null
+  [ -n "$SCP" ] && { curl -sf -m 10 localhost:$SCPORT/park/stats > $O/$arm.sidecar_stats.json 2>/dev/null || true; kill -9 -- -$SCP 2>/dev/null; }
   kill $SP; sleep 10
   # hard-kill what the server left behind (engine core): its own process group only, then free its CPU tier
   kill -9 -- -$SP 2>/dev/null

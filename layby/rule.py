@@ -75,31 +75,50 @@ def decide(S, N, on_disk, idle_g, idle_c, live, p, now, options=OPTIONS, write="
     # ones that arrive while it waits and runs, about lam * (wait + x) of them, by x each
     lnk = {}
     for k in ("cpu", "disk"):
-        lam = live.rate("n_" + k, now)
-        lnk[k] = (lam, live.rate("wait_" + k, now) / lam if lam > 0 else 0.0)
+        # on engines that separate disk reads from background writes, user-facing latency only pays
+        # read queue wait and only delays other user-facing reads (delaying a background write adds 0 TTFT)
+        if k == "disk" and (live.acc.get("n_disk_r", 0.0) > 0.0 or live.acc.get("n_disk_w", 0.0) > 0.0):
+            lam = live.rate("n_disk_r", now)
+            lnk[k] = (lam, live.rate("wait_disk_r", now) / lam if lam > 0 else 0.0)
+        else:
+            lam = live.rate("n_" + k, now)
+            lnk[k] = (lam, live.rate("wait_" + k, now) / lam if lam > 0 else 0.0)
     dly = lambda k, x: lnk[k][0] * (lnk[k][1] + x) * x
     rec = lambda n: n * p.f0 * (1 + p.att * n / 2000)
     # a load holds the request's N allocated GPU tokens while it runs: admission, bound by GPU
     # capacity C, slows by N / C for that long, which delays each waiting request as much
     blk = live.rate("nw", now) * N / p.gpu_tokens
     # a restore from disk: where the engine measures it, the time a request whose prefix is on disk waits
-    # from its first lookup to admission (an engine may defer such a request for whole scheduler steps
-    # while the disk tier promotes it); else the disk link's wait and transfer
+    # while the disk tier promotes it; scaled proportionally to the session's transfer time x when defer_x
+    # is measured (so a 32K deferral does not price a 9K session as 32K, and partial on_disk f0 scales),
+    # decaying smoothly back to the link's queue wait as old deferrals fade out
     nd = live.rate("n_defer", now)
-    defer = live.rate("defer", now) / nd if nd > 0 else None
-    disk_t = (lambda x: defer) if defer is not None else (lambda x: lnk["disk"][1] + x)
+    acc_nd = live.acc.get("n_defer", 0.0)
+    acc_ndx = live.acc.get("n_defer_x", 0.0)
+    if acc_ndx > 0.0 and acc_nd > 0.0:
+        ovh = (live.acc["defer"] - live.acc["defer_x"]) / acc_nd
+        w = acc_nd / (acc_nd + 0.5)
+        wait_d = w * ovh + (1.0 - w) * lnk["disk"][1]
+        disk_t = lambda x, _wd=wait_d: max(_wd + x, 0.0)
+    elif nd > 0 and acc_nd > 1e-3:
+        defer = live.rate("defer", now) / nd
+        disk_t = lambda x, _d=defer: _d
+    else:
+        disk_t = lambda x: lnk["disk"][1] + x
     own = dict(c=lnk["cpu"][1] + tc_ + p.t0, d=disk_t(td_) + tc_ + p.t0, r=rec(N) + p.t0)
     # a recompute of x seconds takes the prefill budget from the requests in prefill and from those
     # that arrive (na per second) while it runs: about npf + na * x requests, each delayed by x
     prf = lambda x: (npf + na * x) * x
-    ext = dict(c=dly("cpu", tc_) + blk * own["c"], d=dly("disk", td_) + dly("cpu", tc_) + blk * own["d"], r=prf(own["r"]))
+    # a CPU->GPU load holds the request's N allocated GPU tokens while PCIe runs; a disk->CPU promotion
+    # runs before admission (holding zero GPU blocks), so only the CPU transfer pays GPU blocking
+    ext = dict(c=dly("cpu", tc_) + blk * own["c"], d=dly("disk", td_) + dly("cpu", tc_) + blk * own["c"], r=prf(own["r"]))
     # without a new disk write, a miss past the CPU tier loads the disk copy the session already has
     # (the engine takes any external prefix) and recomputes the rest
     d0 = min(on_disk, N)
     if d0 > 0:
         f0 = d0 / N
         own["o"] = disk_t(f0 * td_) + f0 * tc_ + rec(N - d0) + p.t0
-        ext["o"] = dly("disk", f0 * td_) + dly("cpu", f0 * tc_) + blk * (own["o"] - rec(N - d0)) + prf(rec(N - d0))
+        ext["o"] = dly("disk", f0 * td_) + dly("cpu", f0 * tc_) + blk * (f0 * tc_ + p.t0) + prf(rec(N - d0))
     else:
         own["o"], ext["o"] = own["r"], ext["r"]
     Rg = live.resid("g", now, idle_g); Rc = live.resid("c", now, idle_c)
@@ -108,7 +127,8 @@ def decide(S, N, on_disk, idle_g, idle_c, live, p, now, options=OPTIONS, write="
     Gc = lambda a: np.interp(a, AG, cumc) + np.maximum(a - AG[-1], 0) * Rc[-1]
     ec = live.rate("w_c", now)
     price_c = ec * live.lam("c", N / ec, now) if ec > 0 else 0.0     # seconds lost per second held
-    W = 0.0 if on_disk >= N else dly("disk", td_)                    # a disk write delays the link's other users
+    # a disk write only needs to write the delta (N - d0) not yet on disk (ParkFsTier deduplicates)
+    W = 0.0 if d0 >= N else dly("disk", ((N - d0) / N) * td_)
     ne = live.rate("ne_c", now)        # a first-out copy stays in the CPU tier until the tier's next eviction
     # in an LRU tier a copy is evicted once about C tokens newer than it came in, so while it sits there
     # the tier evicts at most about C tokens: at e tokens/s that bounds the time it costs price_c to C / e
@@ -143,6 +163,11 @@ def decide(S, N, on_disk, idle_g, idle_c, live, p, now, options=OPTIONS, write="
         if best is None or base + place < best[0]:
             best = (base + place, opt)
     opt = best[1]
+    # cold-start tie-breaker: before the first CPU eviction (ne == 0, Rc == 1), none and ins tie at W == 0;
+    # when disk restore beats recompute (fast disk), insure on disk for free while the disk is idle
+    if (opt == "none" and "ins" in tot and ne == 0.0 and W == 0.0 and own["d"] < own["r"]
+            and sum(tot["ins"]) <= best[0] + 1e-12):
+        opt = "ins"
     first = opt in ("park", "drop")
     # the CPU tier evicts the copy predicted back last; rank by the median return
     eta = -1.0 if first else (float(TG[np.argmax(S <= 0.5)]) if (S <= 0.5).any() else 1800.0)

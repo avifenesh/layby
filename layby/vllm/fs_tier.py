@@ -82,7 +82,10 @@ class ParkFsTier(FileSystemTierManager):
         self._on_disk = set()           # chunks whose write completed
         self._inflight = set()          # chunks being written
         self._writing = {}              # store job id -> its keys
-        self._loading = {}              # load job id -> its keys
+        self._loading = {}              # load job id -> its keys, in submit order while unfinished
+        self._load_key_job = {}         # key -> the unfinished load job that reads it
+        self._load_mark = None          # start of the not yet accounted load-queue busy period
+        self._load_bytes = 0            # load bytes completed since _load_mark
         self._submit = {}               # job id -> (submit time, n keys) for link telemetry
         self._mark = None               # start of the not yet accounted part of the busy period
         self._bytes = 0                 # bytes completed since _mark
@@ -112,39 +115,99 @@ class ParkFsTier(FileSystemTierManager):
     def get_finished_jobs(self):
         results = super().get_finished_jobs()
         now = time.monotonic()
+        loads_done = False
+        lkj = getattr(self, "_load_key_job", None)
         for r in results:
             sub = self._submit.pop(r.job_id, None)
+            is_load = r.job_id in self._loading
+            is_write = r.job_id in self._writing
             if sub is not None:
                 t_sub, n = sub
                 nbytes = n * self._block_size
                 self._bytes += nbytes
                 x = nbytes / (STATE.speeds.gbps("disk") * 1e9)
-                STATE.live.add(now, n_disk=1.0, wait_disk=max(now - t_sub - x, 0.0))
+                wait = max(now - t_sub - x, 0.0)
+                kw = dict(n_disk=1.0, wait_disk=wait)
+                if is_load:
+                    kw.update(n_disk_r=1.0, wait_disk_r=wait)
+                elif is_write:
+                    kw.update(n_disk_w=1.0)
+                STATE.live.add(now, **kw)
             keys = self._writing.pop(r.job_id, None)
             if keys is not None:
                 self._inflight.difference_update(keys)
                 if r.success:
                     self._on_disk.update(keys)
             keys = self._loading.pop(r.job_id, None)
-            if keys is not None and not r.success:
-                # a failed load: the keys past the ones that loaded are no longer trusted
-                ok = set(r.successful_keys or ())
-                self._on_disk.difference_update([k for k in keys if k not in ok])
+            if keys is not None:
+                loads_done = True
+                if hasattr(self, "_load_bytes"):
+                    self._load_bytes += len(keys) * self._block_size
+                if lkj is not None:
+                    for k in keys:
+                        if lkj.get(k) == r.job_id:
+                            del lkj[k]
+                if not r.success:
+                    # a failed load: the keys past the ones that loaded are no longer trusted
+                    ok = set(r.successful_keys or ())
+                    self._on_disk.difference_update([k for k in keys if k not in ok])
         if self._mark is not None and (results or not self._submit):
             span = now - self._mark
             if span > 0:
-                if self._bytes:
+                # only feed combined bytes into disk speed before reads have run; once reads run,
+                # read throughput is measured directly below so full-duplex R+W does not inflate read speed
+                if self._bytes and STATE.speeds.bps("drain") is None:
                     STATE.speeds.link(now, "disk", self._bytes, span)
                 STATE.live.add(now, busy_disk=span)
             self._bytes = 0
             self._mark = now if self._submit else None
+        lmark = getattr(self, "_load_mark", None)
+        if lmark is not None and (loads_done or not self._loading):
+            span = now - lmark
+            if span > 0:
+                STATE.speeds.link(now, "drain", self._load_bytes, span)
+                if self._load_bytes:
+                    STATE.speeds.link(now, "disk", self._load_bytes, span)
+            self._load_bytes = 0
+            self._load_mark = now if self._loading else None
         return results
 
+    def drain_rate(self):
+        """Bytes per second the load queue drains at: load bytes completed per wall-clock second with unfinished
+        loads, decayed over STATE.tw. None until a load job completed."""
+        return STATE.speeds.bps("drain")
+
     def submit_load(self, job_metadata) -> None:
-        self._loading[job_metadata.job_id] = list(job_metadata.keys)
+        keys = list(job_metadata.keys)
+        self._loading[job_metadata.job_id] = keys
+        if hasattr(self, "_load_key_job"):
+            for k in keys:
+                self._load_key_job[k] = job_metadata.job_id
+        if getattr(self, "_load_mark", None) is None and hasattr(self, "_load_mark"):
+            self._load_mark = time.monotonic()
         self._track(job_metadata)
         if not self._split_io(job_metadata, load=True):
             super().submit_load(job_metadata)
+
+    def load_queue_ahead(self, key, pending=()):
+        """Bytes the disk must still read before key is in the CPU tier: unfinished load jobs submitted up to and
+        including the one that reads key, plus any promotions held by the tiering manager until step end.
+        None: no load job reads key."""
+        lkj = getattr(self, "_load_key_job", None)
+        job = lkj.get(key) if lkj is not None else None
+        if job is not None:
+            total = 0
+            for jid, keys in self._loading.items():
+                total += len(keys) * self._block_size
+                if jid == job:
+                    return total
+            return None
+        total = sum(len(keys) for keys in self._loading.values()) * self._block_size
+        for keys in pending:
+            total += len(keys) * self._block_size
+            if key in keys:
+                return total
+        return None
 
     def _split_io(self, job, load: bool) -> bool:
         """Run a job's chunk files as up to n_read_threads (loads) or n_write_threads (stores) tasks of consecutive
@@ -152,7 +215,12 @@ class ParkFsTier(FileSystemTierManager):
         failed one, as the base's single task does. False: not split (one chunk, or a vLLM without these fields)."""
         keys = list(job.keys)
         n = len(keys)
-        k = min(getattr(self, "_split_load" if load else "_split_store", 1), n)
+        # read priority: while an urgent promotion load is in flight, run background stores on 1 thread
+        # instead of competing across all 16 write threads (while still pinning chunks immediately via submit_store)
+        max_k = getattr(self, "_split_load" if load else "_split_store", 1)
+        if not load and self._loading:
+            max_k = 1
+        k = min(max_k, n)
         if k <= 1 or not all(hasattr(self, a) for a in ("_pool", "file_mapper", "_job_block_counts", "_block_size",
                                                          "_primary_kv_view", "_use_o_direct", "_load_progress",
                                                          "_progress_lock")):
@@ -180,7 +248,9 @@ class ParkFsTier(FileSystemTierManager):
                 return task
             self._pool.enqueue_load(job_id, k, [part(bounds[i], bounds[i + 1]) for i in range(k)])
         else:
-            if getattr(self, "events", None) is not None:
+            if hasattr(self, "_store_jobs"):
+                self._store_jobs[job_id] = job
+            elif getattr(self, "events", None) is not None and hasattr(self, "_store_job_keys"):
                 self._store_job_keys[job_id] = keys
             tasks = [functools.partial(fs_io.batch_store_block, paths[bounds[i]:bounds[i + 1]], view,
                                        offsets[bounds[i]:bounds[i + 1]], size, odirect) for i in range(k)]
@@ -193,12 +263,19 @@ class ParkFsTier(FileSystemTierManager):
         return RequestOffloadingContext()
 
     def submit_store(self, job_metadata) -> None:
-        if _parked(job_metadata.req_context) or _through(job_metadata.req_context) or getattr(self, "_write_all", False):
+        parked = _parked(job_metadata.req_context)
+        thru = _through(job_metadata.req_context)
+        write_all = getattr(self, "_write_all", False)
+        if parked or thru or write_all:
             # write only chunks not on disk and not being written: a request-level tier gets every chunk of
             # the request again on each turn (vLLM cascades the chunks already in the CPU tier), which
             # rewrote whole contexts per turn and saturated the disk. The parent releases the job's chunks
             # by job id, so writing a subset is safe.
             keys = list(job_metadata.keys)
+            pol = STATE.policy
+            if parked and pol is not None and hasattr(pol, "release_pending_write"):
+                # late-write chunks are now pinned (ref_cnt >= 1) by create_store_job: apply deferred ins/park hint
+                pol.release_pending_write(keys)
             keep = [i for i, k in enumerate(keys) if k not in self._on_disk and k not in self._inflight]
             if not keep:
                 ParkFsTier.dedup_jobs += 1
@@ -225,10 +302,11 @@ class ParkFsTier(FileSystemTierManager):
         self._submit[job_metadata.job_id] = (now, len(job_metadata.keys))
 
     # --- late writes -------------------------------------------------------------------------
-    def queue_write(self, keys) -> None:
+    def queue_write(self, keys) -> list:
         keys = [k for k in keys if k not in self._on_disk and k not in self._inflight]
         if keys:
             self._late.append((time.monotonic(), keys))
+        return keys
 
     def has_pending_work(self) -> bool:
         return bool(self._late) or super().has_pending_work()
@@ -238,8 +316,15 @@ class ParkFsTier(FileSystemTierManager):
         if not self._late:
             return
         now = time.monotonic()
+        pol = STATE.policy
+        # backpressure on slow disks: never pin more than ~25% of the CPU tier with concurrent late
+        # store jobs (always allow at least 1 active write so large single turns never stall)
+        max_inflight = max(pol.cache_capacity // 4, 1) if pol is not None else 0
         keep = []
-        for t, keys in self._late:
+        for idx, (t, keys) in enumerate(self._late):
+            if self._writing and max_inflight and len(self._inflight) >= max_inflight:
+                keep.extend(self._late[idx:])
+                break
             ctx = ReqContext(req_id=f"park-write-{next(self._seq)}", kv_transfer_params={"park_disk": True})
             parent.on_new_request(ctx)
             hit, wait = [], []

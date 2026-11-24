@@ -61,8 +61,11 @@ def build(n_chunks, root):
     prim._kv_memoryview = memoryview(buf).cast("B", (n_chunks, B))
     par = NS(tp_size=1, pp_size=1, pcp_size=1, dcp_size=1, rank=0, is_parallelism_agnostic=True)
     spec = NS(blocks_per_chunk=1, tokens_per_hash=T, offload_prompt_only=False, tokens_per_block=[T],
+              extra_config={},
               kv_events_config=NS(enable_kv_cache_events=False, self_describing_kv_events=False),
-              config=NS(groups=[NS(group_id=0, tokens_per_block=T, layer_names=["l0"])], model=NS(name="test/m", dtype="bf16"),
+              config=NS(groups=[NS(group_id=0, tokens_per_block=T, layer_names=["l0"],
+                                   sliding_window_size_in_chunks=None)],
+                        model=NS(name="test/m", dtype="bf16"),
                         cache=NS(tokens_per_hash=T), parallel=par, canonical_layout=False, replicated_layout=False))
     fs = F.ParkFsTier(spec, prim.get_kv_memoryview(), "ParkFsTier", root_dir=root, n_read_threads=2, n_write_threads=2)
     mgr = TieringOffloadingManager(prim, [fs])
@@ -70,7 +73,7 @@ def build(n_chunks, root):
     kvc = KVCacheConfig(num_blocks=64, kv_cache_tensors=[], kv_cache_groups=[KVCacheGroupSpec(
         layer_names=["l0"], kv_cache_spec=FullAttentionSpec(block_size=T, num_kv_heads=1, head_size=8, dtype=torch.bfloat16))])
     vc = NS(cache_config=NS(prefix_cache_retention_interval=None, enable_prefix_caching=True), speculative_config=None,
-            parallel_config=NS(world_size=1, decode_context_parallel_size=1))
+            parallel_config=NS(world_size=1, decode_context_parallel_size=1), num_hash_lookahead_tokens=0)
     cs = OffloadingConnectorScheduler(spec, vc, kvc)
     # ParkConnector's scheduler side without a vLLM config: the request-tracking state its __init__ sets
     conn = object.__new__(C.ParkConnector)
@@ -123,7 +126,7 @@ def check(prim, pol):
 def request(rid, hs, prompt):
     return NS(request_id=rid, num_computed_tokens=0, num_prompt_tokens=prompt, num_tokens=prompt, block_hashes=hs,
               kv_transfer_params={"park_key": rid}, kv_hints=None, skip_reading_prefix_cache=False,
-              is_finished=lambda: False)
+              skip_reading_external_kv=False, resumable=False, num_in_flight_tokens=0, is_finished=lambda: False)
 
 
 def lookup(conn, cs, mgr, req, local=0):

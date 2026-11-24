@@ -21,8 +21,7 @@ import torch
 from safetensors.torch import load_file
 from transformers import AutoTokenizer
 
-from laya.agent import _fix_tokenizer_config
-from laya.common import QTYPES, build_model, build_sequence
+from layby_dwell.v2 import DwellV2, is_v2_config
 
 REPO = "avifenesh/layby-dwell"
 QUANT = ("int8w", "fp8w")
@@ -40,19 +39,37 @@ def _quantize(model, precision):
 
 
 class Dwell:
-    def __init__(self, path=None, device=None, precision=None, batch_size=32):
-        """path: a local copy of the model repo (config.json, model.safetensors, encoder/, tokenizer/);
+    def __init__(self, path=None, device=None, precision=None, batch_size=32, encoder_path=None):
+        """path: a local copy of a Layby-Dwell v2 (zero-laya) or v1 (Laya) model directory;
         None downloads REPO from the Hugging Face Hub."""
+        if path is None or not os.path.isdir(path):
+            from huggingface_hub import snapshot_download
+            path = snapshot_download(path or REPO)
+        cfg = json.load(open(os.path.join(path, "config.json")))
+        if is_v2_config(cfg):
+            self._v2 = DwellV2(path, device=device, precision=precision, batch_size=batch_size,
+                               encoder_path=encoder_path, warmup=False)
+            self.dev = self._v2.dev
+            self.precision = self._v2.precision
+            self.horizons = self._v2.horizons
+            self.temp = self._v2.temp
+            self.cfg = self._v2.cfg
+            self.model = self._v2.model
+            self.tok = self._v2.tok
+            self.batch_size = self._v2.batch_size
+            self.model_version = 2
+            return
+        self._v2 = None
+        self.model_version = 1
+        from laya.agent import _fix_tokenizer_config
+        from laya.common import QTYPES, build_model, build_sequence
+        self._QTYPES, self._build_sequence = QTYPES, build_sequence
         self.dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.precision = precision or ("bf16" if self.dev.type == "cuda" else "fp32")
         if self.precision not in PRECISIONS:
             raise ValueError(f"precision is one of {PRECISIONS}")
         if self.precision in QUANT and self.dev.type != "cuda":
             raise ValueError("8-bit precisions need a GPU")
-        if path is None or not os.path.isdir(path):
-            from huggingface_hub import snapshot_download
-            path = snapshot_download(path or REPO)
-        cfg = json.load(open(os.path.join(path, "config.json")))
         d = cfg["layby_dwell"]
         self.horizons = np.asarray(d["horizons_s"], np.float32)
         self.temp = d["temperature"]
@@ -73,15 +90,19 @@ class Dwell:
     def encode(self, states):
         """Token ids and the positions of the 15 + 1 answer markers per state; None where a state
         cannot be fitted into max_len."""
+        if self._v2 is not None:
+            raise NotImplementedError("encode() is v1/Laya-specific; call survival() directly on v2 models")
         out = []
         for s in states:
             s = s if isinstance(s, str) else json.dumps(s, ensure_ascii=False, default=str)
-            seq, mk = build_sequence(self.tok, s, self.q, self.cfg["max_len"], self.cfg["head_max_len"])
+            seq, mk = self._build_sequence(self.tok, s, self.q, self.cfg["max_len"], self.cfg["head_max_len"])
             out.append((seq, mk) if len(mk) == self.K else None)
         return out
 
     @torch.no_grad()
     def logits(self, items):
+        if self._v2 is not None:
+            raise NotImplementedError("logits(items) is v1/Laya-specific; call _v2.logits_and_survival() on v2")
         Z = np.full((len(items), self.K), np.nan, np.float32)
         keep = sorted((i for i, x in enumerate(items) if x is not None), key=lambda i: len(items[i][0]))
         for b in range(0, len(keep), self.batch_size):
@@ -96,7 +117,7 @@ class Dwell:
                 ids[r, :len(seq)] = torch.tensor(seq); att[r, :len(seq)] = 1; mpos[r] = torch.tensor(mk)
             args = (ids.to(self.dev), att.to(self.dev), mpos.to(self.dev),
                     torch.ones((n, self.K), dtype=torch.bool, device=self.dev),
-                    torch.full((n,), QTYPES["score"], dtype=torch.long, device=self.dev))
+                    torch.full((n,), self._QTYPES["score"], dtype=torch.long, device=self.dev))
             if self._amp is not None:
                 with torch.autocast(self.dev.type, dtype=self._amp):
                     lg, _ = self.model(*args)
@@ -105,10 +126,11 @@ class Dwell:
             Z[idx] = lg.float().cpu().numpy()
         return Z
 
-    def survival(self, states, kinds):
+    def survival(self, states, kinds=None):
         """states: server-view states (JSON strings or dicts, see session.Tracker); kinds: "tool" or
-        "human" per state. Returns an (n, 15) array of P(T > horizons[j]). A state that cannot be
-        fitted gives a row of NaN; treat it as unknown (the engine adapters fall back to LRU)."""
+        "human" per state. Returns an (n, 15) array of P(T > horizons[j])."""
+        if self._v2 is not None:
+            return self._v2.survival(states, kinds)
         Z = self.logits(self.encode(states))
         t = np.array([self.temp.get(k, self.temp["_all"]) for k in kinds], np.float32)[:, None]
         z = Z / t

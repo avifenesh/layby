@@ -23,17 +23,104 @@ Content stays on this host: states are scored in process and only curves leave t
 """
 import argparse
 import asyncio
+from collections import OrderedDict, deque
 import hashlib
 import json
 import logging
+import math
+import time
 import uuid
 
 import aiohttp
 from aiohttp import web
+import numpy as np
 
+from layby.rule import E2
 from layby.sidecar.session import Tracker
 
 log = logging.getLogger("layby.sidecar")
+
+
+class OnlineCalib:
+    """Rolling realized-gap calibration monitor + optional adaptive per-kind temperature.
+
+    Stores recent (logits, surv) keyed by boundary key; when Tracker links the session's next request
+    and measures the realized gap, records exact discrete survival NLL and 300s calibration error,
+    and (when enabled) adapts per-kind temperature on a sliding window to absorb workload/harness drift.
+    """
+
+    def __init__(self, base_temps: dict[str, float], enabled: bool = False, window: int = 500, max_pending: int = 20000):
+        self.base_temps = dict(base_temps or {"_all": 1.0})
+        self.temps = dict(self.base_temps)
+        self.enabled = bool(enabled)
+        self.window = int(window)
+        self.max_pending = int(max_pending)
+        self._pending: "OrderedDict[str, tuple[np.ndarray, np.ndarray, str]]" = OrderedDict()
+        self._obs: dict[str, deque] = {}   # kind -> deque[(logits, surv, bin_idx, gap)]
+        self._updates = 0
+
+    def record_prediction(self, key: str, logits: np.ndarray, surv: np.ndarray, kind: str) -> None:
+        if key is None or np.isnan(logits).any():
+            return
+        self._pending[key] = (np.asarray(logits, np.float32), np.asarray(surv, np.float32), str(kind))
+        self._pending.move_to_end(key)
+        while len(self._pending) > self.max_pending:
+            self._pending.popitem(last=False)
+
+    def observe_return(self, key: str, gap: float, kind: str) -> None:
+        item = self._pending.pop(key, None)
+        if item is None:
+            return
+        lg, surv, pred_kind = item
+        kd = str(kind or pred_kind)
+        b = int(np.searchsorted(E2, gap, side="right"))
+        q = self._obs.setdefault(kd, deque(maxlen=self.window))
+        q.append((lg, surv, b, float(gap)))
+        self._updates += 1
+        if self.enabled and len(q) >= 40 and self._updates % 20 == 0:
+            self._refit(kd)
+
+    def _refit(self, kd: str) -> None:
+        q = self._obs.get(kd)
+        if not q or len(q) < 40:
+            return
+        Z = np.stack([x[0] for x in q], axis=0).astype(np.float64)
+        bins = np.array([x[2] for x in q], dtype=np.int64)
+        # Lightweight 1-D grid + local refinement over log-temperature (no autograd needed, <0.5 ms)
+        base = float(self.base_temps.get(kd, self.base_temps.get("_all", 1.0)))
+        best_t, best_l = base, math.inf
+        for cand in np.geomspace(max(0.25, base * 0.4), min(4.0, base * 2.5), 25):
+            z = Z / cand
+            z -= z.max(axis=1, keepdims=True)
+            lse = np.log(np.exp(z).sum(axis=1))
+            nll = float(np.mean(lse - z[np.arange(len(bins)), bins]))
+            # Mild L2 prior toward offline-calibrated temperature so small windows stay stable
+            reg = 0.02 * (math.log(cand / base) ** 2)
+            if nll + reg < best_l:
+                best_l, best_t = nll + reg, float(cand)
+        self.temps[kd] = best_t
+
+    def summary(self) -> dict:
+        out = {"enabled": self.enabled, "temps": {k: round(v, 4) for k, v in self.temps.items()}, "by_kind": {}}
+        for kd, q in self._obs.items():
+            if not q:
+                continue
+            survs = np.stack([x[1] for x in q], axis=0)
+            bins = np.array([x[2] for x in q], dtype=np.int64)
+            gaps = np.array([x[3] for x in q], dtype=np.float64)
+            # Reconstruct discrete bin probabilities from monotonic survival curve
+            S1 = np.concatenate([np.ones((len(q), 1)), survs, np.zeros((len(q), 1))], axis=1)
+            P = np.clip(S1[:, :-1] - S1[:, 1:], 1e-7, 1.0)
+            nll = float(-np.mean(np.log(P[np.arange(len(bins)), bins])))
+            j300 = int(np.argmin(np.abs(E2 - 300.0)))
+            p300 = survs[:, j300]
+            y300 = (gaps > 300.0).astype(np.float64)
+            out["by_kind"][kd] = {
+                "n": len(q),
+                "nll": round(nll, 4),
+                "cal_err_300s": round(float(abs(p300.mean() - y300.mean())), 4),
+            }
+        return out
 
 
 class VllmAdapter:
@@ -65,11 +152,22 @@ class Sidecar:
         self.adapter = ADAPTERS[a.engine](a.hint_url)
         self.queue: asyncio.Queue = asyncio.Queue()
         self.scorer = None
-        self.stats = dict(requests=0, boundaries=0, hints=0, hint_errors=0, unlinked=0)
+        self.calib = None
+        self.score_ms: deque = deque(maxlen=1000)
+        self.stats = dict(requests=0, boundaries=0, hints=0, hint_errors=0, unlinked=0, batches=0)
 
     async def start(self, app):
         from layby.sidecar.scorer import Scorer          # heavy import: torch, transformers
-        self.scorer = await asyncio.to_thread(Scorer, self.a.ckpt, self.a.calib, self.a.device)
+        self.scorer = await asyncio.to_thread(
+            Scorer,
+            self.a.ckpt,
+            self.a.calib,
+            self.a.device,
+            getattr(self.a, "max_len", None),
+            getattr(self.a, "precision", None),
+            getattr(self.a, "encoder", None),
+        )
+        self.calib = OnlineCalib(self.scorer.temp, enabled=bool(getattr(self.a, "online_calib", False)))
         self.http = aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=0))
         app["scorer_task"] = asyncio.create_task(self.score_loop())
 
@@ -78,13 +176,31 @@ class Sidecar:
         await self.http.close()
 
     async def score_loop(self):
+        coalesce_s = max(float(getattr(self.a, "coalesce_ms", 0.0)), 0.0) / 1000.0
         while True:
             batch = [await self.queue.get()]
+            if coalesce_s > 0.0 and len(batch) < self.a.batch:
+                deadline = time.monotonic() + coalesce_s
+                while len(batch) < self.a.batch:
+                    rem = deadline - time.monotonic()
+                    if rem <= 0.0:
+                        break
+                    try:
+                        batch.append(await asyncio.wait_for(self.queue.get(), timeout=rem))
+                    except asyncio.TimeoutError:
+                        break
             while not self.queue.empty() and len(batch) < self.a.batch:
                 batch.append(self.queue.get_nowait())
             keys, states, kinds, futs = zip(*batch)
             try:
-                S = await asyncio.to_thread(self.scorer.score, list(states), list(kinds))
+                t0 = time.perf_counter()
+                temps = self.calib.temps if self.calib is not None else None
+                Z, S = await asyncio.to_thread(self.scorer.score_with_logits, list(states), list(kinds), temps)
+                self.score_ms.append((time.perf_counter() - t0) * 1000.0)
+                self.stats["batches"] += 1
+                if self.calib is not None:
+                    for k, lg, sv, kd in zip(keys, Z, S, kinds):
+                        self.calib.record_prediction(k, lg, sv, kd)
                 await self.adapter.send(self.http, list(zip(keys, S.tolist())))
                 self.stats["hints"] += len(batch)
                 for f, row in zip(futs, S.tolist()):
@@ -110,6 +226,8 @@ class Sidecar:
         self.stats["requests"] += 1
         user = self.user_of(req, body)
         sess = self.tracker.on_request(body, user)
+        if sess.last_returned is not None and self.calib is not None:
+            self.calib.observe_return(*sess.last_returned)
         key = uuid.uuid4().hex
         fwd = dict(body)
         self.adapter.tag(fwd, key)
@@ -167,7 +285,7 @@ class Sidecar:
                 c["function"]["arguments"] += f.get("arguments") or ""
 
     def boundary(self, sess, body, msg, usage, user, key):
-        state, kind = self.tracker.on_response(sess, body, msg, usage, user)
+        state, kind = self.tracker.on_response(sess, body, msg, usage, user, key=key)
         self.stats["boundaries"] += 1
         self.queue.put_nowait((key, state, kind, None))
 
@@ -193,7 +311,19 @@ class Sidecar:
                                 content_type=up.content_type or "application/json")
 
     async def park_stats(self, req):
-        return web.json_response(dict(self.stats, sessions=self.tracker.n_sessions, queued=self.queue.qsize()))
+        ms = np.fromiter(self.score_ms, float) if self.score_ms else np.zeros(0)
+        return web.json_response(dict(
+            self.stats,
+            sessions=self.tracker.n_sessions,
+            active_tips=len(self.tracker.by_tip),
+            tips_evicted=self.tracker.tips_evicted,
+            queued=self.queue.qsize(),
+            model_version=getattr(self.scorer, "model_version", None),
+            device=str(getattr(self.scorer, "dev", "")),
+            score_ms_p50=round(float(np.median(ms)), 2) if len(ms) else None,
+            score_ms_p95=round(float(np.percentile(ms, 95)), 2) if len(ms) else None,
+            online_calib=self.calib.summary() if self.calib is not None else None,
+        ))
 
 
 def main():
@@ -204,8 +334,13 @@ def main():
     ap.add_argument("--engine", default="vllm", choices=sorted(ADAPTERS))
     ap.add_argument("--hint-url", default="http://127.0.0.1:8765/hint")
     ap.add_argument("--ckpt", required=True); ap.add_argument("--calib", required=True)
+    ap.add_argument("--encoder", default=None, help="optional local encoder dir for Layby-Dwell v2")
     ap.add_argument("--device")
+    ap.add_argument("--precision", default=None, choices=["bf16", "fp32", "int8w", "fp8w"])
+    ap.add_argument("--max-len", type=int, default=None)
     ap.add_argument("--batch", type=int, default=32, help="states scored per forward pass at most")
+    ap.add_argument("--coalesce-ms", type=float, default=0.0, help="optional micro-batch coalesce wait in ms")
+    ap.add_argument("--online-calib", action="store_true", help="enable rolling online per-kind temperature calibration")
     a = ap.parse_args()
     logging.basicConfig(level=logging.INFO)
     sc = Sidecar(a)

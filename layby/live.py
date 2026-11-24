@@ -21,8 +21,9 @@ class Live:
         self.tw, self.t, self.t0 = tw, 0.0, None
         self.acc = dict(age_g=0.0, w_g=0.0, age_c=0.0, w_c=0.0, ne_g=0.0, ne_c=0.0, miss_g=0.0, miss_c=0.0,
                         busy_cpu=0.0, busy_disk=0.0, pf=0.0,
-                        n_cpu=0.0, wait_cpu=0.0, n_disk=0.0, wait_disk=0.0, nw=0.0, n_adm=0.0, qwait=0.0,
-                        n_defer=0.0, defer=0.0, n_giveup=0.0, giveup_saved=0.0)
+                        n_cpu=0.0, wait_cpu=0.0, n_disk=0.0, wait_disk=0.0, n_disk_r=0.0, wait_disk_r=0.0, n_disk_w=0.0,
+                        nw=0.0, n_adm=0.0, qwait=0.0,
+                        n_defer=0.0, defer=0.0, n_defer_x=0.0, defer_x=0.0, n_giveup=0.0, giveup_saved=0.0)
         self.km = {k: np.zeros(len(AG) - 1) for k in ("ev_g", "ce_g", "ev_c", "ce_c", "lg", "lc")}
 
     def tick(self, now):
@@ -191,7 +192,10 @@ class Speeds:
 
     def step(self, now, secs, prefill_tokens):
         if prefill_tokens > 0:
-            self._add(now, pt=prefill_tokens, ps=secs, pn=1.0)
+            # only compute-bound prefill steps (past the GPU roofline ridge and well above decode t0)
+            # measure the true linear prefill slope f0; tiny memory-bound or stalled steps distort f0
+            if prefill_tokens >= 256 and secs > 1.5 * self.t0():
+                self._add(now, pt=prefill_tokens, ps=secs, pn=1.0)
         else:
             self._add(now, ds=secs, dn=1.0)
 
@@ -203,6 +207,11 @@ class Speeds:
         if s <= 0 or self.acc.get(f"b_{k}", 0.0) < self.d.get(f"{k}_probe_bytes", 0.0):
             return self.d[f"{k}_gbps"]
         return self.acc[f"b_{k}"] / s / 1e9
+
+    def bps(self, k):
+        """Measured bytes per second on k, with no probe floor and no default: None until k has accounted time."""
+        s = self.acc.get(f"s_{k}", 0.0)
+        return self.acc[f"b_{k}"] / s if s > 0 else None
 
     def t0(self):
         n = self.acc.get("dn", 0.0)
