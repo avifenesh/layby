@@ -276,7 +276,7 @@ class ParkRadixCache(UnifiedRadixCache):
         surv = cp.get("park_surv")
         if surv is None and STATE.port is None:
             return                     # no curve now and none can come later
-        entry = dict(leaf=leaf, tokens=int(up_to), t=STATE.clock)
+        entry = dict(leaf=leaf, ancestors=[n.id for n in self.park_path(leaf)], tokens=int(up_to), t=STATE.clock)
         STATE.entries[key] = entry
         STATE.entries.move_to_end(key)
         if STATE.leader:
@@ -384,6 +384,16 @@ class ParkRadixCache(UnifiedRadixCache):
             node = node.parent
         return out
 
+    def park_entry_path(self, entry):
+        """Deepest surviving path for a finished request entry: falls back from an evicted
+        unbacked output-suffix leaf (split by SGLang 0.5.23 checkpoint_into_tree) to its
+        still-resident prompt ancestors."""
+        for nid in entry.get("ancestors") or (entry["leaf"],):
+            path = self.park_path(nid)
+            if path:
+                return path
+        return []
+
     def park_hashes(self, node):
         """Page hashes of a node (SGLang's storage chain hash); computed and kept on the node when
         storage is off, as the KV events recorder does."""
@@ -448,14 +458,15 @@ def decide_entry(key, entry, surv, now) -> None:
         return
     entry["decided"] = True
     cache = STATE.cache
-    path = cache.park_path(entry["leaf"])
+    path = cache.park_entry_path(entry)
     if not path:
         STATE.counts["gone"] += 1
         STATE.outbox.append((key, None, False))       # every rank drops the entry
         return
     S = interp_surv(np.nan_to_num(np.asarray(surv, float), nan=0.5), TG)
     on_disk = cache.park_on_disk(path) if cache.enable_storage else 0
-    d = decide(S, entry["tokens"], on_disk, STATE.idle_g(now), STATE.idle_c(now), STATE.live,
+    tokens = sum(len(n.key) for n in path) or entry["tokens"]
+    d = decide(S, tokens, on_disk, STATE.idle_g(now), STATE.idle_c(now), STATE.live,
                STATE.params(), now)
     if not cache.enable_storage and d["disk"]:
         d["opt"] = "none" if d["opt"] == "ins" else "drop"     # no disk tier: the same CPU placement
@@ -463,7 +474,7 @@ def decide_entry(key, entry, surv, now) -> None:
     STATE.counts[d["opt"]] += 1
     t_pred = NEVER if d["eta"] < 0 else now + d["eta"]
     STATE.outbox.append((key, t_pred, bool(d["disk"])))
-    STATE.last_decisions.append(dict(opt=d["opt"], eta=round(d["eta"], 2), tokens=entry["tokens"],
+    STATE.last_decisions.append(dict(opt=d["opt"], eta=round(d["eta"], 2), tokens=tokens,
                                      Q=round(d["Q"], 3), price_c=round(d["price_c"], 4)))
     del STATE.last_decisions[:-100]
 
@@ -474,7 +485,7 @@ def apply_placement(key, t_pred, disk) -> None:
     if entry is None or t_pred is None:
         return
     cache = STATE.cache
-    path = cache.park_path(entry["leaf"])
+    path = cache.park_entry_path(entry)
     policy.place(path, t_pred)
     if disk:
         cache.park_write_path(path)

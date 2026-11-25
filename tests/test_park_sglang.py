@@ -542,3 +542,31 @@ def test_park_write_path_defers_unbacked_gpu_nodes_without_forcing_d2h(monkeypat
     cache.park_write_path(path)
     assert parent.id in STATE.disk_ok and child.id in STATE.disk_ok
     assert called == []  # never forces D->H / pins GPU memory outside SGLang's own write policy
+
+
+def test_decide_and_apply_fall_back_to_surviving_prompt_ancestor():
+    from layby.sglang import hooks
+    from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+    cache, alloc = make_cache()
+    a = list(range(400, 448))
+    r1 = insert(cache, alloc, a)
+    insert(cache, alloc, a[:32] + list(range(900, 916)))  # splits into prompt parent (32) + output leaf (16)
+    leaf = r1.last_device_node
+    parent = cache.park_path(leaf)[1].id
+    STATE.port, STATE.server = 1, False
+    req = SimpleNamespace(rid="r-anc", finished=lambda: True,
+                          sampling_params=SimpleNamespace(custom_params={"park_key": "s-anc"}))
+    cache._park_finish(req, 48, [r1])
+    assert STATE.entries["s-anc"]["ancestors"] == [leaf, parent]
+    # Evict the tiny unbacked output leaf (16 tok) while prompt parent (32 tok) remains in tree
+    cache.inc_lock_ref(parent)
+    cache.evict(EvictParams(num_tokens=16))
+    assert cache.park_path(leaf) == [] and len(cache.park_path(parent)) == 1
+    # Late hint arrives after output leaf was evicted -> must NOT hit gone, must place prompt parent!
+    STATE.hints.put(("s-anc", [0.9] * 15))
+    # Unlock parent so policy.place applies to it
+    node_p = cache.tree_core._node_arena[parent]
+    node_p.component_data[ComponentType.FULL].lock_ref = 0
+    tick_roundtrip(hooks)
+    assert STATE.counts["gone"] == 0
+    assert parent in STATE.next_use
