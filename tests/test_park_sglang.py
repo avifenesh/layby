@@ -441,3 +441,87 @@ def test_account_misses_uses_read_only_disk_wait():
     hooks._account_misses(req, now)
     # Loss must reflect ~0.05s read wait (not 25s combined write+read wait)
     assert STATE.live.acc["miss_g"] < 1.0, f"miss_g polluted by write wait: {STATE.live.acc['miss_g']}"
+
+
+def test_dec_lock_ref_and_host_lock_start_idle_after_write_through():
+    cache, alloc = make_cache()
+    r = insert(cache, alloc, list(range(200, 264)))
+    leaf = r.last_device_node
+    # Simulate SGLang 0.5.23 write-through lifecycle: request + write-through both hold lock_ref
+    req_lock = cache.inc_lock_ref(leaf).to_dec_params()
+    cache._park_in_backup = True
+    try:
+        wt_lock = cache.inc_lock_ref(leaf).to_dec_params()
+    finally:
+        cache._park_in_backup = False
+    # Request finishes and unlocks while write-through still holds lock_ref == 1
+    cache.dec_lock_ref(leaf, req_lock)
+    assert leaf not in STATE.g_idle and leaf not in STATE.c_idle
+    # Write-through completes: node becomes backuped, then dec_lock_ref drops lock_ref -> 0
+    node = cache.tree_core._node_arena[leaf]
+    node.component_data[ComponentType.FULL].host_value = torch.zeros(64, dtype=torch.int64)
+    cache._park_cpu_store(node)  # called before dec_lock_ref in SGLang 0.5.23
+    assert leaf not in STATE.c_idle
+    cache.dec_lock_ref(leaf, wt_lock)
+    assert leaf in STATE.g_idle and leaf in STATE.c_idle
+    # A subsequent real request lock ends both idle periods as censored reuses (non-zero age)
+    STATE.g_idle[leaf] = (time.monotonic() - 12.0, 64.0)
+    STATE.c_idle[leaf] = (time.monotonic() - 12.0, 64.0)
+    reuse_lock = cache.inc_lock_ref(leaf).to_dec_params()
+    assert leaf not in STATE.g_idle and leaf not in STATE.c_idle
+    assert STATE.live.km["ce_g"].sum() >= 64.0 and STATE.live.km["ce_c"].sum() >= 64.0
+    # Releasing while host_lock_ref > 0 starts g_idle only; dec_host_lock_ref then starts c_idle
+    host_lock = cache.inc_host_lock_ref(leaf).to_dec_params()
+    cache.dec_lock_ref(leaf, reuse_lock)
+    assert leaf in STATE.g_idle and leaf not in STATE.c_idle
+    cache.dec_host_lock_ref(leaf, host_lock)
+    assert leaf in STATE.c_idle
+    # Internal checkpoint relock must not create fake idle or fake reuse events
+    ce_before = float(STATE.live.km["ce_g"].sum())
+    cache._park_in_checkpoint = True
+    try:
+        lk = cache.inc_lock_ref(leaf).to_dec_params()
+        cache.dec_lock_ref(leaf, lk)
+    finally:
+        cache._park_in_checkpoint = False
+    assert float(STATE.live.km["ce_g"].sum()) == ce_before
+
+
+def test_step_excludes_hicache_load_back_and_overlap_idle_gap(monkeypatch):
+    from layby.sglang import hooks
+    cache, _ = make_cache()
+    now = [100.0]
+    monkeypatch.setattr(hooks.time, "monotonic", lambda: now[0])
+    sched = SimpleNamespace(waiting_queue=[], _sched_idled=False)
+    mk = lambda extend, lens, hci=-1: SimpleNamespace(
+        forward_mode=SimpleNamespace(is_extend=lambda: extend),
+        extend_lens=lens,
+        hicache_consumer_index=hci,
+    )
+    # 1. Pure compute prefill (1000 tok in 0.11s -> f0 ~ 0.00010 s/tok)
+    hooks._step(sched, mk(True, [1000], hci=-1))
+    now[0] += 0.11
+    # 2. Load-back stalled prefill (300 tok, 0.30s PCIe stall, hci=5) -> must NOT pollute f0
+    hooks._step(sched, mk(True, [300], hci=5))
+    f0_clean = STATE.speeds.f0()
+    now[0] += 0.30
+    hooks._step(sched, mk(False, [], hci=-1))
+    assert abs(STATE.speeds.f0() - f0_clean) < 1e-12
+    # 3. 1-tick overlap idle gap (_sched_idled=True) -> must NOT time across idle
+    now[0] += 5.0
+    sched._sched_idled = True
+    hooks._step(sched, mk(False, [], hci=-1))
+    assert STATE.speeds.acc.get("ds", 0.0) < 1.0
+
+
+def test_place_handles_pending_write_through_lock(monkeypatch):
+    ticks((0, 100.0), (20, 120.0))
+    monkeypatch.setattr(policy, "counter", lambda: 21.0)
+    wt_only = Node(10, lock=1)
+    wt_only.write_through_pending_id = 42
+    wt_and_req = Node(10, lock=2)
+    wt_and_req.write_through_pending_id = 42
+    req_only = Node(10, lock=1)
+    assert policy.place([wt_only, wt_and_req, req_only], 180.0) == 1
+    assert STATE.next_use[wt_only.id][0] == 180.0
+    assert wt_and_req.id not in STATE.next_use and req_only.id not in STATE.next_use

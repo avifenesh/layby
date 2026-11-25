@@ -238,10 +238,18 @@ def _step(sched, batch):
         pt = sum(n for n in lens if n > 1)
         npre = sum(1 for n in lens if n > 1)
     _mark(sched, now, npre)
+    # A 1-tick overlap idle gap sets _sched_idled without calling on_idle; never time across it.
+    if getattr(sched, "_sched_idled", False):
+        STATE.step_last = None
+    # Batches with an active H->D HiCache load-back stall forward_stream on PCIe, not compute;
+    # exclude them from Speeds.step so H->D transfer latency does not inflate f0.
+    has_load = getattr(batch, "hicache_consumer_index", -1) >= 0
     if STATE.step_last is not None:
-        t, p_tokens = STATE.step_last
-        STATE.speeds.step(now, now - t, p_tokens)
-    STATE.step_last = (now, pt)
+        t, p_tokens = STATE.step_last[0], STATE.step_last[1]
+        prev_load = STATE.step_last[2] if len(STATE.step_last) >= 3 else False
+        if not prev_load:
+            STATE.speeds.step(now, now - t, p_tokens)
+    STATE.step_last = (now, pt, has_load)
 
 
 def _mark(sched, now, npre):

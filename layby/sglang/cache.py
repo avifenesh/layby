@@ -63,6 +63,8 @@ class _Events:
 class ParkRadixCache(UnifiedRadixCache):
     def __init__(self, params):
         self._park_cap = None
+        self._park_in_checkpoint = False
+        self._park_in_backup = False
         super().__init__(params)
         tc = self.tree_core
         tc.kv_events = _Events(tc.kv_events, self)
@@ -234,20 +236,31 @@ class ParkRadixCache(UnifiedRadixCache):
 
     def insert_req(self, req, *, up_to: int, **kwargs) -> None:
         self._park_cap = []
+        self._park_in_checkpoint = True
         try:
             super().insert_req(req, up_to=up_to, **kwargs)
         finally:
+            self._park_in_checkpoint = False
             cap, self._park_cap = self._park_cap, None
         safe("finish", self._park_finish, req, up_to, cap)
 
     def checkpoint(self, req, *, up_to: int, **kwargs) -> None:
         # SGLang 0.5.23 renamed insert_req -> checkpoint with the same signature.
         self._park_cap = []
+        self._park_in_checkpoint = True
         try:
             super().checkpoint(req, up_to=up_to, **kwargs)
         finally:
+            self._park_in_checkpoint = False
             cap, self._park_cap = self._park_cap, None
         safe("finish", self._park_finish, req, up_to, cap)
+
+    def _execute_and_commit_kv_backup(self, action, write_back: bool = False):
+        self._park_in_backup = True
+        try:
+            return super()._execute_and_commit_kv_backup(action, write_back=write_back)
+        finally:
+            self._park_in_backup = False
 
     def _park_finish(self, req, up_to, cap) -> None:
         if not cap or cap[0] is None or cap[0].last_device_node is None:
@@ -279,11 +292,28 @@ class ParkRadixCache(UnifiedRadixCache):
         leaf = STATE.leaf_of.pop(req.rid, None)
         if leaf is None or not STATE.leader:
             return
+        self._park_maybe_idle(leaf)
+
+    def dec_lock_ref(self, node_id, params, skip_swa: bool = False):
+        out = super().dec_lock_ref(node_id, params, skip_swa)
+        if STATE.leader and not self._park_in_checkpoint:
+            safe("release", self._park_maybe_idle, node_id)
+        return out
+
+    def dec_host_lock_ref(self, node_id, params):
+        out = super().dec_host_lock_ref(node_id, params)
+        if STATE.leader and not self._park_in_checkpoint:
+            safe("release", self._park_maybe_idle, node_id)
+        return out
+
+    def _park_maybe_idle(self, node_id) -> None:
+        """Start GPU/CPU idle periods once the last device or host lock drops (including after
+        async D->H write-through acks and storage backup/prefetch host-lock releases)."""
         now = time.monotonic()
-        for node in self.park_path(leaf):
+        for node in self.park_path(node_id):
             cd = node.component_data[FULL]
             if cd.lock_ref > 0:
-                continue                                 # another running request holds it
+                continue                                 # another request or in-flight D->H holds it
             w = float(len(node.key))
             if not node.evicted and node.id not in STATE.g_idle:
                 STATE.g_idle[node.id] = (now, w)
@@ -292,7 +322,8 @@ class ParkRadixCache(UnifiedRadixCache):
 
     def inc_lock_ref(self, node_id, skip_lock_components=()):
         out = super().inc_lock_ref(node_id, skip_lock_components)
-        if STATE.leader and (STATE.g_idle or STATE.c_idle):
+        if (STATE.leader and not self._park_in_checkpoint and not self._park_in_backup
+                and (STATE.g_idle or STATE.c_idle)):
             safe("reuse", self._park_reuse, node_id)
         return out
 
