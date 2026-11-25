@@ -74,10 +74,12 @@ alive() {   # alive SERVER_PID [SIDECAR_PID]: what died during the replay ("" wh
 }
 for arm in "$@"; do
   storage=""; park=""; client=""; plugins=none; SCP=""
+  wp=${WRITE_POLICY:-write_through}
   case ${arm%%.*} in
     C0) ;;
     T) storage="--hicache-storage-backend file" ;;
     K|K_km|K_ewma) storage="--hicache-storage-backend file"; plugins=park
+       wp=${WRITE_POLICY:-write_through_selective}
        park="--radix-cache-backend park --radix-eviction-policy park --radix-eviction-policy-config {\"port\":$PARK_PORT}"
        case ${arm%%.*} in K_km) hints=km ;; K_ewma) hints=ewma ;; *) hints=${PARK_HINTS:-v6} ;; esac
        client="--park-hints $hints --park-port $PARK_PORT" ;;
@@ -88,7 +90,7 @@ for arm in "$@"; do
   SGLANG_PLUGINS=$plugins SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=$DISK SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE=${DISK_BYTES:-0} setsid ${SERVER_WRAP:-} $VENV/bin/sglang serve \
     --model-path $MODEL --port $PORT --context-length 40960 --max-running-requests 64 \
     --page-size $PAGE --max-total-tokens $TOKENS --enable-metrics \
-    --enable-hierarchical-cache --hicache-ratio $RATIO --hicache-write-policy ${WRITE_POLICY:-write_through} \
+    --enable-hierarchical-cache --hicache-ratio $RATIO --hicache-write-policy $wp \
     $storage $park ${SERVE_ARGS:-} > $O/$arm.server.log 2>&1 &
   SP=$!
   for i in $(seq 1 ${BOOT_WAIT:-180}); do curl -sf localhost:$PORT/health >/dev/null && break; kill -0 $SP 2>/dev/null || break; sleep 5; done

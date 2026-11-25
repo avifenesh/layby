@@ -525,3 +525,25 @@ def test_place_handles_pending_write_through_lock(monkeypatch):
     assert policy.place([wt_only, wt_and_req, req_only], 180.0) == 1
     assert STATE.next_use[wt_only.id][0] == 180.0
     assert wt_and_req.id not in STATE.next_use and req_only.id not in STATE.next_use
+
+
+def test_park_write_path_triggers_selective_d2h_backup(monkeypatch):
+    cache, alloc = make_cache()
+    a = list(range(300, 332))
+    r1 = insert(cache, alloc, a)
+    insert(cache, alloc, a[:16] + list(range(800, 816)))  # splits into parent (16) -> child (16)
+    leaf = r1.last_device_node
+    path = cache.park_path(leaf)
+    assert len(path) == 2
+    child, parent = path[0], path[1]
+    cache.enable_storage = True
+    cache.is_write_back = False
+    backed, started = [], []
+    cache.cache_controller = SimpleNamespace(start_writing=lambda: started.append(True))
+    monkeypatch.setattr(cache, "_execute_and_commit_kv_backup",
+                        lambda action, write_back=False: (backed.extend(action.node_ids), len(action.node_ids))[1])
+    cache.park_write_path(path)
+    # Parent must precede child (HiCache host contiguity), both queued in disk_ok, and start_writing called
+    assert backed == [parent.id, child.id]
+    assert parent.id in STATE.disk_ok and child.id in STATE.disk_ok
+    assert started == [True]
