@@ -424,38 +424,22 @@ class ParkRadixCache(UnifiedRadixCache):
 
     def park_write_path(self, path) -> None:
         """Late writes for an ins or park placement: host copies go to storage now; a node whose host
-        copy is in flight goes on when its write-through ack lands; under write_through_selective an
-        unbacked GPU node is explicitly backed up to host (ancestor-first) so it reaches storage."""
+        copy is not there yet (in-flight write-through, or unbacked 1-hit node under
+        write_through_selective) is marked in disk_ok so it flows to storage once SGLang backs it
+        up, without forcing extra D->H transfers that would pin GPU memory or duplicate 1-hit leaves."""
         if not self.enable_storage:
             return
-        need_backup = []
-        for node in reversed(path):
+        for node in path:
             hv = self.park_hashes(node)
             if hv and all(h in STATE.disk_pages for h in hv):
                 continue
-            if node.write_through_pending_id is not None:
-                STATE.disk_ok.add(node.id)                 # D->H copy is already in flight
+            if node.write_through_pending_id is not None or (not node.backuped and not node.evicted):
+                STATE.disk_ok.add(node.id)                 # the D->H copy is in flight or deferred
             elif node.backuped:
                 self._park_write(node.id)
                 STATE.counts["write_late"] += 1
-            elif not node.evicted:
-                STATE.disk_ok.add(node.id)                 # unbacked GPU node (e.g. write_through_selective)
-                need_backup.append(node.id)
             else:
                 STATE.counts["write_lost"] += 1            # gone from host memory before the decision
-        if need_backup and self.cache_controller is not None and not getattr(self, "is_write_back", False):
-            from sglang.srt.mem_cache.unified_cache.cache_action import BackupKV
-            action = self.tree_core.build_backup_kv_action(need_backup[-1])
-            arena = self.tree_core._node_arena
-            ids = [
-                nid for nid in action.node_ids
-                if (n := arena.get(nid)) is not None
-                and not n.backuped
-                and not n.evicted
-                and n.write_through_pending_id is None
-            ]
-            if ids and self._execute_and_commit_kv_backup(BackupKV(node_ids=ids)):
-                self.cache_controller.start_writing()
 
 
 def decide_entry(key, entry, surv, now) -> None:

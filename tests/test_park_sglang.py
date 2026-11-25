@@ -527,7 +527,7 @@ def test_place_handles_pending_write_through_lock(monkeypatch):
     assert wt_and_req.id not in STATE.next_use and req_only.id not in STATE.next_use
 
 
-def test_park_write_path_triggers_selective_d2h_backup(monkeypatch):
+def test_park_write_path_defers_unbacked_gpu_nodes_without_forcing_d2h(monkeypatch):
     cache, alloc = make_cache()
     a = list(range(300, 332))
     r1 = insert(cache, alloc, a)
@@ -537,13 +537,8 @@ def test_park_write_path_triggers_selective_d2h_backup(monkeypatch):
     assert len(path) == 2
     child, parent = path[0], path[1]
     cache.enable_storage = True
-    cache.is_write_back = False
-    backed, started = [], []
-    cache.cache_controller = SimpleNamespace(start_writing=lambda: started.append(True))
-    monkeypatch.setattr(cache, "_execute_and_commit_kv_backup",
-                        lambda action, write_back=False: (backed.extend(action.node_ids), len(action.node_ids))[1])
+    called = []
+    monkeypatch.setattr(cache, "_execute_and_commit_kv_backup", lambda *a, **k: called.append(True))
     cache.park_write_path(path)
-    # Parent must precede child (HiCache host contiguity), both queued in disk_ok, and start_writing called
-    assert backed == [parent.id, child.id]
     assert parent.id in STATE.disk_ok and child.id in STATE.disk_ok
-    assert started == [True]
+    assert called == []  # never forces D->H / pins GPU memory outside SGLang's own write policy
