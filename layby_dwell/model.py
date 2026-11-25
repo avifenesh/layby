@@ -39,12 +39,13 @@ def _quantize(model, precision):
 
 
 class Dwell:
-    def __init__(self, path=None, device=None, precision=None, batch_size=32, encoder_path=None):
-        """path: a local copy of a Layby-Dwell v2 (zero-laya) or v1 (Laya) model directory;
-        None downloads REPO from the Hugging Face Hub."""
+    def __init__(self, path=None, device=None, precision=None, batch_size=32, encoder_path=None, revision=None):
+        """path: a local copy of a Layby-Dwell v2 (zero-laya) or v1 (Laya) model directory, or a
+        Hugging Face repo id; None downloads REPO from the Hugging Face Hub.
+        revision: optional git branch/tag/commit on the Hub (e.g. "v1" for legacy 421M v1 weights)."""
         if path is None or not os.path.isdir(path):
             from huggingface_hub import snapshot_download
-            path = snapshot_download(path or REPO)
+            path = snapshot_download(path or REPO, revision=revision)
         cfg = json.load(open(os.path.join(path, "config.json")))
         if is_v2_config(cfg):
             self._v2 = DwellV2(path, device=device, precision=precision, batch_size=batch_size,

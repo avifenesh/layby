@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from safetensors.torch import load_file
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoConfig, AutoModel, AutoTokenizer
 
 EDGES = [0.5, 1, 2, 3, 5, 8, 12, 20, 30, 45, 60, 120, 300, 600, 1800]
 K = len(EDGES) + 1
@@ -284,6 +284,7 @@ class LaybyDwellV2(nn.Module):
         aux_prefix: bool = False,
         attn_implementation: str = "sdpa",
         dtype=torch.float32,
+        load_pretrained_encoder: bool = True,
     ):
         super().__init__()
         self.mode = mode
@@ -296,9 +297,16 @@ class LaybyDwellV2(nn.Module):
         if mode in ("two_tower", "text_only"):
             if encoder_path is None:
                 raise ValueError("encoder_path is required for two_tower and text_only modes")
-            self.encoder = AutoModel.from_pretrained(
-                encoder_path, dtype=dtype, attn_implementation=attn_implementation
-            )
+            if load_pretrained_encoder:
+                self.encoder = AutoModel.from_pretrained(
+                    encoder_path, dtype=dtype, attn_implementation=attn_implementation
+                )
+            else:
+                enc_cfg = AutoConfig.from_pretrained(encoder_path)
+                enc_cfg._attn_implementation = attn_implementation
+                self.encoder = AutoModel.from_config(enc_cfg)
+                if dtype is not None:
+                    self.encoder = self.encoder.to(dtype=dtype)
             d_enc = self.encoder.config.hidden_size
             self.layer_mix = LayerMix(n_layers=min(4, self.encoder.config.num_hidden_layers)) if arch == "v2_gated" else None
             self.pool = AttentionPool(d_enc)
@@ -492,7 +500,7 @@ class DwellV2:
             self.tok = None
             self.pad_id = 0
 
-        aux_prefix = bool(args.get("aux_prefix_weight", 0.0) > 0)
+        aux_prefix = bool(args.get("aux_prefix_weight", 0.0) > 0 or d.get("aux_prefix", False))
         m = LaybyDwellV2(
             encoder_path=enc_path,
             mode=self.mode,
@@ -501,6 +509,7 @@ class DwellV2:
             aux_prefix=aux_prefix,
             attn_implementation="sdpa",
             dtype=torch.float32,
+            load_pretrained_encoder=False,
         )
         m.load_state_dict(load_file(ckpt), strict=True)
         m.eval()

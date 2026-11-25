@@ -138,9 +138,81 @@ def test_dwell_v2_real_checkpoint_zero_laya():
     assert np.allclose(S, S2, atol=1e-5)
 
 
+def test_dwell_v2_config_only_hf_bundle():
+    """Verify a self-contained HF bundle (encoder/config.json only, sanitized config.json) loads offline with exact parity."""
+    import shutil
+    import tempfile
+
+    ckpt_dir = None
+    for cand in (
+        os.path.expanduser("~/layby-data/runs/rung4_32m_all_corpora"),
+        "/mnt/Data/layby-data/runs/rung4_32m_all_corpora",
+    ):
+        if os.path.isdir(cand) and os.path.exists(os.path.join(cand, "best.safetensors")):
+            ckpt_dir = cand
+            break
+    if ckpt_dir is None:
+        print("skipping HF bundle test (rung4_32m_all_corpora not on this host)")
+        return
+
+    src_cfg = json.load(open(os.path.join(ckpt_dir, "config.json")))
+    enc_src = src_cfg["args"]["encoder"]
+    if not os.path.isdir(enc_src):
+        enc_src = "/mnt/Data/layby-data/models/ettin-encoder-32m"
+
+    with tempfile.TemporaryDirectory(prefix="layby_hf_bundle_") as td:
+        os.makedirs(os.path.join(td, "encoder"))
+        os.makedirs(os.path.join(td, "tokenizer"))
+        os.symlink(os.path.join(ckpt_dir, "best.safetensors"), os.path.join(td, "model.safetensors"))
+        shutil.copy2(os.path.join(enc_src, "config.json"), os.path.join(td, "encoder", "config.json"))
+        for tf in ("tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"):
+            p = os.path.join(enc_src, tf)
+            if os.path.exists(p):
+                shutil.copy2(p, os.path.join(td, "tokenizer", tf))
+        clean_cfg = {
+            "model_version": 2,
+            "arch": src_cfg["args"]["arch"],
+            "mode": src_cfg["args"]["mode"],
+            "max_len": src_cfg["args"]["max_len"],
+            "aux_prefix": False,
+            "base_encoder": "jhu-clsp/ettin-encoder-32m",
+            "encoder": "encoder",
+            "edges": src_cfg["edges"],
+            "num_cols": src_cfg["num_cols"],
+            "num_mean": src_cfg["num_mean"],
+            "num_std": src_cfg["num_std"],
+            "temperature": src_cfg["temperature"],
+            "layer_mix_weights": src_cfg["layer_mix_weights"],
+        }
+        with open(os.path.join(td, "config.json"), "w") as f:
+            json.dump(clean_cfg, f, indent=2)
+
+        old_offline = os.environ.get("HF_HUB_OFFLINE")
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        try:
+            dw_bundle = Dwell(td, device="cpu", precision="fp32")
+            dw_ref = Dwell(ckpt_dir, device="cpu", precision="fp32")
+        finally:
+            if old_offline is None:
+                os.environ.pop("HF_HUB_OFFLINE", None)
+            else:
+                os.environ["HF_HUB_OFFLINE"] = old_offline
+
+        states = [
+            json.dumps({"kind": "tool", "tool": "Bash", "program": "pytest", "ctx_tokens": 12000, "turn": 3,
+                        "tool_call": 'Bash {"command": "pytest -q"}', "assistant": "Running tests."}),
+            json.dumps({"kind": "human", "ctx_tokens": 24000, "turn": 5,
+                        "assistant": "Finished the PR, ready for review.", "user": "Open the PR."}),
+        ]
+        S_bundle = dw_bundle.survival(states)
+        S_ref = dw_ref.survival(states, ["tool", "human"])
+        assert np.allclose(S_bundle, S_ref, atol=1e-6), f"bundle mismatch: max diff {np.max(np.abs(S_bundle - S_ref))}"
+
+
 if __name__ == "__main__":
     test_state_to_v2_features()
     test_tracker_bounded_lru_and_return_tracking()
     test_online_calib()
     test_dwell_v2_real_checkpoint_zero_laya()
+    test_dwell_v2_config_only_hf_bundle()
     print("dwell v2 & sidecar tests ok (zero laya dependency verified)")
