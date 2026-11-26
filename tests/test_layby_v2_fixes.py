@@ -852,6 +852,20 @@ def test_wave6_general_streaming_cumulative_defer_prefetch_and_io_timing():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_nightly_iteration_details_fallback():
+    """vLLM nightly (>=0.34.0rc1) fallback reads iteration_details or computes ctx counts from SchedulerOutput."""
+    direct = NS(num_ctx_requests=3, num_ctx_tokens=4096)
+    got_direct = C._fallback_iteration_details(NS(iteration_details=direct))
+    assert got_direct is direct
+    sched_out = NS(
+        num_scheduled_tokens={"new1": 1024, "new2": 512, "chunked": 256, "decode": 1},
+        scheduled_new_reqs=[NS(req_id="new1"), NS(req_id="new2")],
+        scheduled_cached_reqs=NS(req_ids=["chunked", "decode"]),
+    )
+    got = C._fallback_iteration_details(sched_out)
+    assert got.num_ctx_requests == 3 and got.num_ctx_tokens == 1792, f"unexpected fallback counts: {got}"
+
+
 if __name__ == "__main__":
     test_bug_b_token_proportional_defer_and_ghost_decay()
     test_bug_a_hybrid_on_disk_no_overcount()
@@ -863,4 +877,5 @@ if __name__ == "__main__":
     test_wave3_pending_hint_ins_protection_thru_and_ready()
     test_wave4_no_disk_gpu_blk_roofline_f0_running_protect_and_backpressure()
     test_wave6_general_streaming_cumulative_defer_prefetch_and_io_timing()
-    print("layby v2 engine fixes ok: wave1-wave6 all verified")
+    test_nightly_iteration_details_fallback()
+    print("layby v2 engine fixes ok: wave1-wave6 + nightly fallback all verified")

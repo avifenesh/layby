@@ -3,6 +3,15 @@
 Newest first. Paper versions map to tags: arXiv v1 maps to `v1.0.0`, and Layby v2 maps to `v2.0`. The archive DOI is
 copied here, into `CITATION.cff` and into the README once a tag is archived.
 
+## 2.1.0 (2026-11-26)
+
+- **vLLM nightly (`>=0.34.0rc1`) compatibility (`layby/vllm/connector.py`):** added `_fallback_iteration_details` fallback when `vllm.v1.utils.compute_iteration_details` is absent on vLLM nightly (reads `SchedulerOutput.iteration_details` or derives context request/token counts from scheduled new and chunked cached requests), covered by `test_nightly_iteration_details_fallback` in `tests/test_layby_v2_fixes.py`.
+- **Arm runner sidecar forwarding (`engine/run_arms.sh`, `engine/run_arms_sglang.sh`):** forward `${SIDECAR_EXTRA:-}` to `layby.sidecar.proxy` so `--online-calib` runs directly from the benchmark harness.
+- **Cross-hardware, Online Calibration, and ablation results (`README.md`):**
+  - **4 hardware tiers & 5 model families:** added 1x RTX PRO 6000 (`1.91 s` vs `3.98 s` no-disk), 1x RTX 5090 Laptop 24 GB (`23.75 s` vs `39.24 s` no-disk, `2.57x` better p99 than write-through), and NVIDIA DGX Spark GB10 ARM64 serving Thinking Machines Lab's `Inkling 2 Mini` (26.4B looped SWA MoE NVFP4 on vLLM nightly: `7.77 s` Online Calib, `8.56 s` static, `6.18 s` write-through on native `8.3 GB/s` NVMe, `18.54 s` frequency-gated, `23.10 s` no-disk).
+  - **Zero-gap Blackwell Online Calibration matrix:** closed `Qwen3.8-27B` fast NVMe to `#1` overall mean (`1.74 s` vs `1.83 s` write-through) and `Gemma-4-31B` slow disk mean (`24.35 s` vs `24.80 s` no-disk), and completed TP=4 `GLM-5.3-Flash` (`24.40 s` held-out / `33.03 s` dev).
+  - **Complete ablations:** 9-run `Layby-Dwell v2` architecture/objective/multi-seed ladder, 8-arm fast-NVMe real-engine component decomposition, and 6-policy slow-disk neural vs. EWMA/Kaplan-Meier ladder (`2.04 s` neural vs `2.23 s` KM and `2.33 s` EWMA, all `0.0 GB` written).
+
 ## 2.0.0 (2026-11-25)
 
 Model weights: [Avifenesh/layby-dwell](https://huggingface.co/Avifenesh/layby-dwell) (`v2.0` on `main`; legacy 421M

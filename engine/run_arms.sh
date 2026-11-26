@@ -181,7 +181,7 @@ for arm in "$@"; do
     SCPORT=${SIDECAR_PORT:-$((PARK_PORT + 1))}
     setsid ${SERVER_WRAP:-} $VENV/bin/python -m layby.sidecar.proxy --upstream http://127.0.0.1:$PORT --listen $SCPORT \
       --engine vllm --hint-url http://127.0.0.1:$PARK_PORT/hint --ckpt "$SIDECAR_CKPT" --calib "$SIDECAR_CALIB" \
-      ${SIDECAR_DEVICE:+--device $SIDECAR_DEVICE} ${SIDECAR_ENCODER:+--encoder $SIDECAR_ENCODER} > $O/$arm.sidecar.log 2>&1 &
+      ${SIDECAR_DEVICE:+--device $SIDECAR_DEVICE} ${SIDECAR_ENCODER:+--encoder $SIDECAR_ENCODER} ${SIDECAR_EXTRA:-} > $O/$arm.sidecar.log 2>&1 &
     SCP=$!
     # shellcheck disable=SC2064  # the trap takes this arm's process groups now
     trap "kill -9 -- -$SP ${LMP:+-$LMP} -$SCP 2>/dev/null" EXIT INT TERM

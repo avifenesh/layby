@@ -50,7 +50,32 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_utils import get_block_hash
 from vllm.v1.kv_offload.base import LookupResult
-from vllm.v1.utils import compute_iteration_details
+from types import SimpleNamespace
+
+
+def _fallback_iteration_details(scheduler_output):
+    """Fallback for vLLM nightly (>=0.34.0rc1) where compute_iteration_details moved onto SchedulerOutput."""
+    det = getattr(scheduler_output, "iteration_details", None)
+    if det is not None:
+        return det
+    ntok = getattr(scheduler_output, "num_scheduled_tokens", {}) or {}
+    new_reqs = getattr(scheduler_output, "scheduled_new_reqs", ()) or ()
+    ctx_reqs = len(new_reqs)
+    ctx_toks = sum(ntok.get(r.req_id, 0) for r in new_reqs)
+    cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
+    if cached is not None:
+        for rid in getattr(cached, "req_ids", ()) or ():
+            t = ntok.get(rid, 0)
+            if t > 1:
+                ctx_reqs += 1
+                ctx_toks += t
+    return SimpleNamespace(num_ctx_requests=ctx_reqs, num_ctx_tokens=ctx_toks)
+
+
+try:
+    from vllm.v1.utils import compute_iteration_details
+except ImportError:
+    compute_iteration_details = _fallback_iteration_details
 
 from layby.rule import TG, decide, interp_surv, recompute_cost
 from layby.vllm import server
