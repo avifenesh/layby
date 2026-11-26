@@ -30,7 +30,7 @@ authors:
     given-names: "Avi"
 preferred-citation:
   type: misc
-  title: "Layby: placing idle LLM sessions' KV cache by when they come back"
+  title: "Layby: Placing Idle KV Cache by Predicted Return Time and Measured Cost"
   authors:
     - family-names: "Fenesh"
       given-names: "Avi"

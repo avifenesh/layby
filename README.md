@@ -5,7 +5,7 @@ disk, or nowhere. Agent and chat sessions go idle between turns for seconds to m
 recomputing it on return is what makes the next turn slow.
 
 Model: [Avifenesh/layby-dwell](https://huggingface.co/Avifenesh/layby-dwell) on Hugging Face (`v2.0` on `main`; legacy `v1.0` archived at branch `v1`). Paper: arXiv, link to
-follow. Author: [Avi Fenesh](https://github.com/avifenesh), [Tiyuvta](https://tiyuvta.ai).
+follow. Author: [Avi Fenesh](https://github.com/avifenesh).
 
 Layby has four parts:
 
@@ -412,7 +412,7 @@ tests/          CPU tests (vLLM 0.30/0.31/0.34, SGLang 0.5.21/0.5.23, Layby-Dwel
 
 ## Citation
 
-The paper is "Layby: placing idle LLM sessions' KV cache by when they come back" (2026; arXiv id to follow).
+The paper is "Layby: Placing Idle KV Cache by Predicted Return Time and Measured Cost" (2026; arXiv id to follow).
 `CITATION.cff` at the repository root carries the same entry for GitHub and Zenodo. The code is archived on
 Zenodo: [10.5281/zenodo.23285213](https://doi.org/10.5281/zenodo.23285213) (all versions; v1.0.0 is
 [10.5281/zenodo.23285214](https://doi.org/10.5281/zenodo.23285214)). The Layby-Dwell model is
@@ -420,7 +420,7 @@ Zenodo: [10.5281/zenodo.23285213](https://doi.org/10.5281/zenodo.23285213) (all 
 
 ```bibtex
 @misc{fenesh2026layby,
-  title  = {Layby: placing idle LLM sessions' KV cache by when they come back},
+  title  = {Layby: Placing Idle KV Cache by Predicted Return Time and Measured Cost},
   author = {Avi Fenesh},
   year   = {2026},
   note   = {arXiv id to follow}

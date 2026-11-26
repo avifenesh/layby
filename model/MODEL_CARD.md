@@ -22,9 +22,9 @@ Layby-Dwell predicts how long an LLM session stays idle after a response ends. I
 serving engine can see at that moment and returns a calibrated survival curve: the probability that
 the session's next request has not arrived yet, at 15 horizons from 0.5 s to 30 min.
 
-Code, engine adapters and the ReturnBench benchmark: [github.com/avifenesh/layby](https://github.com/avifenesh/layby), archived on Zenodo as
+Code, engine adapters and the ReturnBench benchmark: [github.com/avifenesh/layby](https://github.com/avifenesh/layby) (`v2.1.0`), archived on Zenodo as
 [10.5281/zenodo.23285213](https://doi.org/10.5281/zenodo.23285213).
-Paper: arXiv, link to follow. Author: [Avi Fenesh](https://github.com/avifenesh), [Tiyuvta](https://tiyuvta.ai).
+Paper: arXiv, link to follow. Author: [Avi Fenesh](https://github.com/avifenesh).
 
 It exists for one decision: where to keep the session's KV cache while it waits. Keep it on the GPU,
 move it to CPU memory, write it to disk, or let it go. Layby, the placement rule it was built for,
@@ -108,9 +108,9 @@ Score at the end of each response, off the critical path. Batch the boundaries t
 The Layby adapters run the placement rule inside the engine and take the curve as a hint keyed by
 request:
 
-- **vLLM 0.30, 0.31, and 0.34:** `ParkConnector` (`layby.vllm.connector`, an `OffloadingConnector`
-  subclass) with `ParkCachePolicy` (`layby.vllm.policy`) and `ParkFsTier` (`layby.vllm.fs_tier`),
-  configured through `--kv-transfer-config`.
+- **vLLM 0.30, 0.31, 0.34, and nightly (`>=0.34.0rc1`):** `ParkConnector` (`layby.vllm.connector`, an
+  `OffloadingConnector` subclass) with `ParkCachePolicy` (`layby.vllm.policy`) and `ParkFsTier`
+  (`layby.vllm.fs_tier`), configured through `--kv-transfer-config`.
 - **SGLang 0.5.21 and 0.5.23:** the `park` plugin (`layby.sglang`, `SGLANG_PLUGINS=park`,
   `--radix-cache-backend park --radix-eviction-policy park`) on HiCache with a file storage backend.
 
@@ -162,30 +162,48 @@ All `v2` offline metrics below are 3-seed medians on strictly untouched evaluati
 | Untouched BurstGPT v2 `eval_ood` (`n=20,000`) | 2.1235 (`ece60` 0.0405) | **2.0871 (`ece60` 0.0148)** | **-0.0364 NLL, 2.7x lower 60s ECE** |
 | AgentX 390-session replay (`0.5 GB/s`) | 1.012 (wt: 1.158) | **1.004** | Eliminates write-through blow-up |
 
+### Architecture & objective ablations (`eval_uhold`, 184,148 unseen-user turns + 33 ReturnBench cells)
+
+One-epoch ablations on the same 3.24M-row corpus confirm every architectural module (`aux=0.10` is 3-seed median):
+
+| Model variant | Params | All NLL | Tool NLL | Human NLL | Human `ECE@300s` | `wait_poll` NLL | RB p95 (worst) | RB `@0.5` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **Layby-Dwell v2 (`aux=0`, published)** | **33.8M** | **1.5862** | **1.6046** | 1.4375 | 0.0104 | **1.8843** | 0.660 (1.039) | 0.817 |
+| Joint-Prefix (`aux=0.10`, 3 seeds) | 33.8M | 1.6068 | 1.6282 | 1.4338 | 0.0115 | 2.2126 | 0.659 (1.039) | 0.815 |
+| Stronger Aux (`aux=0.25`) | 33.8M | 1.6027 | 1.6233 | 1.4359 | 0.0115 | 2.0448 | 0.657 (1.039) | 0.817 |
+| Long-Tail Upweight (`2x >60s`) | 33.8M | 1.6006 | 1.6214 | 1.4326 | 0.0128 | 2.3348 | 0.660 (1.073) | **0.806** |
+| Compact 18.5M (`Ettin-17M`) | 18.5M | 1.5930 | 1.6129 | **1.4318** | **0.0093** | 2.3914 | 0.659 (1.067) | 0.818 |
+| Plain Concat (no `LayerMix` / gate) | 32.1M | 1.6435 | 1.6664 | 1.4577 | 0.0202 | 2.2865 | 0.661 (1.084) | 0.819 |
+| Tabular Telemetry Only (no text) | 1.4M | 1.6684 | 1.6906 | 1.4888 | 0.0323 | 1.8861 | 0.667 (1.061) | 0.828 |
+| Text Encoder Only (no telemetry) | 32.5M | 2.1852 | 2.2540 | 1.6288 | 0.0514 | 2.6953 | 0.678 (1.324) | 0.873 |
+
 ### Real-engine serving (CPU sidecar, 0 MiB GPU VRAM)
 
-Running this exact checkpoint (`rung4_32m_all_corpora`, seed 0) on CPU in front of real serving engines
-on NVIDIA RTX PRO 6000 Blackwell GPUs (0 hint errors across >8,000 live turns, 10.6-19.4 ms p50 CPU
-scoring latency, 0 MiB extra GPU VRAM):
+Running this exact checkpoint (`rung4_32m_all_corpora`, seed 0) on host CPU across 4 hardware tiers and 5 model families (`O_DIRECT` / `fadvise`, 0 hint errors across >8,000 live turns, 0 MiB extra GPU VRAM):
 
-- **vLLM 0.34.0, untouched held-out `GLM-5.3-Flash` 320B MoE TP=4 (`seed=2027`, 128K-190K ctx, 398 turns):**
-  `19.52 s` mean TTFT (`48.92 s` p95), **4.69x faster mean** than `no-disk` (`91.57 s`), **2.16x
-  faster** than `LMCache 0.5.7.post1 ARC` (`42.23 s`, with 31.7% less disk and 3.5 GiB less VRAM),
-  **2.17x faster** than `freq-gated` (`42.31 s`), and **8.60x faster** than `Continuum` (`167.91 s`).
-- **SGLang 0.5.23 + HiCache (`Qwen/Qwen3-8B` bf16, Gen4 NVMe `2.0 GB/s` KV-pressure, 366 turns):**
-  beats `hicache-selective` across every metric across both repeats (`3.27-3.40 s` mean vs `3.60 s`,
-  `-10.7%` r1 p95, lower recompute and disk) and auto-suppresses disk writes (`0.0 GB`) on `141 MB/s`
-  slow disk.
+- **4x RTX PRO 6000 Blackwell, vLLM 0.34.0, untouched held-out `GLM-5.3-Flash` 320B MoE TP=4 (`seed=2027`, 128K-190K ctx, 398 turns, `12.5 GB/s` NVMe):**
+  `19.52 s` mean TTFT (`48.92 s` p95), **4.69x faster mean** than `no-disk` (`91.57 s`), **2.16x faster** than `LMCache 0.5.7.post1 ARC` (`42.23 s`, with 31.7% less disk and 3.5 GiB less VRAM), **2.17x faster** than `freq-gated` (`42.31 s`), and **8.60x faster** than `Continuum` (`167.91 s`).
+- **1x RTX PRO 6000 Blackwell (`96 GB`), vLLM 0.34.0 with `--online-calib`:**
+  - `Qwen3-8B` BF16 (`2.0 GB/s`): `#1` across every metric at **`1.91 s` mean / `8.96 s` p95 / `14.24 s` p99** vs `3.98 s` `no-disk` (**2.08x**), `3.17 s` `LMCache ARC`, and `3.04 s` `write-through` (`35.38 s` p99 / `139.07 s` max).
+  - `Qwen3.8-27B` FP8 (`1.31 GB/s`): `#1` overall mean (**`1.74 s`** vs `1.83 s` `write-through`, `2.43 s` `no-disk`); `Gemma-4-31B` FP8 (`1.35 GB/s`): `#1` mean and p95 (**`3.69 s` / `17.58 s`** vs `3.85 s` / `18.88 s` `write-through`); `Gemma-4-31B` slow disk (`146 MB/s`): beats `no-disk` on both mean and p95 (**`24.35 s` / `80.45 s`** vs `24.80 s` / `82.20 s`, while `LMCache` timed out at `190.2 s` p95).
+- **1x RTX 5090 Laptop (`24 GB`), vLLM 0.34.0 (`Qwen3-8B` BF16, `2.0 GB/s`):**
+  `--online-calib` leads mean and all tails at **`23.75 s` mean / `95.51 s` p95 / `105.87 s` p99 / `117.97 s` max** vs `39.24 s` `no-disk` (**1.65x**), `35.03 s` `LMCache ARC` (**1.47x**), and `31.03 s` `write-through` (`272.0 s` p99 / `490.7 s` max).
+- **NVIDIA DGX Spark GB10 ARM64 (`121 GiB`), vLLM nightly `0.34.0rc1` (`Inkling 2 Mini` 26.4B looped SWA MoE NVFP4, native `8.3 GB/s` NVMe):**
+  Runs natively on ARM64 CPU (`117 ms` median, 0 MiB VRAM). `--online-calib` reaches **`7.77 s` mean** (**2.97x faster** than `no-disk` `23.10 s`, **2.39x faster** than `freq-gated` `18.54 s`), while `LMCache 0.5.7.post1` failed to import on vLLM nightly; `write-through` led mean (`6.18 s`) due to single-stride overestimation of Inkling 2's compact hybrid-SWA KV.
+- **Slow-disk neural vs. heuristic ladder (`141 MB/s`, `Qwen3-8B`, `0.0 GB` written by Layby/no-disk):**
+  Monotonic latency drop purely via CPU eviction order: `no-disk` (`2.98 s` mean / `17.23 s` p99) -> EWMA (`2.33 s` / `15.55 s`) -> Kaplan-Meier (`2.23 s` / `14.55 s`) -> static neural (`2.07 s` / `14.23 s`) -> neural `--online-calib` (**`2.04 s` / `12.90 s`**, **12.4% faster mean and 17.0% faster p99 than EWMA**). Stock `write-through` collapses to `10.53 s` mean / `274.3 s` p99 (`77.2 GB` written).
+- **SGLang 0.5.23 + HiCache (`Qwen3-8B` BF16, 366 turns):**
+  Beats `hicache-selective` across every metric at `2.0 GB/s` (`3.27-3.40 s` vs `3.60 s`), cuts disk writes `15-26%` at `1.31 GB/s`, and auto-suppresses disk writes (`0.0 GB`) on `141 MB/s` slow disk while `hicache-write-back` OOM-crashes at turn 21.
 
-Full real-hardware tables across `GLM-5.3-Flash`, `Gemma-4-31B`, `Qwen3.8-27B`, and `Qwen3-8B` are
-in the [Layby repository README](https://github.com/avifenesh/layby).
+Full real-hardware tables across all hardware tiers and model families are in the [Layby repository README](https://github.com/avifenesh/layby).
 
 ## Speed
 
 | device | precision | one state (`bs=1`) | batch of 8 | VRAM |
 |---|---|---|---|---|
-| CPU, 8 threads (`L = 128 / 256 / 512`) | fp32 | **20.9 / 24.3 / 29.8 ms** | | **0 MB** |
-| CPU, live sidecar (64-vCPU host, mixed lengths) | fp32 | **10.6 to 19.4 ms p50** | | **0 MB** |
+| CPU x86, 8 threads (`L = 128 / 256 / 512`) | fp32 | **20.9 / 24.3 / 29.8 ms** | | **0 MB** |
+| CPU x86, live sidecar (64-vCPU host, mixed lengths) | fp32 | **10.6 to 19.4 ms p50** | | **0 MB** |
+| CPU ARM64, live sidecar (DGX Spark GB10) | fp32 | **117 ms p50** | | **0 MB** |
 | RTX 5090 (`L = 256 / 1536`, PyTorch `sdpa`) | bf16 | **4.07 / 4.26 ms** | **1,960 / 488 st/s** (`L=256/1024`) | **427 MB** |
 
 Unlike `v1` (1.7-2.9 s on CPU, GPU-required), `v2` is fast enough to run directly on CPU inside the
@@ -216,7 +234,7 @@ Apache-2.0, matching the base [jhu-clsp/ettin-encoder-32m](https://huggingface.c
 
 ```bibtex
 @misc{fenesh2026layby,
-  title  = {Layby: placing idle LLM sessions' KV cache by when they come back},
+  title  = {Layby: Placing Idle KV Cache by Predicted Return Time and Measured Cost},
   author = {Avi Fenesh},
   year   = {2026},
   note   = {arXiv id to follow}
