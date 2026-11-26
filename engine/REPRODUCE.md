@@ -31,7 +31,8 @@ paper (the author's own sessions) is not shipped.
 
 The runs below were made at tag `v1.0.0`, whose `replay.py --window` stopped every session at the window (`WINDOW`).
 Check out `v1.0.0` to rerun them as published. Later commits run every session to completion under `--hard-cap`
-(`HARD_CAP` in the scripts), with unserved turns censored, and analyze with `engine/analyze_phase_r.py`.
+(`HARD_CAP` in the scripts), with unserved turns censored, and analyze with `engine/analyze_phase_r.py` or
+`engine/analyze_arms.py` (`--all-turns --pct linear` for Tables 1, 2, 4; `--pct nearest` for Tables 3, 6, 7).
 
 Paths. Every script takes its locations from environment variables and falls back to the values the rounds used:
 `LAYBY_ROOT` (this repo; default the checkout the script lives in), `REPLAY` (the workload file; default

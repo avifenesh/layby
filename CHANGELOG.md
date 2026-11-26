@@ -3,14 +3,18 @@
 Newest first. Paper versions map to tags: arXiv v1 maps to `v1.0.0`, and Layby v2 maps to `v2.0`. The archive DOI is
 copied here, into `CITATION.cff` and into the README once a tag is archived.
 
+## 2.1.1 (2026-11-26)
+
+- **Paper-reproducibility artifacts (`data/`, `figs.py`, release asset `layby.pdf`):** added `data/v2_results.json`, `data/returnbench_v2_s0.json`, `data/ablation_rows.jsonl`, `data/baselines_rows.jsonl`, and `figs.py` (with repository-relative path resolution) so every paper table and figure regenerates directly from the release. Attached `layby.pdf` to the GitHub release.
+- **Audit-verified reporting (`README.md`, `model/MODEL_CARD.md`, `data/v2_results.json`):** removed the invalid `layby+calib` benchmark comparison after verifying `engine/replay.py` calls `/park/score` (not `/v1/chat/completions`), leaving `OnlineCalib` untouched (`boundaries = 0`, bit-identical curves). Pooled identical repeats honestly as multi-repeat `layby` averages alongside repeat spreads, aligned all-turn linear vs. resumed-turn nearest-rank table conventions, aligned ReturnBench Table 8 / Fig. 7 / Table 12 to published 33.8M v2 curves (`data/returnbench_v2_s0.json`), aligned full `eval_uhold` (`n=184,148`) ablations, and scoped CPU latencies across server, ARM64, laptop, and isolated 8-thread runs.
+- **Online calibration bin-edge parity (`layby/sidecar/proxy.py`, `tests/test_dwell_v2_sidecar.py`):** fixed `np.searchsorted(E2, gap, side="left")` in `OnlineCalib.observe_return()` to match training bin boundaries.
+- **Analyzer CLI options (`engine/analyze_arms.py`):** added `--all-turns` and `--pct {linear,nearest}` flags so both all-turn linear and resumed-turn nearest-rank table conventions reproduce directly from raw JSONL logs.
+
 ## 2.1.0 (2026-11-26)
 
 - **vLLM nightly (`>=0.34.0rc1`) compatibility (`layby/vllm/connector.py`):** added `_fallback_iteration_details` fallback when `vllm.v1.utils.compute_iteration_details` is absent on vLLM nightly (reads `SchedulerOutput.iteration_details` or derives context request/token counts from scheduled new and chunked cached requests), covered by `test_nightly_iteration_details_fallback` in `tests/test_layby_v2_fixes.py`.
-- **Arm runner sidecar forwarding (`engine/run_arms.sh`, `engine/run_arms_sglang.sh`):** forward `${SIDECAR_EXTRA:-}` to `layby.sidecar.proxy` so `--online-calib` runs directly from the benchmark harness.
-- **Cross-hardware, Online Calibration, and ablation results (`README.md`):**
-  - **4 hardware tiers & 5 model families:** added 1x RTX PRO 6000 (`1.91 s` vs `3.98 s` no-disk), 1x RTX 5090 Laptop 24 GB (`23.75 s` vs `39.24 s` no-disk, `2.57x` better p99 than write-through), and NVIDIA DGX Spark GB10 ARM64 serving Thinking Machines Lab's `Inkling 2 Mini` (26.4B looped SWA MoE NVFP4 on vLLM nightly: `7.77 s` Online Calib, `8.56 s` static, `6.18 s` write-through on native `8.3 GB/s` NVMe, `18.54 s` frequency-gated, `23.10 s` no-disk).
-  - **Zero-gap Blackwell Online Calibration matrix:** closed `Qwen3.8-27B` fast NVMe to `#1` overall mean (`1.74 s` vs `1.83 s` write-through) and `Gemma-4-31B` slow disk mean (`24.35 s` vs `24.80 s` no-disk), and completed TP=4 `GLM-5.3-Flash` (`24.40 s` held-out / `33.03 s` dev).
-  - **Complete ablations:** 9-run `Layby-Dwell v2` architecture/objective/multi-seed ladder, 8-arm fast-NVMe real-engine component decomposition, and 6-policy slow-disk neural vs. EWMA/Kaplan-Meier ladder (`2.04 s` neural vs `2.23 s` KM and `2.33 s` EWMA, all `0.0 GB` written).
+- **Arm runner sidecar forwarding (`engine/run_arms.sh`, `engine/run_arms_sglang.sh`):** forward `${SIDECAR_EXTRA:-}` to `layby.sidecar.proxy`.
+- **Cross-hardware and ablation evaluations:** added 1x RTX PRO 6000, 1x RTX 5090 Laptop 24 GB, and NVIDIA DGX Spark GB10 ARM64 (`Inkling 2 Mini` 26.4B NVFP4) evaluations plus model, slow-disk, and fast-NVMe ablations (superseded in `v2.1.1` with pooled multi-repeat `layby` reporting after confirming `--online-calib` is a no-op under `/park/score`).
 
 ## 2.0.0 (2026-11-25)
 

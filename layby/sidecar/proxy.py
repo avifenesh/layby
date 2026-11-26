@@ -73,7 +73,7 @@ class OnlineCalib:
             return
         lg, surv, pred_kind = item
         kd = str(kind or pred_kind)
-        b = int(np.searchsorted(E2, gap, side="right"))
+        b = int(np.searchsorted(E2, gap, side="left"))
         q = self._obs.setdefault(kd, deque(maxlen=self.window))
         q.append((lg, surv, b, float(gap)))
         self._updates += 1
@@ -195,10 +195,14 @@ class Sidecar:
             try:
                 t0 = time.perf_counter()
                 temps = self.calib.temps if self.calib is not None else None
-                Z, S = await asyncio.to_thread(self.scorer.score_with_logits, list(states), list(kinds), temps)
+                if hasattr(self.scorer, "score_with_logits"):
+                    Z, S = await asyncio.to_thread(self.scorer.score_with_logits, list(states), list(kinds), temps)
+                else:
+                    Z = None
+                    S = await asyncio.to_thread(self.scorer.score, list(states), list(kinds))
                 self.score_ms.append((time.perf_counter() - t0) * 1000.0)
                 self.stats["batches"] += 1
-                if self.calib is not None:
+                if self.calib is not None and Z is not None:
                     for k, lg, sv, kd in zip(keys, Z, S, kinds):
                         self.calib.record_prediction(k, lg, sv, kd)
                 await self.adapter.send(self.http, list(zip(keys, S.tolist())))

@@ -99,6 +99,12 @@ def test_online_calib():
     sm = oc.summary()
     assert sm["by_kind"]["tool"]["n"] == 60
     assert sm["temps"]["tool"] > 1.0, f"expected online calib to raise T on overconfident logits: {sm}"
+    # Exact bin-edge parity with training (side="left"): gap == 0.5 belongs to bin 0
+    oc2 = OnlineCalib({"_all": 1.0}, enabled=False)
+    z0 = np.zeros(16, dtype=np.float32)
+    oc2.record_prediction("edge", z0, np.ones(15, dtype=np.float32), "tool")
+    oc2.observe_return("edge", 0.5, "tool")
+    assert oc2._obs["tool"][0][2] == 0, f"expected bin 0 for gap=0.5 (side='left'), got {oc2._obs['tool'][0][2]}"
 
 
 def test_dwell_v2_real_checkpoint_zero_laya():

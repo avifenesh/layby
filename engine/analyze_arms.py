@@ -6,13 +6,22 @@ waits and after human waits, and by the hint that governed the wait; plus token 
 the server's /metrics delta: GPU prefix-cache hits, CPU-tier loads, recomputed prompt tokens.
 A session-bootstrap CI (200 resamples) on the p95 resumed-turn TTFT ratio vs arm B.
 
-Usage: analyze_arms.py OUTDIR [BASE_ARM]   (default base: lru_offload or B)
+Usage: analyze_arms.py OUTDIR [BASE_ARM] [--all-turns] [--pct linear|nearest]
+       (default base: lru_offload or B; default turns: resumed turn > 0; default pct: linear)
 """
-import glob, json, os, re, sys
+import argparse, glob, json, os, re, sys
 import numpy as np
 
-d = sys.argv[1]
+ap = argparse.ArgumentParser(description="Summarize closed-loop replay arms.")
+ap.add_argument("outdir", help="Directory containing *.jsonl arm logs")
+ap.add_argument("base_arm", nargs="?", default=None, help="Optional baseline arm name (default: lru_offload or B)")
+ap.add_argument("--all-turns", action="store_true", help="Include turn 0 in summary stats (Tables 1, 2, 4 convention)")
+ap.add_argument("--pct", choices=("linear", "nearest"), default="linear",
+                help="Percentile method: linear (default, Tables 1, 2, 4) or nearest (inverted_cdf, Tables 3, 6, 7)")
+args = ap.parse_args()
+d = args.outdir
 KIB = 144
+PCT_METHOD = "inverted_cdf" if args.pct == "nearest" else "linear"
 
 
 def metric(lines, name, **labels):
@@ -41,26 +50,30 @@ for f in sorted(glob.glob(os.path.join(d, "*.jsonl"))):
             mets.setdefault("_truncated", []).append(r)
         elif "wall_s" in r:
             wall = r["wall_s"]
-        else:
+        elif "ttft" in r and "turn" in r and "session" in r:
             rows.append(r)
     arms[name] = (rows, mets, wall)
 
 
 def pct(v, q):
-    return float(np.quantile(v, q)) * 1000 if len(v) else float("nan")
+    return float(np.quantile(v, q, method=PCT_METHOD)) * 1000 if len(v) else float("nan")
 
 
 def resumed(rows):
+    if args.all_turns:
+        return [r for r in rows if r["ttft"] is not None]
     return [r for r in rows if r["turn"] > 0 and r["ttft"] is not None]
 
 
-base = arms.get(sys.argv[2]) if len(sys.argv) > 2 else (arms.get("lru_offload") or arms.get("B"))
+base = arms.get(args.base_arm) if args.base_arm else (arms.get("lru_offload") or arms.get("B"))
 out = {}
 for name, (rows, mets, wall) in arms.items():
     res = resumed(rows)
     def stats(sel):
         v = np.array([r["ttft"] for r in sel])
-        return dict(n=len(v), p50_ms=pct(v, .5), p95_ms=pct(v, .95), p99_ms=pct(v, .99), mean_ms=float(v.mean() * 1000) if len(v) else None)
+        return dict(n=len(v), p50_ms=pct(v, .5), p95_ms=pct(v, .95), p99_ms=pct(v, .99),
+                    max_ms=float(v.max() * 1000) if len(v) else None,
+                    mean_ms=float(v.mean() * 1000) if len(v) else None)
     prev_kind = {}
     for r in rows:
         prev_kind[(r["session"], r["turn"] + 1)] = r["kind"]

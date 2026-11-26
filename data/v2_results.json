@@ -1,0 +1,199 @@
+{
+  "provenance": {
+    "layby_v2_vllm_commit": "20ee8da6884c169c5fabb8be29603ab19f6285ce",
+    "layby_v2_sglang_commit": "31cf0eb880109c56d7c57e27fa6b0c16b381ce80",
+    "release_commit": "v2.1.1",
+    "hf_model_v2_sha": "074ac1a70a878a922da14e8f92079b3e66486755",
+    "hf_model_v1_sha": "ddc3e908ff137758d3fbf0317e04810de439a917",
+    "host": "4x NVIDIA RTX PRO 6000 Blackwell Max-Q 96 GB, 1x RTX 5090 Laptop GPU 24 GB, NVIDIA DGX Spark GB10 ARM64 121 GiB",
+    "note": "Tables 1, 2, 4 report all-turn TTFT (linear interpolation; reproducible via engine/analyze_arms.py --all-turns --pct linear). Tables 3, 6, 7 report resumed-turn (turn > 0) TTFT (nearest-rank; reproducible via engine/analyze_arms.py --pct nearest). Identical repeat runs previously launched with --online-calib (a no-op under engine/replay.py /park/score) are pooled as multi-repeat averages of layby."
+  },
+  "dwell_v2_vs_v1": [
+    {"metric": "Parameters (total / non-emb)", "v1": "421M / 369M", "v2": "33.8M / 14.4M", "delta": "12.5$\\times$ smaller"},
+    {"metric": "Checkpoint size (FP32 safetensors)", "v1": "1,685\\,MB", "v2": "135\\,MB", "delta": "12.5$\\times$ smaller"},
+    {"metric": "Peak serving VRAM (BF16 / CPU)", "v1": "2,616\\,MiB", "v2": "427\\,MiB / 0\\,MiB", "delta": "6.1$\\times$ less (0 on CPU)"},
+    {"metric": "CPU bs=1 latency (8t L=128--512 / 64-vCPU live)", "v1": "1.7--2.9\\,s", "v2": "20.9--29.8\\,ms / 10.6--19.4\\,ms", "delta": "CPU-deployable"},
+    {"metric": "GPU bs=1 latency (RTX 5090, L=256/1536)", "v1": "19.4 / 31.2\\,ms", "v2": "4.07 / 4.26\\,ms", "delta": "4.8--7.3$\\times$ faster"},
+    {"metric": "ReturnBench 33-cell p95 vs no-disk ($\\downarrow$)", "v1": "0.659 (worst 1.043)", "v2": "0.661 (worst 1.039)", "delta": "matches, better worst"},
+    {"metric": "ReturnBench 0.5\\,GB/s slow disk ($\\downarrow$)", "v1": "0.823", "v2": "0.816", "delta": "beats v1 on 3/3 seeds"},
+    {"metric": "eval\\_uhold matched human NLL (n=18,096, $\\downarrow$)", "v1": "1.5980", "v2": "1.5439", "delta": "$-0.0541$ NLL"},
+    {"metric": "eval\\_uhold matched human ECE@300\\,s ($\\downarrow$)", "v1": "0.0340", "v2": "0.0104", "delta": "3.3$\\times$ lower ECE"},
+    {"metric": "eval\\_uhold swechat:tool NLL (n=7,260, $\\downarrow$)", "v1": "0.7589", "v2": "0.6490", "delta": "$-0.1099$ NLL"},
+    {"metric": "eval\\_uhold ask\\_user / subagent NLL ($\\downarrow$)", "v1": "2.1127 / 1.8073", "v2": "1.6967 / 1.6127", "delta": "$-0.416$ / $-0.195$"},
+    {"metric": "eval\\_uhold matched tool Spearman $\\rho$ ($\\uparrow$)", "v1": "0.774", "v2": "0.790 (s0: 0.798)", "delta": "$+0.016$ to $+0.024$"},
+    {"metric": "BurstGPT v2 eval\\_ood NLL (ECE@60\\,s, $\\downarrow$)", "v1": "2.1235 (0.0405)", "v2": "2.0871 (0.0148)", "delta": "$-0.0364$, 2.7$\\times$ ECE"}
+  ],
+  "glm2027_heldout": [
+    {"arm": "continuum", "label": "continuum", "served": 398, "p50": 195.28, "p95": 293.49, "p99": 303.63, "mean": 167.91, "max": 312.17, "recomp_m": 32.93, "disk_gb": 0.0, "extra_vram_gib": 0.0, "wall_min": 79.33, "afal": 0},
+    {"arm": "no-disk", "label": "no-disk", "served": 398, "p50": 103.90, "p95": 166.26, "p99": 174.20, "mean": 91.57, "max": 176.71, "recomp_m": 33.11, "disk_gb": 0.0, "extra_vram_gib": 0.0, "wall_min": 63.81, "afal": 0},
+    {"arm": "freq-gated", "label": "freq-gated", "served": 398, "p50": 45.15, "p95": 91.25, "p99": 119.20, "mean": 42.31, "max": 143.92, "recomp_m": 15.21, "disk_gb": 90.3, "extra_vram_gib": 2.0, "wall_min": 40.93, "afal": 704},
+    {"arm": "lmcache", "label": "lmcache", "served": 398, "p50": 33.51, "p95": 111.98, "p99": 122.18, "mean": 42.23, "max": 129.69, "recomp_m": 16.28, "disk_gb": 222.3, "extra_vram_gib": 3.5, "wall_min": 43.07, "afal": 0},
+    {"arm": "layby-v2", "label": "layby (2-rep avg)", "served": 398, "p50": 14.80, "p95": 56.39, "p99": 61.96, "mean": 21.51, "max": 75.36, "recomp_m": 9.52, "disk_gb": 148.9, "extra_vram_gib": 0.0, "wall_min": 35.00, "afal": 46, "r1": {"mean": 19.52, "p50": 16.47, "p95": 48.92, "p99": 52.46, "max": 63.12, "recomp_m": 9.00, "disk_gb": 151.8, "wall_min": 34.42}, "r2": {"mean": 23.49, "p50": 13.13, "p95": 63.86, "p99": 71.46, "max": 87.60, "recomp_m": 10.04, "disk_gb": 146.0, "wall_min": 35.58}}
+  ],
+  "vllm_v034_matrix": [
+    {
+      "cell": "GLM-5.3 held-out (2027)",
+      "short": "GLM-5.3 held-out\n(12.5 GB/s)",
+      "regime": "Native NVMe 12.5 GB/s, 398t",
+      "arms": {
+        "no-disk": {"mean": 91.57, "p95": 166.26},
+        "write-through": {"status": "n/a"},
+        "lmcache": {"mean": 42.23, "p95": 111.98},
+        "freq-gated": {"mean": 42.31, "p95": 91.25},
+        "continuum": {"mean": 167.91, "p95": 293.49},
+        "layby-v2": {"mean": 21.51, "p95": 56.39, "reps_mean": [19.52, 23.49], "reps_p95": [48.92, 63.86]}
+      }
+    },
+    {
+      "cell": "GLM-5.3 dev (2026)",
+      "short": "GLM-5.3 dev\n(11.6 GB/s)",
+      "regime": "Native NVMe 11.6 GB/s, 437t",
+      "arms": {
+        "no-disk": {"mean": 108.86, "p95": 192.22},
+        "write-through": {"status": "crash t76"},
+        "lmcache": {"mean": 73.73, "p95": 157.72},
+        "freq-gated": {"mean": 49.19, "p95": 101.70},
+        "continuum": {"status": "cap (44c)"},
+        "layby-v2": {"mean": 29.92, "p95": 70.17, "reps_mean": [27.85, 30.26, 31.66], "reps_p95": [67.84, 64.30, 78.37]}
+      }
+    },
+    {
+      "cell": "Gemma-4-31B fast",
+      "short": "Gemma-4-31B\nfast (1.35 GB/s)",
+      "regime": "Fast NVMe 1.35 GB/s, 443t",
+      "arms": {
+        "no-disk": {"mean": 7.32, "p95": 38.26},
+        "write-through": {"mean": 3.85, "p95": 18.88},
+        "lmcache": {"mean": 5.66, "p95": 28.71},
+        "freq-gated": {"mean": 4.42, "p95": 22.10},
+        "continuum": {"mean": 7.24, "p95": 40.96},
+        "layby-v2": {"mean": 3.81, "p95": 17.88, "reps_mean": [3.82, 3.80, 3.81], "reps_p95": [17.84, 17.89, 17.90]}
+      }
+    },
+    {
+      "cell": "Qwen3.8-27B fast",
+      "short": "Qwen3.8-27B\nfast (1.31 GB/s)",
+      "regime": "Fast NVMe 1.31 GB/s, 488t",
+      "arms": {
+        "no-disk": {"mean": 2.43, "p95": 10.49},
+        "write-through": {"mean": 1.83, "p95": 7.39},
+        "lmcache": {"mean": 2.19, "p95": 9.12},
+        "freq-gated": {"mean": 1.89, "p95": 8.35},
+        "continuum": {"mean": 2.76, "p95": 13.01},
+        "layby-v2": {"mean": 1.83, "p95": 7.67, "reps_mean": [1.85, 1.85, 1.78], "reps_p95": [7.62, 7.75, 7.64]}
+      }
+    },
+    {
+      "cell": "Qwen3.8-27B slow",
+      "short": "Qwen3.8-27B\nslow (141 MB/s)",
+      "regime": "Slow disk 141 MB/s, 366t",
+      "arms": {
+        "no-disk": {"mean": 12.46, "p95": 39.50},
+        "write-through": {"mean": 12.72, "p95": 58.21},
+        "lmcache": {"mean": 11.03, "p95": 40.53},
+        "freq-gated": {"mean": 15.17, "p95": 62.94},
+        "continuum": {"mean": 14.68, "p95": 48.50},
+        "layby-v2": {"mean": 10.53, "p95": 36.70, "reps_mean": [10.60, 10.56, 10.44], "reps_p95": [36.36, 34.42, 39.33]}
+      }
+    },
+    {
+      "cell": "Gemma-4-31B slow",
+      "short": "Gemma-4-31B\nslow (146 MB/s)",
+      "regime": "Slow disk 146 MB/s, 321t",
+      "arms": {
+        "no-disk": {"mean": 24.80, "p95": 82.20},
+        "write-through": {"mean": 24.19, "p95": 97.93},
+        "lmcache": {"mean": null, "p95": 190.16, "status": "cap (5c)"},
+        "freq-gated": {"mean": 26.52, "p95": 84.54},
+        "continuum": {"mean": 27.32, "p95": 90.44},
+        "layby-v2": {"mean": 25.72, "p95": 77.88, "reps_mean": [25.35, 27.02, 24.80], "reps_p95": [67.61, 86.03, 80.01]}
+      }
+    }
+  ],
+  "sglang_v0523_matrix": [
+    {"regime": "Gen4 2.0\\,GB/s (5/5G)", "arm": "hicache-selective", "mean": 3.60, "p95": 13.33, "p99": 17.23, "max": 21.55, "recomp": 2.40, "disk": 49.9},
+    {"regime": "Gen4 2.0\\,GB/s (5/5G)", "arm": "layby (3-rep avg)", "mean": 3.44, "p95": 12.89, "p99": 17.21, "max": 20.66, "recomp": 2.39, "disk": 47.9, "reps": "3.27/3.40/3.65"},
+    {"regime": "Cap 1.31\\,GB/s (5/5G)", "arm": "no-disk-selective", "mean": 3.85, "p95": 14.21, "p99": 18.44, "max": 21.97, "recomp": 2.67, "disk": 0.0},
+    {"regime": "Cap 1.31\\,GB/s (5/5G)", "arm": "hicache-write-back", "status": "OOM t21", "disk": 10.9},
+    {"regime": "Cap 1.31\\,GB/s (5/5G)", "arm": "hicache-selective", "mean": 3.33, "p95": 13.61, "p99": 17.47, "max": 19.75, "recomp": 2.22, "disk": 50.3},
+    {"regime": "Cap 1.31\\,GB/s (5/5G)", "arm": "layby (2-rep avg)", "mean": 3.68, "p95": 13.84, "p99": 17.34, "max": 21.52, "recomp": 2.44, "disk": 40.1, "reps": "3.53/3.82"},
+    {"regime": "Slow 141\\,MB/s (5/10G)", "arm": "hicache-file", "mean": 3.28, "p95": 12.69, "p99": 16.23, "max": 18.28, "recomp": 1.80, "disk": 94.2},
+    {"regime": "Slow 141\\,MB/s (5/10G)", "arm": "hicache-selective", "mean": 3.43, "p95": 13.80, "p99": 17.51, "max": 19.80, "recomp": 2.17, "disk": 52.8},
+    {"regime": "Slow 141\\,MB/s (5/10G)", "arm": "hicache-write-back", "status": "OOM t21"},
+    {"regime": "Slow 141\\,MB/s (5/10G)", "arm": "no-disk", "mean": 2.88, "p95": 11.26, "p99": 18.47, "max": 22.72, "recomp": 1.36, "disk": 0.0},
+    {"regime": "Slow 141\\,MB/s (5/10G)", "arm": "layby (wt, 0\\,GB)", "mean": 3.00, "p95": 12.75, "p99": 18.08, "max": 22.49, "recomp": 1.31, "disk": 0.0}
+  ],
+  "cross_hardware_1gpu": [
+    {
+      "group": "RTX PRO 6000 (96\\,GB, Qwen3-8B, 2.0\\,GB/s)",
+      "short": "1x RTX PRO 6000 (96 GB)\nQwen3-8B BF16, 2.0 GB/s",
+      "rows": [
+        {"policy": "layby", "label": "Layby (3-rep avg)", "mean": 2.12, "p50": 0.32, "p95": 9.99, "p99": 15.72, "max": 20.47, "disk_gb": 100.4, "reps_mean": [1.91, 2.02, 2.44]},
+        {"policy": "write-through", "label": "Write-Through", "mean": 3.04, "p50": 0.29, "p95": 13.44, "p99": 35.38, "max": 139.07, "disk_gb": 111.9},
+        {"policy": "lmcache", "label": "LMCache ARC", "mean": 3.17, "p50": 0.39, "p95": 12.97, "p99": 17.29, "max": 22.60, "disk_gb": 93.4},
+        {"policy": "no-disk", "label": "No Disk (LRU)", "mean": 3.98, "p50": 1.20, "p95": 16.94, "p99": 20.73, "max": 22.27, "disk_gb": 0.0}
+      ]
+    },
+    {
+      "group": "RTX 5090 Laptop (24\\,GB, Qwen3-8B, 2.0\\,GB/s)",
+      "short": "1x RTX 5090 Laptop (24 GB)\nQwen3-8B BF16, 2.0 GB/s",
+      "rows": [
+        {"policy": "layby", "label": "Layby (2-rep avg)", "mean": 25.69, "p50": 11.01, "p95": 97.11, "p99": 117.52, "max": 137.65, "disk_gb": 97.7, "reps_mean": [23.75, 27.62]},
+        {"policy": "write-through", "label": "Write-Through", "mean": 31.03, "p50": 5.65, "p95": 120.66, "p99": 272.00, "max": 490.68, "disk_gb": 110.3},
+        {"policy": "lmcache", "label": "LMCache ARC", "mean": 35.03, "p50": 25.75, "p95": 99.61, "p99": 109.30, "max": 125.76, "disk_gb": 109.8},
+        {"policy": "no-disk", "label": "No Disk (LRU)", "mean": 39.24, "p50": 29.22, "p95": 103.21, "p99": 118.49, "max": 122.64, "disk_gb": 0.0}
+      ]
+    },
+    {
+      "group": "DGX Spark GB10 (121\\,GiB, Inkling 2 Mini, 8.3\\,GB/s)",
+      "short": "DGX Spark GB10 ARM64\nInkling 2 Mini NVFP4, 8.3 GB/s",
+      "rows": [
+        {"policy": "write-through", "label": "Write-Through", "mean": 6.18, "p50": 1.16, "p95": 37.68, "p99": 58.27, "max": 98.81, "disk_gb": 67.1},
+        {"policy": "layby", "label": "Layby (2-rep avg)", "mean": 8.17, "p50": 1.98, "p95": 46.38, "p99": 61.50, "max": 82.27, "disk_gb": 58.9, "reps_mean": [7.77, 8.56]},
+        {"policy": "freq-gated", "label": "Freq-Gated (Reuse >= 2)", "mean": 18.54, "p50": 3.82, "p95": 70.77, "p99": 83.22, "max": 107.84, "disk_gb": 41.6},
+        {"policy": "no-disk", "label": "No Disk (LRU)", "mean": 23.10, "p50": 3.10, "p95": 79.09, "p99": 91.10, "max": 95.67, "disk_gb": 0.0}
+      ]
+    }
+  ],
+  "slow_disk_ladder": {
+    "qwen8b_141mbs": [
+      {"label": "Layby (neural, 2-rep avg)", "mean": 2.06, "p50": 0.34, "p95": 9.46, "p99": 13.57, "max": 16.29, "disk_gb": 0.0, "reps_mean": [2.04, 2.07], "reps_p99": [12.90, 14.23]},
+      {"label": "Cost Rule Only (Kaplan-Meier)", "mean": 2.23, "p50": 0.50, "p95": 9.18, "p99": 14.55, "max": 16.76, "disk_gb": 0.0},
+      {"label": "Cost Rule Only (EWMA)", "mean": 2.33, "p50": 0.48, "p95": 9.75, "p99": 15.55, "max": 19.33, "disk_gb": 0.0},
+      {"label": "No Disk (CPU-Only LRU)", "mean": 2.98, "p50": 0.55, "p95": 13.21, "p99": 17.23, "max": 23.12, "disk_gb": 0.0},
+      {"label": "Write-Through (All Disk)", "mean": 10.53, "p50": 0.12, "p95": 54.02, "p99": 274.28, "max": 367.83, "disk_gb": 77.2}
+    ],
+    "qwen27b_141mbs": [
+      {"label": "Cost Rule Only (Kaplan-Meier)", "mean": 9.84, "p50": 3.26, "p95": 34.13, "p99": 54.09, "max": 78.57, "disk_gb": 11.3},
+      {"label": "Cost Rule Only (EWMA)", "mean": 9.91, "p50": 3.61, "p95": 38.51, "p99": 57.35, "max": 69.32, "disk_gb": 9.2},
+      {"label": "Layby (neural, resumed r3)", "mean": 10.06, "p50": 3.57, "p95": 39.36, "p99": 52.90, "max": 58.67, "disk_gb": 14.4}
+    ]
+  },
+  "engine_ablations_gen4": [
+    {"label": "Layby CPU-Ordering + Write-Through Disk", "mean": 1.88, "p50": 0.33, "p95": 10.02, "p99": 14.06, "max": 19.97, "disk_gb": 112.7},
+    {"label": "Layby (33.8M, r1)", "mean": 1.91, "p50": 0.26, "p95": 8.96, "p99": 14.24, "max": 16.36, "disk_gb": 100.0},
+    {"label": "Cost Rule Only (EWMA, No Neural Model)", "mean": 1.94, "p50": 0.37, "p95": 8.92, "p99": 15.89, "max": 18.97, "disk_gb": 98.6},
+    {"label": "Cost Rule Only (Kaplan-Meier, No Neural)", "mean": 1.97, "p50": 0.36, "p95": 9.88, "p99": 15.56, "max": 21.96, "disk_gb": 100.1},
+    {"label": "Layby + Joint-Prefix 33.8M (aux=0.10)", "mean": 2.00, "p50": 0.37, "p95": 9.89, "p99": 14.43, "max": 16.28, "disk_gb": 101.6},
+    {"label": "Frequency-Gated Disk (Reuse >= 2)", "mean": 2.00, "p50": 0.20, "p95": 9.36, "p99": 25.06, "max": 43.33, "disk_gb": 82.1},
+    {"label": "Layby (33.8M, r2, 4-GPU load)", "mean": 2.02, "p50": 0.34, "p95": 9.34, "p99": 15.10, "max": 22.75, "disk_gb": 99.4},
+    {"label": "Layby (33.8M, 3-rep avg)", "mean": 2.12, "p50": 0.32, "p95": 9.99, "p99": 15.72, "max": 20.47, "disk_gb": 100.4},
+    {"label": "Layby + Compact 18.5M (Ettin-17M, aux=0.10)", "mean": 2.21, "p50": 0.33, "p95": 10.41, "p99": 14.36, "max": 21.59, "disk_gb": 103.3},
+    {"label": "Layby (33.8M, r3)", "mean": 2.44, "p50": 0.36, "p95": 11.66, "p99": 17.82, "max": 22.29, "disk_gb": 101.7},
+    {"label": "Layby Adapter Only (No Curves Posted)", "mean": 2.65, "p50": 0.51, "p95": 11.95, "p99": 17.77, "max": 20.32, "disk_gb": 67.4},
+    {"label": "Write-Through (All Disk, Stock LRU)", "mean": 3.04, "p50": 0.29, "p95": 13.44, "p99": 35.38, "max": 139.07, "disk_gb": 111.9},
+    {"label": "LMCache 0.5.7.post1 (ARC)", "mean": 3.17, "p50": 0.39, "p95": 12.97, "p99": 17.29, "max": 22.60, "disk_gb": 93.4},
+    {"label": "No Disk (Stock CPU-Only LRU)", "mean": 3.98, "p50": 1.20, "p95": 16.94, "p99": 20.73, "max": 22.27, "disk_gb": 0.0}
+  ],
+  "model_ablations_v2": [
+    {"variant": "Layby-Dwell (aux=0, 3-seed med.)", "params": "33.8M", "all_nll": 1.5950, "tool_nll": 1.6148, "human_nll": 1.4374, "ece300": 0.0103, "wait_poll": 2.1261, "rb_p95": 0.660, "rb_worst": 1.039, "rb_slow": 0.817, "is_ref": true},
+    {"variant": "Layby-Dwell (aux=0, pub. s0)", "params": "33.8M", "all_nll": 1.5862, "tool_nll": 1.6046, "human_nll": 1.4375, "ece300": 0.0116, "wait_poll": 1.8843, "rb_p95": 0.661, "rb_worst": 1.039, "rb_slow": 0.816, "is_pub": true},
+    {"variant": "Joint-Prefix (aux=0.10, 3-seed med.)", "params": "33.8M", "all_nll": 1.6068, "tool_nll": 1.6282, "human_nll": 1.4338, "ece300": 0.0115, "wait_poll": 2.2126, "rb_p95": 0.659, "rb_worst": 1.039, "rb_slow": 0.815},
+    {"variant": "Stronger Aux (aux=0.25)", "params": "33.8M", "all_nll": 1.6027, "tool_nll": 1.6233, "human_nll": 1.4359, "ece300": 0.0115, "wait_poll": 2.0448, "rb_p95": 0.657, "rb_worst": 1.039, "rb_slow": 0.817},
+    {"variant": "Long-Tail Upwt (2x >60\\,s, aux=0.10)", "params": "33.8M", "all_nll": 1.6006, "tool_nll": 1.6214, "human_nll": 1.4326, "ece300": 0.0128, "wait_poll": 2.3348, "rb_p95": 0.660, "rb_worst": 1.073, "rb_slow": 0.806},
+    {"variant": "Compact 18.5M (Ettin-17M, aux=0*)", "params": "18.5M", "all_nll": 1.5926, "tool_nll": 1.6121, "human_nll": 1.4342, "ece300": 0.0130, "wait_poll": 2.0797, "rb_p95": 0.663, "rb_worst": 1.079, "rb_slow": 0.824},
+    {"variant": "Plain MLP + Concat (v1\\_plain)", "params": "32.1M", "all_nll": 1.6435, "tool_nll": 1.6664, "human_nll": 1.4577, "ece300": 0.0202, "wait_poll": 2.2865, "rb_p95": 0.661, "rb_worst": 1.084, "rb_slow": 0.819},
+    {"variant": "Tabular Telemetry Only", "params": "1.4M", "all_nll": 1.6684, "tool_nll": 1.6906, "human_nll": 1.4888, "ece300": 0.0323, "wait_poll": 1.8861, "rb_p95": 0.667, "rb_worst": 1.061, "rb_slow": 0.828},
+    {"variant": "Text Encoder Only", "params": "32.5M", "all_nll": 2.1852, "tool_nll": 2.2540, "human_nll": 1.6288, "ece300": 0.0514, "wait_poll": 2.6953, "rb_p95": 0.678, "rb_worst": 1.324, "rb_slow": 0.873}
+  ]
+}

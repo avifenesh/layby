@@ -5,7 +5,7 @@ abstract: "KV cache placement for idle LLM sessions by when they come back: the 
 repository-code: "https://github.com/avifenesh/layby"
 url: "https://github.com/avifenesh/layby"
 license: Apache-2.0
-version: "2.1.0"
+version: "2.1.1"
 doi: "10.5281/zenodo.23285213"
 identifiers:
   - type: doi
