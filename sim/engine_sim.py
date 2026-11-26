@@ -19,6 +19,8 @@ this models the engine the replay ran against (Qwen3-8B, vLLM 0.30.0, chunked pr
   disk        a request with park_eta < 0 writes its session; a disk hit is promoted to the CPU tier at
               DISK_GBPS, then loaded to the GPU at CPU_GBPS.
   loads       one CPU->GPU link and one disk link, serialized; a request prefills after its load.
+  keep        a turn with keep (a context cut, engine/replay.py) matches only the first keep tokens of the
+              session's cached KV; the tiers drop the rest of that session's tokens at once.
   step time   T0 + decode KV bytes / BW + prefill tokens * F0 * (1 + ATT * mean position / 1000).
 
 Use simulate(W, None, Params()) for C0 (LRU, no disk tier) and simulate(W, "x", Params(), rule) for a
@@ -51,6 +53,19 @@ class Params:
         self.seed = 0
         self.tw = 120.0             # Live averaging window, seconds (estimator smoothing, not a decision constant)
         self.window = None          # run length in seconds: no send after it (None: every turn is sent)
+        self.kib = KIB              # KiB per token moved on the CPU and disk tiers (all TP ranks' copies)
+        self.hbm_kib = None         # KiB per token a decode step reads from HBM per rank (None: kib)
+        self.max_seqs = None        # max running requests, as --max-num-seqs (None: no cap)
+        self.req_tokens = 0         # GPU KV a running request holds beyond its tokens, in tokens (a recurrent
+                                    # state, a sliding window: bench/phase_r/fit_service.py)
+        self.req_tokens_prefill = None  # the same while its prefill runs (None: req_tokens): a Mamba request's
+                                    # checkpoint block per group (bench/phase_r/sim_sizing.req_reserve_bytes)
+        self.win_groups = 0         # sliding-window groups (vLLM 0.31.0): while a request prefills, each group
+        self.win_lead = 0           # holds cdiv(win_lead + in-flight tokens, win_block) + 1 pages, in-flight =
+        self.win_block = 16         # min(its prompt tokens not on the GPU, two chunks); win_lead = window - 1,
+        self.win_page_tokens = 0    # win_page_tokens = page bytes / growing bytes per token; replaces
+                                    # req_tokens_prefill when win_groups > 0
+        self.until = None           # stop the simulation at this time (a hard cap; unfinished turns are not in out)
         self.__dict__.update(kw)
 
 
@@ -77,7 +92,7 @@ from .live import AG, Live   # shared with the engine adapters
 
 def simulate(W, src, p, rule=None):
     """Replay W's sessions closed-loop through the simulated engine; src None is C0 (LRU, no hints).
-    rule: an object with decide(view) -> dict(eta, disk, pre, warm_eta), called when a turn finishes
+    rule: an object with decide(view) -> dict(eta, disk, pre, warm_eta[, gpu_pin, disk_tokens]), called when a turn finishes
     with the live engine state; it replaces the replay's eta_<src>/pre_<src> (src must not be None)."""
     S = W["sessions"]
     live = Live(p.tw)
@@ -171,24 +186,40 @@ def simulate(W, src, p, rule=None):
             r = Req(i, j, H[i], 1, True, eta, now, t["kind"])
             warms += 1
         else:
+            if t.get("keep") is not None:
+                # the client cut its context (engine/replay.py keep): only the first `keep` tokens of the session's
+                # cached KV still match; the rest no longer counts as this session's prefix in any tier
+                kp = t["keep"]
+                H[i] = min(H[i], kp)
+                for tier in (gpu_idle, cpu, disk, disk_writing):
+                    if i in tier:
+                        tier[i] = min(tier[i], kp)
             e = t.get(f"eta_{src}") if src else None
             r = Req(i, j, H[i] + t["new_tokens"], t["out_len"], False, e, now, t["kind"])
         waiting.append(r)
+
+    def prefill_reserve(todo):
+        """GPU KV beyond its tokens a request holds while `todo` prompt tokens are left to prefill."""
+        if p.win_groups:
+            fl = min(max(todo, 1), 2 * p.budget)
+            return max(p.req_tokens, p.win_groups * (-(-(p.win_lead + fl) // p.win_block) + 1) * p.win_page_tokens)
+        return p.req_tokens if p.req_tokens_prefill is None else p.req_tokens_prefill
 
     def admit(r, now):
         """Prefix lookup and KV allocation at the moment the scheduler takes the request."""
         nonlocal alloc, link_cpu, link_disk
         k = r.sess
         own = gpu_idle.get(k, 0)
-        if not gpu_evict(r.P + r.O - min(own, r.P + r.O), k, now):
+        need = r.P + r.O + prefill_reserve(r.P - min(own, r.P))
+        if not gpu_evict(need - min(own, r.P + r.O), k, now):
             return False
         g = min(r.P, max(own, running_sess.get(k, 0)))
         if own:
             live.end_idle(now, "g", now - gpu_free_t[k], own, False)
         gpu_idle.pop(k, None)
         gpu_pin.pop(k, None)
-        alloc += r.P + r.O
-        r.alloc = r.P + r.O
+        alloc += need
+        r.alloc = need
         c, d = cpu.get(k, 0), disk.get(k, 0)
         if k in cpu:
             if not any(x.sess == k for x in running):
@@ -199,16 +230,16 @@ def simulate(W, src, p, rule=None):
         ext = max(c, d)
         r.hit = g
         if ext > g:
-            L = (min(ext, r.P) - g) * KIB * 1024
+            L = (min(ext, r.P) - g) * p.kib * 1024
             if c >= ext:
                 live.add(now, busy_cpu=L / (p.cpu_gbps * 1e9), n_cpu=1.0, wait_cpu=max(link_cpu - now, 0.0))
                 link_cpu = max(link_cpu, now) + L / (p.cpu_gbps * 1e9); r.ready = link_cpu
-                io["cpu_load"] += L // (KIB * 1024)
+                io["cpu_load"] += L // (p.kib * 1024)
             else:
                 # promoted disk -> CPU, then loaded CPU -> GPU (the second hop is not queued on link_cpu)
                 live.add(now, busy_disk=L / (p.disk_gbps * 1e9), n_disk=1.0, wait_disk=max(link_disk - now, 0.0))
                 link_disk = max(link_disk, now) + L / (p.disk_gbps * 1e9); r.ready = link_disk + L / (p.cpu_gbps * 1e9)
-                io["disk_read"] += L // (KIB * 1024)
+                io["disk_read"] += L // (p.kib * 1024)
             r.ext = min(ext, r.P) - g
         r.rem = r.P - g - r.ext
         if r.rem <= 0:
@@ -221,7 +252,7 @@ def simulate(W, src, p, rule=None):
             lost = max(r.ready - now, 0.0) + rec * p.f0 * (1 + p.att * (g + r.ext + rec / 2) / 1000)
             if pre > g:
                 in_cpu = c >= pre
-                lost_c = 0.0 if in_cpu else max(0.0, lost - (pre - g) * KIB * 1024 / (p.cpu_gbps * 1e9))
+                lost_c = 0.0 if in_cpu else max(0.0, lost - (pre - g) * p.kib * 1024 / (p.cpu_gbps * 1e9))
                 live.add(now, miss_g=lost, miss_c=lost_c)
                 # the same loss with what it delays: link waits by the link's busy fraction, recompute by
                 # the requests in prefill
@@ -231,11 +262,13 @@ def simulate(W, src, p, rule=None):
                 if g_ev_t.get(k, -1.0) >= gpu_free_t.get(k, math.inf):
                     live.miss(now, "g", now - g_ev_t[k], full)
                 if not in_cpu and c_ev_t.get(k, -1.0) >= cpu_last.get(k, math.inf):
-                    live.miss(now, "c", now - c_ev_t[k], max(0.0, full - (pre - g) * KIB * 1024 / (p.cpu_gbps * 1e9)))
+                    live.miss(now, "c", now - c_ev_t[k], max(0.0, full - (pre - g) * p.kib * 1024 / (p.cpu_gbps * 1e9)))
         return True
 
     now = 0.0
     while ev or waiting or running:
+        if p.until is not None and now >= p.until:
+            break
         if not waiting and not running:
             now = max(now, ev[0][0])
         while ev and ev[0][0] <= now:
@@ -262,6 +295,8 @@ def simulate(W, src, p, rule=None):
         lookups = deferred = 0
         wi = 0
         while wi < len(waiting) and budget > 0:
+            if p.max_seqs is not None and len(running) >= p.max_seqs:
+                break
             r = waiting[wi]
             lookups += 1
             if defer and not r.looked:
@@ -286,7 +321,7 @@ def simulate(W, src, p, rule=None):
                 break
             now = t_next
             continue
-        ctx_bytes = sum((r.P + r.out) for r in dec) * KIB * 1024
+        ctx_bytes = sum((r.P + r.out) for r in dec) * (p.hbm_kib if p.hbm_kib is not None else p.kib) * 1024
         pre = sum(c * p.f0 * (1 + p.att * (r.P - r.rem + c / 2) / 1000) for r, c in chunks)
         lk = lookups * p.lookup_s if defer else 0.0
         dt = p.t0 + ctx_bytes / p.bw + pre + lk
@@ -299,6 +334,9 @@ def simulate(W, src, p, rule=None):
             running_sess[r.sess] = max(running_sess.get(r.sess, 0), r.P - r.rem)
             if r.rem == 0:
                 r.out = 1; r.t_first = now
+                d = r.alloc - (r.P + r.O + p.req_tokens)   # prefill over: back to the decode reserve
+                if d > 0:
+                    alloc -= d; r.alloc -= d
         for r in dec:
             r.out += 1
         for r in [r for r in running if r.rem == 0 and r.out >= r.O]:
@@ -326,21 +364,24 @@ def simulate(W, src, p, rule=None):
             if to_disk and src is not None:
                 if p.disk_write:
                     # REQUEST_LEVEL write of the session; blocks already on disk are skipped
-                    new = tot - max(disk.get(k, 0), disk_writing.get(k, 0))
+                    # a rule may write only a prefix of the session (disk_tokens)
+                    wtot = min(dec_r.get("disk_tokens") or tot, tot) if dec_r is not None else tot
+                    new = wtot - max(disk.get(k, 0), disk_writing.get(k, 0))
                     if new > 0:
                         io["disk_write"] += new
-                        live.add(now, busy_disk=new * KIB * 1024 / (p.disk_gbps * 1e9), n_disk=1.0, wait_disk=max(link_disk - now, 0.0))
-                        link_disk = max(link_disk, now) + new * KIB * 1024 / (p.disk_gbps * 1e9)
-                        disk_writing[k] = tot
-                        push(link_disk, "disk", (k, tot))
+                        live.add(now, busy_disk=new * p.kib * 1024 / (p.disk_gbps * 1e9), n_disk=1.0, wait_disk=max(link_disk - now, 0.0))
+                        link_disk = max(link_disk, now) + new * p.kib * 1024 / (p.disk_gbps * 1e9)
+                        disk_writing[k] = wtot
+                        push(link_disk, "disk", (k, wtot))
                 else:
-                    disk[k] = tot
+                    disk[k] = min(dec_r.get("disk_tokens") or tot, tot) if dec_r is not None else tot
             if r.warm:
                 wlog[(k, r.turn)] = [r.t_send, r.t_adm, now]
                 continue
             H[k] = tot
             out.append(dict(session=S[k]["id"], turn=r.turn, kind=r.kind, ttft=r.t_first - r.t_send,
                             hit=r.hit, ext=r.ext, P=r.P, queue=r.t_adm - r.t_send, load=max(r.ready - r.t_adm, 0.0),
+                            t_send=r.t_send, t_first=r.t_first, t_done=now,
                             warm=None if (k, r.turn) not in wlog else [x - r.t_send for x in wlog[(k, r.turn)]]))
             t = turn_of(k, r.turn)
             if t["gap_after"] is None or r.turn + 1 >= len(S[k]["turns"]):
@@ -356,7 +397,7 @@ def simulate(W, src, p, rule=None):
                 we = None if e is None or w is None else (-1.0 if e < 0 else max(e - w, 0.5))
             if w is not None and w < t["gap_after"]:
                 push(now + w, "warm", (k, r.turn + 1, we))
-    return out, dict(warms=warms, skipped=skipped, wall=now, lookup_time=lookup_time, **{k: v * KIB * 1024 / 1e9 for k, v in io.items()})
+    return out, dict(warms=warms, skipped=skipped, wall=now, lookup_time=lookup_time, **{k: v * p.kib * 1024 / 1e9 for k, v in io.items()})
 
 
 def summarize(rows):

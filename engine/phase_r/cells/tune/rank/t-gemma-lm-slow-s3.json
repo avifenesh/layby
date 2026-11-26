@@ -1,0 +1,80 @@
+{
+ "cell": "t-gemma-lm-slow-s3",
+ "tuning": {
+  "model": "gemma4_31b",
+  "family": "LM",
+  "disk": "slow",
+  "stage": 3,
+  "workload": "gemma4_31b.tuning",
+  "grid": [
+   "LM_c256_default",
+   "LM_c256_default_eager",
+   "LM_c256_retain",
+   "LM_c256_retain_eager",
+   "LM_c512_default",
+   "LM_c512_default_eager",
+   "LM_c512_retain",
+   "LM_c512_retain_eager"
+  ],
+  "carried": {
+   "C0": {
+    "budget": null,
+    "eviction": "lru"
+   }
+  },
+  "dropped": [
+   "eviction ARC: LMCache 0.5.5's --eviction-policy takes LRU, IsolatedLRU or noop only (lmcache/v1/distributed/config.py); eviction stays LRU"
+  ]
+ },
+ "block": {
+  "host": "tune-gemma",
+  "repeat": 1,
+  "attempt": 1,
+  "dir": "/home/avifenesh/park-predictor-data/phase_r/tune/gemma/pr/t-gemma-lm-slow-s3/tune-gemma/r1/a1"
+ },
+ "rule": "p95 TTFT on resumed turns (failed and censored +inf), ties by p50 then grid order",
+ "arms": [
+  {
+   "n": 351,
+   "served": 351,
+   "failed": 0,
+   "censored": 0,
+   "missing": 0,
+   "p50": 20.660348,
+   "p95": 46.132721,
+   "label": "LM_c512_retain",
+   "rank": 1,
+   "code": "LMR",
+   "knobs": {
+    "chunk": 512,
+    "prefetch": "retain",
+    "eager": false
+   },
+   "grid_index": 6
+  },
+  {
+   "n": 351,
+   "served": 351,
+   "failed": 0,
+   "censored": 0,
+   "missing": 0,
+   "p50": 18.526624,
+   "p95": 46.268493,
+   "label": "LM_c256_default_eager",
+   "rank": 2,
+   "code": "LM",
+   "knobs": {
+    "chunk": 256,
+    "prefetch": "default",
+    "eager": true
+   },
+   "grid_index": 1
+  }
+ ],
+ "unranked": [],
+ "complete": true,
+ "next_stage": null,
+ "advance": [],
+ "winner": "LM_c512_retain",
+ "cell_spec": "/home/avifenesh/.cache/layby-wt/integ/engine/phase_r/cells/tune/t-gemma-lm-slow-s3.json"
+}

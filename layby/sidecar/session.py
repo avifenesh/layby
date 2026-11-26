@@ -33,7 +33,7 @@ import hashlib
 import json
 import math
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from datetime import datetime, timezone
 
 import numpy as np
@@ -108,24 +108,39 @@ class _Hist:
 
 
 class Boundary:
-    __slots__ = ("t", "kind", "tool", "prog", "user", "gap")
+    __slots__ = ("t", "kind", "tool", "prog", "user", "gap", "key")
 
-    def __init__(self, t, kind, tool, prog, user):
-        self.t, self.kind, self.tool, self.prog, self.user, self.gap = t, kind, tool, prog, user, None
+    def __init__(self, t, kind, tool, prog, user, key=None):
+        self.t, self.kind, self.tool, self.prog, self.user, self.gap, self.key = t, kind, tool, prog, user, None, key
 
 
 class Session:
     def __init__(self, sid, t0):
         self.sid, self.t0 = sid, t0
         self.bounds: list[Boundary] = []        # every boundary, in order
+        self.last_returned = None               # (key, gap, kind) populated when a returning request links
 
 
 class Tracker:
-    def __init__(self, clock=time.time):
+    def __init__(self, clock=time.time, max_tips: int = 50000, max_hist: int = 100000):
         self.clock = clock
-        self.by_tip: dict[str, Session] = {}    # hash of conversation up to the last response -> session
-        self.hist: dict[tuple, _Hist] = {}      # (user, field, value) -> gaps
+        self.max_tips = max(int(max_tips), 1)
+        self.max_hist = max(int(max_hist), 1)
+        self.by_tip: "OrderedDict[str, Session]" = OrderedDict()   # bounded LRU: tip hash -> session
+        self.hist: "OrderedDict[tuple, _Hist]" = OrderedDict()     # bounded LRU: (user, field, value) -> gaps
         self.n_sessions = 0
+        self.tips_evicted = 0
+
+    def _hist_add(self, key, lg):
+        h = self.hist.get(key)
+        if h is None:
+            h = _Hist()
+            self.hist[key] = h
+            while len(self.hist) > self.max_hist:
+                self.hist.popitem(last=False)
+        else:
+            self.hist.move_to_end(key)
+        h.add(lg)
 
     # --- requests ------------------------------------------------------------------------
     def on_request(self, body, user):
@@ -137,16 +152,19 @@ class Tracker:
         if sess is None:
             self.n_sessions += 1
             sess = Session(f"s{self.n_sessions}", now)
-        elif sess.bounds and sess.bounds[-1].gap is None:
-            b = sess.bounds[-1]
-            b.gap = max(now - b.t, 0.0)
-            lg = math.log1p(b.gap)
-            for key in ((b.user, "tool", b.tool), (b.user, "prog", b.prog), (b.user, "kind", b.kind)):
-                self.hist.setdefault(key, _Hist()).add(lg)
+        else:
+            sess.last_returned = None
+            if sess.bounds and sess.bounds[-1].gap is None:
+                b = sess.bounds[-1]
+                b.gap = max(now - b.t, 0.0)
+                sess.last_returned = (b.key, b.gap, b.kind)
+                lg = math.log1p(b.gap)
+                for key in ((b.user, "tool", b.tool), (b.user, "prog", b.prog), (b.user, "kind", b.kind)):
+                    self._hist_add(key, lg)
         return sess
 
     # --- responses -------------------------------------------------------------------------
-    def on_response(self, sess, body, resp, usage, user):
+    def on_response(self, sess, body, resp, usage, user, key=None):
         """The response ended: record the boundary and return its server-view state (JSON) and kind."""
         now = self.clock()
         msgs = body.get("messages") or []
@@ -187,9 +205,14 @@ class Tracker:
              "user": cut(_last_user(msgs), 400)}
         state = json.dumps({k: v for k, v in s.items() if not (v is None or (isinstance(v, (str, list)) and len(v) == 0))},
                            ensure_ascii=False, default=str)
-        sess.bounds.append(Boundary(now, kind, tool, prog, user))
+        sess.bounds.append(Boundary(now, kind, tool, prog, user, key=key))
         tip = msgs + [{"role": "assistant", "content": resp.get("content"), "tool_calls": calls}]
-        self.by_tip[conv_hash(tip)] = sess
+        tip_h = conv_hash(tip)
+        self.by_tip[tip_h] = sess
+        self.by_tip.move_to_end(tip_h)
+        while len(self.by_tip) > self.max_tips:
+            self.by_tip.popitem(last=False)
+            self.tips_evicted += 1
         return state, kind
 
 

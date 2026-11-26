@@ -25,6 +25,16 @@ Measured here, fed to layby.vllm.state.STATE:
   misses        at admission, the latency a request loses to KV evicted from the GPU and from the CPU
                 tier, against the time since that eviction (Live.miss, the source of the holding price)
 
+Queue hold: from its arrival to its admission (or its end), a request's chunks are held in the CPU tier at its
+queue rank (ParkCachePolicy.hold): evicted after every idle chunk, the last-arrived first. A preempted request is
+held again at the head of the queue. Counts held.
+
+Prefetch: each step, the waiting requests whose held chunks fit in the CPU tier's room (queue order) have the
+disk -> CPU promotion of their prefix past what the GPU prefix cache holds (and of each windowed group's window at its
+end) started once, so a disk restore runs during the queue wait. An admission
+whose prefetch restored its prefix before the scheduler reached it is a disk restore that cost no wait (defer 0).
+Counts prefetch (chunks).
+
 Decision: when a request finishes its curve may already be there (kv_transfer_params["park_surv"]);
 otherwise the request is remembered under its park_key and decided when POST /hint delivers the curve.
 The decision sets the CPU tier's predicted next use of the request's chunks (park_eta; first out for
@@ -40,13 +50,38 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_utils import get_block_hash
 from vllm.v1.kv_offload.base import LookupResult
-from vllm.v1.utils import compute_iteration_details
+from types import SimpleNamespace
+
+
+def _fallback_iteration_details(scheduler_output):
+    """Fallback for vLLM nightly (>=0.34.0rc1) where compute_iteration_details moved onto SchedulerOutput."""
+    det = getattr(scheduler_output, "iteration_details", None)
+    if det is not None:
+        return det
+    ntok = getattr(scheduler_output, "num_scheduled_tokens", {}) or {}
+    new_reqs = getattr(scheduler_output, "scheduled_new_reqs", ()) or ()
+    ctx_reqs = len(new_reqs)
+    ctx_toks = sum(ntok.get(r.req_id, 0) for r in new_reqs)
+    cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
+    if cached is not None:
+        for rid in getattr(cached, "req_ids", ()) or ():
+            t = ntok.get(rid, 0)
+            if t > 1:
+                ctx_reqs += 1
+                ctx_toks += t
+    return SimpleNamespace(num_ctx_requests=ctx_reqs, num_ctx_tokens=ctx_toks)
+
+
+try:
+    from vllm.v1.utils import compute_iteration_details
+except ImportError:
+    compute_iteration_details = _fallback_iteration_details
 
 from layby.rule import TG, decide, interp_surv, recompute_cost
 from layby.vllm import server
 from layby.vllm.state import STATE
 
-logger = init_logger(__name__)
+logger = init_logger("vllm." + __name__)   # under vLLM's handler: a module name outside "vllm" prints nothing
 _failed: set = set()
 
 
@@ -116,7 +151,11 @@ class _ReadyOnly:
         return getattr(self.inner, name)
 
     def lookup(self, key, req_context, **kw):
-        r = self.inner.lookup(key, req_context, **kw)
+        poll = getattr(self.inner, "_maybe_process_finished_jobs", None)
+        if poll is not None:
+            poll()
+        prim = getattr(self.inner, "primary_tier", self.inner)
+        r = prim.lookup(key, req_context)
         return r if r is LookupResult.HIT else LookupResult.MISS
 
 
@@ -162,8 +201,15 @@ class ParkConnector(OffloadingConnector):
         STATE.cpu_tokens = primary._num_chunks * STATE.chunk_tokens
         STATE.gpu_tokens = kv_cache_config.num_blocks * STATE.block_tokens
         self._waiting: dict[str, float] = {}           # request id -> time added, until admitted
+        self._running: dict[str, list[int]] = {}       # running request id -> per-group protected key counts
         self._deferred: dict[str, float] = {}          # request id -> first lookup that deferred it
-        # request id -> its give-up (the deferral it stopped), until the promotion it waited on resolves
+        self._defer_accum: dict[str, float] = {}       # request id -> cumulative actual deferral seconds across re-deferrals
+        self._gave_up: set[str] = set()                # waiting requests that already gave up on disk promotion
+        self._defer_ready: dict[str, int] = {}         # request id -> tokens already in CPU at first deferral
+        self._est0: dict[str, tuple[float, float, float]] = {}  # request id -> (t, first remaining est, link est)
+        self._ready: dict[str, float] = {}             # request id -> first lookup after its deferral that could load
+        self._prefetched: dict[str, int] = {}          # waiting request id -> promotions its prefetch started
+        # request id -> its give-up (the deferral it stopped), until admitted and settled
         self._giveups: dict[str, dict] = {}
         # request id -> the GPU-local prefix hit (tokens) vLLM passed to the last lookup. vLLM calls
         # update_state_after_alloc before it sets request.num_computed_tokens, so a new request reads 0 there
@@ -172,8 +218,11 @@ class ParkConnector(OffloadingConnector):
         self._early: dict[str, tuple[float, list]] = {}               # park_key -> curve that beat the finish
         self._loads: dict[int, tuple[float, int]] = {}  # load job id -> (submit time, chunks)
         self._last_step = None                          # (time, prefill tokens, had work)
+        self._step_dt = 0.0                             # latest step wall-clock seconds (scales pending-hint TTL)
         self._last_prune = time.monotonic()
         STATE.write_mode = extra.get("park_write", "rule")
+        self._gpu_order = bool(extra.get("park_gpu_order", False))
+        self._gpu_demote: list[list[tuple[int, object]]] = []
         if STATE.write_mode == "demand":
             # KD write-back: a chunk the rule kept in RAM only is written to disk when the CPU tier evicts it
             from layby.vllm import demote
@@ -184,7 +233,7 @@ class ParkConnector(OffloadingConnector):
         self._hints_on = False            # without a hint port, curves can only ride on the request
         if port:
             try:
-                server.start(int(port))
+                server.start(int(port), str(extra.get("park_host", "127.0.0.1")))
                 self._hints_on = True
                 if extra.get("park_prof"):
                     from layby import prof
@@ -212,36 +261,424 @@ class ParkConnector(OffloadingConnector):
 
     # --- admission and misses -----------------------------------------------------------
     def on_new_request(self, request) -> None:
-        self._waiting[request.request_id] = time.monotonic()
+        now = time.monotonic()
+        self._waiting[request.request_id] = now
         super().on_new_request(request)
+        _safe("hold", self._hold, request.request_id, now)
+
+    def _hold(self, rid: str, rank: float) -> None:
+        """Queue hold: the CPU tier keeps a waiting request's chunks by its queue rank until admission
+        (ParkCachePolicy.hold)."""
+        pol = STATE.policy
+        rs = self.connector_scheduler._req_status.get(rid)
+        if pol is None or rs is None or not hasattr(pol, "hold"):
+            return
+        rs.update_offload_keys()
+        pol.hold(rid, self._hold_keys(rs), rank)
+        self._prefetched.pop(rid, None)        # a preempted request is prefetched again
+        STATE.counts["held"] += 1
+
+    def _hold_keys(self, rs) -> list:
+        """The chunks a load of this request can use, in prefix order (by end token across groups): every
+        full-attention chunk, and for each windowed group (sliding window, Mamba state) only the window that ends
+        where the full-attention prefix in the CPU tier or on disk ends; older windows are never loaded."""
+        cs = self.connector_scheduler
+        mgr = cs.manager
+        prim = getattr(mgr, "primary_tier", mgr)
+        fs = STATE.fs_tier
+        ctx = rs.req_context
+        present = lambda k: prim.lookup(k, ctx) is not LookupResult.MISS or (fs is not None and k in fs._on_disk)
+        groups = list(zip(cs.config.kv_group_configs, rs.group_states))
+        out, bound = [], None
+        for g, gs in groups:
+            if g.sliding_window_size_in_chunks is not None:
+                continue
+            ks = list(gs.offload_keys)
+            out += ks
+            last = next((i for i in range(len(ks) - 1, -1, -1) if present(ks[i])), -1)
+            t = (last + 1) * g.tokens_per_chunk
+            bound = t if bound is None else min(bound, t)
+        for g, gs in groups:
+            if g.sliding_window_size_in_chunks is None:
+                continue
+            ks = list(gs.offload_keys)
+            if bound is None:
+                end = next((i + 1 for i in range(len(ks) - 1, -1, -1) if present(ks[i])), 0)
+            else:
+                end = min(bound // g.tokens_per_chunk, len(ks))
+            w = (g.load_window_size_in_chunks(end * g.tokens_per_chunk) if hasattr(g, "load_window_size_in_chunks")
+                 else g.sliding_window_size_in_chunks) or 0
+            out += ks[max(end - w, 0):end]
+        pos = getattr(ctx, "get_offload_key_position", None)
+        if pos is not None and len(groups) > 1:
+            out.sort(key=lambda k: pos(k) or 0)
+        return out
+
+    def _unhold(self, rid: str) -> None:
+        pol = STATE.policy
+        if pol is not None and hasattr(pol, "unhold"):
+            pol.unhold(rid)
+
+    def _prefetch(self) -> None:
+        """Prefetch: start the disk -> CPU promotion of waiting requests' prefixes while they queue, so a restore
+        from disk overlaps the queue wait instead of starting when the scheduler reaches the request. In queue
+        order, while the chunks held by the requests up to this one fit in the CPU tier's room (its capacity less
+        the chunks in use), once per request; the scheduler's own lookup at admission handles anything that is not
+        ready. The tiering manager submits the promotions at the end of this schedule."""
+        pol = STATE.policy
+        if pol is None or not getattr(pol, "held", None) or STATE.fs_tier is None:
+            return
+        cs = self.connector_scheduler
+        mgr = cs.manager
+        prim = getattr(mgr, "primary_tier", None)
+        if prim is None:
+            return
+        fs = STATE.fs_tier
+        # do not stack prefetch reads onto an already-busy disk read queue or same-step pending promotions
+        # (avoids CPU pin lockup, promo_afal, and disk contention with active admission promotions)
+        if getattr(fs, "_loading", None) or self._pending_promo_chunks() > 0:
+            return
+        if any(rid not in self._ready for rid in self._deferred):
+            return
+        now = time.monotonic()
+        # leave headroom for running requests' unwritten CPU stores and pending disk writes so prefetched
+        # waiting chunks never evict running prompts or thrash a tight CPU tier
+        pinned = len(pol.chunks) - len(pol.evictable)
+        if pinned > pol.cache_capacity // 2:
+            return
+        pmem = pol.pending_mem_count() if hasattr(pol, "pending_mem_count") else 0
+        reserve = min(int(STATE.burst_now(now)), pol.cache_capacity // 3)
+        room = pol.cache_capacity - pinned - pmem - reserve
+        L, p = STATE.live, STATE.params()
+        npf, na = L.rate("pf", now), L.rate("n_adm", now)
+        used = 0
+        for rid, (_, keys) in sorted(pol.held.items(), key=lambda kv: kv[1][0]):
+            used += len(keys)
+            if used > room:
+                break
+            if rid in self._prefetched or rid in self.__dict__.get("_gave_up", ()):
+                continue
+            rs = cs._req_status.get(rid)
+            if rs is None or rs.transfer_jobs:
+                continue
+            # only prefetch disk chunks when reading them from disk beats recomputing them under current load
+            d_chunks, d_tokens = self._disk_prefix_need(rs, self._gpu_prefix_tokens(rs))
+            avail = pol.cache_capacity - pinned
+            if d_chunks > 0 and p.disk_gbps > 0 and p.bytes_per_token > 0:
+                if d_chunks > avail:
+                    break
+                disk_s = d_tokens * p.bytes_per_token / (p.disk_gbps * 1e9)
+                _, cap = recompute_cost(d_tokens, npf, na, p)
+                if disk_s >= cap:
+                    continue
+            n = self._prefetch_req(rs, mgr, prim)
+            self._prefetched[rid] = n
+            STATE.counts["prefetch"] += n
+            if n > 0:
+                break   # prefetch one waiting request per step so head-of-queue lands first without ping-pong
+
+    def _disk_prefix_need(self, rs, local: int) -> tuple[int, int]:
+        """Count (disk_chunks, disk_tokens) past `local` that are missing from CPU but present on disk."""
+        fs = STATE.fs_tier
+        if fs is None:
+            return 0, 0
+        mgr = self.connector_scheduler.manager
+        prim = getattr(mgr, "primary_tier", mgr)
+        on_disk = getattr(fs, "_on_disk", ())
+        groups = list(zip(self.connector_scheduler.config.kv_group_configs, rs.group_states))
+        d_chunks = 0
+        d_toks = None
+        bound = None
+        for g, gs in groups:
+            if getattr(g, "sliding_window_size_in_chunks", None) is not None:
+                continue
+            tc = g.tokens_per_chunk
+            start = local // tc
+            hit = start
+            dc = 0
+            for k in gs.offload_keys[start:]:
+                r = prim.lookup(k, rs.req_context)
+                if r is LookupResult.HIT:
+                    hit += 1
+                elif k in on_disk:
+                    hit += 1
+                    dc += 1
+                else:
+                    break
+            d_chunks += dc
+            dt = dc * tc
+            d_toks = dt if d_toks is None else min(d_toks, dt)
+            b = hit * tc
+            bound = b if bound is None else min(bound, b)
+        for g, gs in groups:
+            sw = getattr(g, "sliding_window_size_in_chunks", None)
+            if sw is None:
+                continue
+            tc = g.tokens_per_chunk
+            ks = gs.offload_keys
+            end = len(ks) if bound is None else min(bound // tc, len(ks))
+            w = (g.load_window_size_in_chunks(end * tc) if hasattr(g, "load_window_size_in_chunks") else sw) or 0
+            for k in ks[max(end - w, 0):end]:
+                if prim.lookup(k, rs.req_context) is LookupResult.MISS and k in on_disk:
+                    d_chunks += 1
+        return d_chunks, d_toks or 0
+
+    def _prefetch_req(self, rs, mgr, prim) -> int:
+        """Look up a waiting request's chunks as the scheduler will (the tiering manager starts a promotion for each
+        one only the disk has): full-attention groups along the prefix up to the first chunk no tier has, then each
+        windowed group (sliding window, Mamba state) over the window that ends at that prefix. Returns the
+        promotions started."""
+        groups = list(zip(self.connector_scheduler.config.kv_group_configs, rs.group_states))
+        n = 0
+        local = self._gpu_prefix_tokens(rs)    # vLLM loads only past the prefix its GPU cache still holds
+
+        def one(k):
+            nonlocal n
+            before = prim.lookup(k, rs.req_context)
+            r = mgr.lookup(k, rs.req_context)
+            if before is LookupResult.MISS and r is LookupResult.HIT_PENDING:
+                n += 1
+            return r
+
+        bound = None                                # tokens of the prefix every full-attention group has
+        for g, gs in groups:
+            if g.sliding_window_size_in_chunks is not None:
+                continue
+            start = local // g.tokens_per_chunk
+            hit = start
+            for k in gs.offload_keys[start:]:
+                if one(k) is LookupResult.MISS:
+                    break
+                hit += 1
+            bound = hit * g.tokens_per_chunk if bound is None else min(bound, hit * g.tokens_per_chunk)
+        for g, gs in groups:
+            if g.sliding_window_size_in_chunks is None:
+                continue
+            ks = gs.offload_keys
+            end = len(ks) if bound is None else min(bound // g.tokens_per_chunk, len(ks))
+            w = (g.load_window_size_in_chunks(end * g.tokens_per_chunk) if hasattr(g, "load_window_size_in_chunks")
+                 else g.sliding_window_size_in_chunks)
+            for k in ks[max(end - (w or 0), 0):end]:
+                one(k)
+        return n
+
+    def _gpu_prefix_tokens(self, rs) -> int:
+        """Tokens of the request's prefix whose blocks the GPU prefix cache holds now, in every full-attention group
+        (vLLM's local hit; the offload lookup starts past it). 0 without a bound block pool."""
+        pool = getattr(self, "_pool", None)
+        req = getattr(rs, "req", None)
+        if pool is None or req is None or not hasattr(pool, "get_cached_block"):
+            return 0
+        gids = [g.group_idx for g in self.connector_scheduler.config.kv_group_configs
+                if g.sliding_window_size_in_chunks is None]
+        if not gids:
+            return 0
+        n = 0
+        for h in req.block_hashes:
+            if pool.get_cached_block(h, gids) is None:
+                break
+            n += 1
+        return n * STATE.hash_tokens
+
+    def _ready_only_lookup(self, request, num_computed_tokens):
+        cs = self.connector_scheduler
+        proxy = _ReadyOnly(cs.manager)
+        cs.manager = proxy
+        try:
+            out = super().get_num_new_matched_tokens(request, num_computed_tokens)
+        finally:
+            cs.manager = proxy.inner
+        pol = STATE.policy
+        step_prot = getattr(pol, "_step_protected", None) if pol is not None else None
+        if step_prot is not None and out[0] is not None and out[0] > 0:
+            rs = cs._req_status.get(request.request_id)
+            if rs is not None:
+                for k in _request_keys(rs):
+                    if k in pol.chunks:
+                        step_prot.add(k)
+        return out
+
+    def _pending_promo_chunks(self) -> int:
+        """Chunks already pinned (ref_cnt=-1) in primary_tier by same-step promotions waiting in
+        TieringOffloadingManager._pending_load_submissions until on_schedule_end() flushes them."""
+        pend = getattr(self.connector_scheduler.manager, "_pending_load_submissions", None)
+        if not pend:
+            return 0
+        total = 0
+        for tier_map in pend.values():
+            for entry in tier_map.values():
+                total += len(entry.keys)
+        return total
+
+    def _has_inflight_promotion(self, rs, local: int) -> bool:
+        """True if any chunk of rs past `local` is already HIT_PENDING in primary_tier."""
+        mgr = self.connector_scheduler.manager
+        prim = getattr(mgr, "primary_tier", mgr)
+        for g, gs in zip(self.connector_scheduler.config.kv_group_configs, rs.group_states):
+            start = 0 if getattr(g, "sliding_window_size_in_chunks", None) is not None else local // g.tokens_per_chunk
+            for k in gs.offload_keys[start:]:
+                if prim.lookup(k, rs.req_context) is LookupResult.HIT_PENDING:
+                    return True
+        return False
 
     def get_num_new_matched_tokens(self, request, num_computed_tokens):
         rid = request.request_id
-        self._local[rid] = int(num_computed_tokens)
-        out = super().get_num_new_matched_tokens(request, num_computed_tokens)
+        local = int(num_computed_tokens)
+        self._local[rid] = local
+        pol, fs = STATE.policy, STATE.fs_tier
+        gave_up = self.__dict__.setdefault("_gave_up", set())
+        defer_accum = self.__dict__.setdefault("_defer_accum", {})
+        pin_deferred = self.__dict__.setdefault("_pin_deferred", set())
+        # sticky give-up: once a waiting request already gave up on disk promotion, serve its resident CPU
+        # prefix directly without re-launching the same doomed promotion on subsequent scheduler steps
+        if rid in gave_up:
+            return self._ready_only_lookup(request, local)
+        # queue-ordered promotion & CPU-pin-budget gate:
+        #   1. Tracks BOTH in-flight disk loads (fs._loading) AND same-step pending promotions
+        #      (_pending_load_submissions, already pinned ref_cnt=-1 before on_schedule_end()).
+        #   2. Serializes disk promotions in FCFS queue order when promoting a later request would exceed
+        #      CPU capacity with earlier queued requests (eliminates promote->evict->re-promote ping-pong).
+        #   3. Never blindly admits cached fast-disk prompts with ext=0 when pinned >= 75%; defers cleanly
+        #      unless waiting genuinely exceeds recompute_cost(d_tokens) (slow/saturated disk).
+        if pol is not None and fs is not None and getattr(fs, "_on_disk", None):
+            rs = self.connector_scheduler._req_status.get(rid)
+            if rs is not None:
+                rs.update_offload_keys()
+                d_chunks, d_tokens = self._disk_prefix_need(rs, local)
+                if d_chunks > 0 and not self._has_inflight_promotion(rs, local):
+                    pinned = len(pol.chunks) - len(pol.evictable)
+                    avail = max(pol.cache_capacity - pinned, 0)
+                    three_q = max(pol.cache_capacity * 3 // 4, 1)
+                    loading_keys = {k for ks in getattr(fs, "_loading", {}).values() for k in ks}
+                    loading_chunks = len(loading_keys)
+                    pending_promo = self._pending_promo_chunks()
+                    active_promo = loading_chunks + pending_promo
+                    ahead_chunks = 0
+                    ahead_disk_chunks = 0
+                    own_chunks = d_chunks
+                    held = getattr(pol, "held", None)
+                    if held and rid in held:
+                        my_rank, my_keys = held[rid]
+                        own_chunks = max(len(my_keys), d_chunks)
+                        mgr = self.connector_scheduler.manager
+                        prim = getattr(mgr, "primary_tier", mgr)
+                        on_disk = fs._on_disk
+                        for h_rid, (h_rank, h_keys) in held.items():
+                            if h_rid != rid and h_rid not in gave_up and h_rank < my_rank:
+                                ahead_chunks += len(h_keys)
+                                h_rs = self.connector_scheduler._req_status.get(h_rid)
+                                h_ctx = h_rs.req_context if h_rs is not None else rs.req_context
+                                for hk in h_keys:
+                                    if hk in on_disk and hk not in loading_keys and prim.lookup(hk, h_ctx) is LookupResult.MISS:
+                                        ahead_disk_chunks += 1
+                    fits_cap = d_chunks <= pol.cache_capacity
+                    pin_ceil = pol.cache_capacity - max(pol.cache_capacity // 8, 1)
+                    queue_overflow = (ahead_chunks > 0 and fits_cap
+                                      and (ahead_chunks + own_chunks) > pol.cache_capacity)
+                    overlap_block = (active_promo > 0 and (
+                        (fits_cap and d_chunks > avail)
+                        or (pinned + d_chunks > pin_ceil)
+                    ))
+                    pin_block = (pinned >= three_q) or (fits_cap and pinned > 0 and (pinned + d_chunks) > pin_ceil)
+                    if queue_overflow or overlap_block or pin_block:
+                        now_g = time.monotonic()
+                        p, L = STATE.params(), STATE.live
+                        link_bps = p.disk_gbps * 1e9
+                        own_disk_s = d_tokens * p.bytes_per_token / link_bps if link_bps > 0 else 0.0
+                        own_rec_s, cap = recompute_cost(d_tokens, L.rate("pf", now_g), L.rate("n_adm", now_g), p)
+                        bps = (fs.drain_rate() if hasattr(fs, "drain_rate") else None) or link_bps
+                        chunk_bytes = max(getattr(fs, "_block_size", 0), p.bytes_per_token * STATE.chunk_tokens)
+                        ahead_bytes = (active_promo + ahead_disk_chunks) * chunk_bytes
+                        est_wait = (ahead_bytes / bps if bps > 0 else 0.0) + own_disk_s
+                        if est_wait > cap:
+                            pin_deferred.discard(rid)
+                            gave_up.add(rid)
+                            return self._ready_only_lookup(request, local)
+                        if queue_overflow and own_disk_s <= own_rec_s:
+                            # Fast-disk FCFS queue-order wait: earlier waiting requests fill CPU capacity
+                            # and disk restore is faster than GPU recompute, so wait our turn without
+                            # starting an overlapping/evicting promotion or triggering false give-ups.
+                            pin_deferred.add(rid)
+                            return (None, False)
+                        t0 = self._deferred.setdefault(rid, now_g)
+                        if defer_accum.get(rid, 0.0) + (now_g - t0) > cap:
+                            pin_deferred.discard(rid)
+                            gave_up.add(rid)
+                            return self._ready_only_lookup(request, local)
+                        pin_deferred.add(rid)
+                        return (None, False)
+        pin_deferred.discard(rid)
+        # step-scoped protection against upstream vLLM 0.34.0 TieringOffloadingManager race:
+        # lookup() calls _initiate_promotion() -> primary_tier.prepare_write() which can evict unpinned
+        # HIT chunks of this or another request in the SAME scheduler step before update_state_after_alloc()
+        # calls prepare_load(), crashing EngineCore with AssertionError("Chunk ... not found in cache").
+        step_added = []
+        step_prot = getattr(pol, "_step_protected", None) if pol is not None else None
+        if step_prot is not None:
+            rs = self.connector_scheduler._req_status.get(rid)
+            if rs is not None:
+                rs.update_offload_keys()
+                for k in _request_keys(rs):
+                    if k in pol.chunks and k not in step_prot:
+                        step_prot.add(k)
+                        step_added.append(k)
+        out = super().get_num_new_matched_tokens(request, local)
+        if step_added and (out[0] is None or out[0] <= 0):
+            step_prot.difference_update(step_added)
         if out[0] is not None:
+            if rid in self._deferred and rid not in self._ready:
+                self._ready[rid] = time.monotonic()      # the promotion it waited on has landed
             return out
         now = time.monotonic()
+        if rid in self._ready:
+            # an earlier promotion already landed and waited in the GPU queue before being evicted:
+            # accumulate ONLY the real prior deferral time (ready - deferred, excluding GPU queue wait)
+            # so legitimate GPU queue waits do not cause false give-ups, while repeated slow-disk
+            # promotion failures/evictions cannot loop forever with a reset clock
+            prev_t0 = self._deferred.get(rid)
+            prev_tr = self._ready.pop(rid)
+            if prev_t0 is not None:
+                defer_accum[rid] = defer_accum.get(rid, 0.0) + max(prev_tr - prev_t0, 0.0)
+            self._deferred.pop(rid, None)
+            self.__dict__.get("_est0", {}).pop(rid, None)
         t0 = self._deferred.get(rid)
         if t0 is None:
             # the offload tier is promoting part of the prefix (disk -> CPU): the request waits steps
-            self._deferred[rid] = now
-            return out
-        alt = _safe("defer cap", self._defer_cap, request, int(num_computed_tokens), now - t0, now)
+            self._deferred[rid] = t0 = now
+            rs = self.connector_scheduler._req_status.get(rid)
+            if rs is not None:
+                dr = self.__dict__.setdefault("_defer_ready", {})
+                dr[rid] = self._ready_tokens(rs, local)[0]
+        waited = defer_accum.get(rid, 0.0) + (now - t0)
+        alt = _safe("defer cap", self._defer_cap, request, local, waited, now)
         return out if alt is None else alt
 
     def _defer_cap(self, request, local: int, waited: float, now: float):
-        """The bounded deferral: once the wait since the first deferral exceeds the recompute of the tokens it
-        waits on, give up and return what the base can load now (0 if nothing). None: keep waiting."""
+        """The bounded deferral: give up and return what the base can load now (0 if nothing) when the remaining
+        wait for the promotion exceeds the recompute of the tokens it waits on (forward), when the wait so far
+        exceeds the first remaining estimate by more than that recompute (safety), or, with no estimate, when
+        the wait so far exceeds it (fallback). None: keep waiting."""
         cs = self.connector_scheduler
-        rs = cs._req_status.get(request.request_id)
+        rid = request.request_id
+        rs = cs._req_status.get(rid)
         if rs is None or rs.transfer_jobs:
             return None     # the base holds a request with its own transfers in flight; that is not a promotion
         ready, key = self._ready_tokens(rs, local)
         n = max(request.num_prompt_tokens - local - ready, 0)
         L = STATE.live
         x, cap = recompute_cost(n, L.rate("pf", now), L.rate("n_adm", now), STATE.params())
-        if waited <= cap:
+        rem, link = self._remaining(key)
+        est0_map = self.__dict__.setdefault("_est0", {})
+        est = est0_map.get(rid)
+        if rem is not None and est is None:
+            est = est0_map[rid] = (now, rem, link)
+        if rem is not None and rem > cap:
+            branch = "forward"
+        elif est is not None and waited > est[1] + cap:
+            branch = "safety"
+        elif est is None and rem is None and waited > cap:
+            branch = "fallback"
+        else:
             return None
         proxy = _ReadyOnly(cs.manager)
         cs.manager = proxy
@@ -252,78 +689,199 @@ class ParkConnector(OffloadingConnector):
             cs.manager = proxy.inner
         if out[0] is None:
             return None     # another request is loading these chunks to the GPU: that wait ends with its load
-        g = self._giveups.get(request.request_id)
+        self.__dict__.setdefault("_gave_up", set()).add(rid)
+        g = self._giveups.get(rid)
         if g is None or g.get("admitted"):
             # one give-up per deferral: a request the scheduler could not fit after giving up gives up again
             # next step without a second count (a preempted request's new deferral is a new give-up)
             STATE.counts["defer_giveup"] += 1
-            g = self._giveups[request.request_id] = dict(t=now, ctx=rs.req_context)
-        g.update(x=x, waited=waited, cap=cap, ready=ready, n=n, key=key)
-        logger.debug("park: request %s gave up a %.1f s deferral (cap %.2f s, %d tokens ready, %d to recompute)",
-                     request.request_id, waited, cap, ready, n)
+            g = self._giveups[rid] = dict(t=now, ctx=rs.req_context)
+        g.update(x=x, waited=waited, cap=cap, ready=ready, n=n, key=key, rem=rem, branch=branch,
+                 est0=None if est is None else est[1], link0=None if est is None else est[2])
+        logger.debug("park: request %s gave up a %.1f s deferral (%s: rem %s s, cap %.2f s, %d tokens ready, "
+                     "%d to recompute)", rid, waited, branch, None if rem is None else round(rem, 2), cap, ready, n)
         return out
+
+    def _remaining(self, key):
+        """Seconds until the promotion for key lands: bytes ahead on the disk load queue (submitted loads plus
+        promotions the tiering manager still holds until step end) at the queue's measured drain rate, and at
+        the per-transfer disk speed. (None, None) when no load job reads key."""
+        fs = STATE.fs_tier
+        if key is None or fs is None or not hasattr(fs, "load_queue_ahead"):
+            return None, None
+        mgr = self.connector_scheduler.manager
+        pend = getattr(mgr, "_pending_load_submissions", None) or {}
+        pending = ()
+        for i, tier in enumerate(getattr(mgr, "secondary_tiers", ())):
+            if tier is fs:
+                pending = [e.keys for e in pend.get(i, {}).values()]
+                break
+        ahead = fs.load_queue_ahead(key, pending)
+        if ahead is None:
+            return None, None
+        link_bps = STATE.speeds.gbps("disk") * 1e9
+        link = ahead / link_bps if link_bps > 0 else None
+        drain = fs.drain_rate() if hasattr(fs, "drain_rate") else None
+        bps = drain if drain else link_bps
+        return (ahead / bps if bps > 0 else None), link
 
     def _ready_tokens(self, rs, local: int):
         """Tokens past the local hit that every KV group can load now, and the first chunk key that is not
-        ready. Read from the CPU tier only (no lookup that could start a promotion)."""
+        ready (preferring HIT_PENDING). For hybrid windowed groups (SWA, Mamba), checks only the window ending
+        at the full-attention prefix rather than stale pre-window chunks."""
         mgr = self.connector_scheduler.manager
         prim = getattr(mgr, "primary_tier", mgr)
+        groups = list(zip(self.connector_scheduler.config.kv_group_configs, rs.group_states))
         ready, pending = None, None
-        for g, gs in zip(self.connector_scheduler.config.kv_group_configs, rs.group_states):
+        for g, gs in groups:
+            if getattr(g, "sliding_window_size_in_chunks", None) is not None:
+                continue
             tc = g.tokens_per_chunk
             start = local // tc
             n = 0
             for key in gs.offload_keys[start:]:
-                if prim.lookup(key, rs.req_context) is not LookupResult.HIT:
-                    if pending is None:
+                r = prim.lookup(key, rs.req_context)
+                if r is not LookupResult.HIT:
+                    if pending is None or r is LookupResult.HIT_PENDING:
                         pending = key
                     break
                 n += 1
             tokens = max(tc * (start + n) - local, 0)
             ready = tokens if ready is None else min(ready, tokens)
+        bound = local + (ready or 0)
+        for g, gs in groups:
+            sw = getattr(g, "sliding_window_size_in_chunks", None)
+            if sw is None:
+                continue
+            tc = g.tokens_per_chunk
+            ks = gs.offload_keys
+            end = len(ks) if ready is None else min(bound // tc, len(ks))
+            w = (g.load_window_size_in_chunks(end * tc) if hasattr(g, "load_window_size_in_chunks") else sw) or 0
+            lo = max(end - w, 0)
+            for key in ks[lo:end]:
+                r = prim.lookup(key, rs.req_context)
+                if r is not LookupResult.HIT:
+                    if r is LookupResult.HIT_PENDING or pending is None:
+                        pending = key
+                    ready = 0
+                    break
         return ready or 0, pending
 
     def _settle_giveups(self, now: float) -> None:
         """A give-up's saving is known once the promotion it waited on resolves: the chunk is ready in the CPU
-        tier (or gone, the promotion failed or its slot was evicted). The deferral would have ended then at the
-        earliest, so the request saved that remaining wait less the recompute it paid instead."""
+        tier (or gone, the promotion failed or its slot was evicted). Keep settled entries while the request is
+        still deferred (not yet admitted) so defer_giveup is never counted twice for one deferral."""
         if not self._giveups:
             return
         mgr = self.connector_scheduler.manager
         prim = getattr(mgr, "primary_tier", mgr)
         for rid, g in list(self._giveups.items()):
+            if g.get("settled"):
+                if rid not in self._deferred:
+                    del self._giveups[rid]
+                continue
             if g["key"] is not None and prim.lookup(g["key"], g["ctx"]) is LookupResult.HIT_PENDING:
                 continue
             STATE.live.add(now, n_giveup=1.0, giveup_saved=(now - g["t"]) - g["x"])
-            del self._giveups[rid]
+            g["settled"] = True
+            if rid not in self._deferred:
+                del self._giveups[rid]
+
+    def _check_ready(self, now: float) -> None:
+        """Stamp _ready[rid] as soon as a deferred request's disk promotion actually lands in primary_tier,
+        even if vLLM's FCFS scheduler is blocked on an earlier queued request and does not poll rid
+        again for several seconds (prevents GPU queue wait from polluting defer telemetry). Does NOT stamp
+        _ready if the missing key dropped back to MISS (failed allocation / evicted before landing)."""
+        if not self._deferred:
+            return
+        cs = self.connector_scheduler
+        mgr = cs.manager
+        prim = getattr(mgr, "primary_tier", mgr)
+        fs = STATE.fs_tier
+        on_disk = getattr(fs, "_on_disk", ()) if fs is not None else ()
+        for rid in list(self._deferred):
+            if rid in self._ready or rid in self._giveups:
+                continue
+            rs = cs._req_status.get(rid)
+            if rs is None or rs.transfer_jobs:
+                continue
+            _, key = self._ready_tokens(rs, self._local.get(rid, 0))
+            if key is None or (prim.lookup(key, rs.req_context) is not LookupResult.HIT_PENDING and key not in on_disk):
+                self._ready[rid] = now
 
     def _admit(self, request, num_external_tokens):
-        t = self._waiting.pop(request.request_id, None)
-        td = self._deferred.pop(request.request_id, None)
-        local = self._local.pop(request.request_id, None)
-        g = self._giveups.get(request.request_id)
+        rid = request.request_id
+        self._unhold(rid)
+        pol = STATE.policy
+        rs = self.connector_scheduler._req_status.get(rid)
+        if pol is not None and rs is not None and hasattr(pol, "mark_pending_write"):
+            now_a = time.monotonic()
+            rs.update_offload_keys()
+            lens = [len(gs.offload_keys) for gs in rs.group_states]
+            keys = _request_keys(rs)
+            self.__dict__.setdefault("_running", {})[rid] = lens
+            if keys:
+                pol.mark_pending_write(keys, now_a, ttl=600.0, eta=None)
+        pf = self._prefetched.pop(rid, 0)
+        t = self._waiting.pop(rid, None)
+        td = self._deferred.pop(rid, None)
+        tr = self._ready.pop(rid, None)
+        self.__dict__.get("_defer_accum", {}).pop(rid, None)
+        self.__dict__.get("_gave_up", set()).discard(rid)
+        self.__dict__.get("_pin_deferred", set()).discard(rid)
+        dr = self.__dict__.get("_defer_ready", {}).pop(rid, 0)
+        est = self.__dict__.get("_est0", {}).pop(rid, None)
+        local = self._local.pop(rid, None)
+        g = self._giveups.get(rid)
         if g is not None:
             if g.get("admitted"):
                 g = None             # an earlier admission's give-up (the request was preempted since)
             else:
                 g["admitted"] = True
+                if g.get("settled"):
+                    del self._giveups[rid]
+        p = STATE.params()
+        landed = None
         if td is not None:
             now = time.monotonic()
-            # a return whose prefix was on disk paid the wait, and after a give-up the recompute too
-            STATE.live.add(now, n_defer=1.0, defer=now - td + (g["x"] if g is not None else 0.0))
+            # a restore from disk costs the promotion: first deferral to the first lookup that could load (the wait
+            # for admission after that is the queue every request pays, priced by the rule as Q); after a give-up,
+            # the wait until it gave up plus the recompute. Also record defer_x (expected transfer seconds of the
+            # promoted tokens) so layby.rule scales disk restore proportionally to session size N and on_disk f0.
+            defer_w = (tr if tr is not None else now) - td + (g["x"] if g is not None else 0.0)
+            promo_toks = g["n"] if g is not None else max(num_external_tokens - dr, 0)
+            defer_x = promo_toks * p.bytes_per_token / (p.disk_gbps * 1e9) if (promo_toks > 0 and p.disk_gbps > 0) else 0.0
+            kw = dict(n_defer=1.0, defer=defer_w)
+            if defer_x > 0.0:
+                kw.update(n_defer_x=1.0, defer_x=defer_x)
+            STATE.live.add(now, **kw)
+            if g is None:
+                landed = dict(wait=(tr if tr is not None else now) - td)
+                if est is not None:
+                    landed.update(est0=est[1], link0=est[2], est_wait=(tr if tr is not None else now) - est[0])
+        elif pf and num_external_tokens > 0:
+            # a restore from disk its prefetch finished during the queue wait: it cost the admission nothing
+            promo_toks = min(pf * STATE.chunk_tokens, num_external_tokens)
+            defer_x = promo_toks * p.bytes_per_token / (p.disk_gbps * 1e9) if (promo_toks > 0 and p.disk_gbps > 0) else 0.0
+            kw = dict(n_defer=1.0, defer=0.0)
+            if defer_x > 0.0:
+                kw.update(n_defer_x=1.0, defer_x=defer_x)
+            STATE.live.add(time.monotonic(), **kw)
         if t is not None:
             now = time.monotonic()
             STATE.live.add(now, n_adm=1.0, qwait=now - t)
             self._account_misses(request, num_external_tokens, now,
                                  request.num_computed_tokens if local is None else max(local, request.num_computed_tokens),
-                                 g)
+                                 g, qwait=now - t, defer=None if td is None else now - td,
+                                 promo=None if td is None or tr is None else tr - td, landed=landed)
 
     def update_state_after_alloc(self, request, blocks, num_external_tokens: int):
         out = super().update_state_after_alloc(request, blocks, num_external_tokens)
         _safe("admission", self._admit, request, num_external_tokens)
         return out
 
-    def _account_misses(self, request, ext: int, now: float, local: int, giveup=None) -> None:
+    def _account_misses(self, request, ext: int, now: float, local: int, giveup=None, qwait=None, defer=None,
+                        promo=None, landed=None) -> None:
         """The latency this admission loses to KV the GPU and the CPU tier evicted (and how long
         ago): the load of what comes from outside the GPU, at the CPU link's measured speed and wait,
         and the recompute of what comes from nowhere, at the measured prefill speed; each counted with
@@ -333,8 +891,20 @@ class ParkConnector(OffloadingConnector):
         rec = max(prompt - local - ext, 0)
         params = getattr(request, "kv_transfer_params", None) or {}
         row = dict(t=round(now, 3), sess=session_of(params.get("park_key")), P=prompt, local=local, ext=ext, rec=rec)
+        if qwait is not None:
+            row["qwait"] = round(qwait, 3)          # add to admission
+        if defer is not None:
+            row["defer"] = round(defer, 3)          # first deferral (a promotion from disk) to admission
+        if promo is not None:
+            row["promo"] = round(promo, 3)          # first deferral to the promotion landing
         if giveup is not None:
-            row.update(giveup=True, wait=round(giveup["waited"], 3), cap=round(giveup["cap"], 3), ready=giveup["ready"])
+            row.update(giveup=True, wait=round(giveup["waited"], 3), cap=round(giveup["cap"], 3), ready=giveup["ready"],
+                       branch=giveup.get("branch"),
+                       rem=None if giveup.get("rem") is None else round(giveup["rem"], 3),
+                       est0=None if giveup.get("est0") is None else round(giveup["est0"], 3),
+                       link0=None if giveup.get("link0") is None else round(giveup["link0"], 3))
+        elif landed is not None:
+            row.update({k: round(v, 3) for k, v in landed.items() if v is not None})
         STATE.rlog.append(row)
         del STATE.rlog[:-20000]
         if prompt - local <= 0:
@@ -359,11 +929,14 @@ class ParkConnector(OffloadingConnector):
         if pol is not None and req_status is not None and rec > 0:
             keys = [k for g, gs in zip(self.connector_scheduler.config.kv_group_configs, req_status.group_states)
                     for k in gs.offload_keys[(local + ext) // g.tokens_per_chunk: prompt // g.tokens_per_chunk]]
-            tc = [pol.c_evicted[k] for k in keys if k in pol.c_evicted]
-            if tc:
-                # loss beyond what loading the same tokens from a CPU copy would have cost
-                lost_c = max(full - rec * p.bytes_per_token / (p.cpu_gbps * 1e9), 0.0)
-                L.miss(now, "c", now - max(tc), lost_c)
+            ev = [k for k in keys if k in pol.c_evicted]
+            kept = [k for k in ev if k not in pol.c_first]
+            if kept:
+                # loss beyond what loading the same tokens from a CPU copy would have cost, for the share of the
+                # missing chunks the tier evicted under pressure; chunks the rule placed first out (park, drop)
+                # were lost by that decision, which prices them itself, so they do not raise the holding price
+                lost_c = max(full - rec * p.bytes_per_token / (p.cpu_gbps * 1e9), 0.0) * len(kept) / len(ev)
+                L.miss(now, "c", now - max(pol.c_evicted[k] for k in kept), lost_c)
                 L.add(now, miss_c=lost_c)
 
     # --- steps and the CPU link --------------------------------------------------------
@@ -372,19 +945,64 @@ class ParkConnector(OffloadingConnector):
         _safe("idle", STATE.flush_idle, now)
         _safe("hints", self._drain_hints, now)
         _safe("giveups", self._settle_giveups, now)
+        _safe("ready", self._check_ready, now)
         _safe("step", self._step, scheduler_output, now)
+        for rid in getattr(scheduler_output, "preempted_req_ids", None) or ():
+            # back in the queue at its head (vLLM resumes preempted requests first): ranks before every arrival
+            self.__dict__.get("_running", {}).pop(rid, None)
+            _safe("hold", self._hold, rid, -now)
+        # all update_state_after_alloc -> prepare_load calls for this scheduler step have completed;
+        # clear step-scoped HIT protection before _prefetch() and GPU->CPU stores run
+        pol = STATE.policy
+        if pol is not None and hasattr(pol, "_step_protected"):
+            pol._step_protected.clear()
+        _safe("prefetch", self._prefetch)
+        if getattr(self, "_gpu_demote", None):
+            _safe("gpu order", self._apply_gpu_order)
         meta = super().build_connector_meta(scheduler_output)
+        _safe("protect running", self._protect_running, scheduler_output, now)
         for job_id, job in meta.load_jobs.items():
             self._loads[job_id] = (now, len(job.src_spec.block_ids))
         if now - self._last_prune > 60.0:
             _safe("prune", self._prune, now)
         return meta
 
+    def _protect_running(self, scheduler_output, now: float) -> None:
+        """Keep newly stored CPU chunks of currently running requests protected below idle chunks
+        until finish (still evictable if needed, zero pinning): prevents vLLM 0.31 from evicting a
+        running request's early prefill chunks during its own decode before the cost rule runs."""
+        running = self.__dict__.get("_running")
+        pol = STATE.policy
+        if not running or pol is None or not hasattr(pol, "mark_pending_write"):
+            return
+        cs = self.connector_scheduler
+        for rid in getattr(scheduler_output, "num_scheduled_tokens", None) or ():
+            prev = running.get(rid)
+            if prev is None:
+                continue
+            rs = cs._req_status.get(rid)
+            if rs is None:
+                continue
+            new_keys = []
+            for gi, gs in enumerate(rs.group_states):
+                ks = gs.offload_keys
+                n = len(ks)
+                old = prev[gi] if gi < len(prev) else 0
+                if n > old:
+                    new_keys.extend(ks[old:n])
+                    if gi < len(prev):
+                        prev[gi] = n
+                    else:
+                        prev.append(n)
+            if new_keys:
+                pol.mark_pending_write(new_keys, now, ttl=600.0, eta=None)
+
     def _step(self, scheduler_output, now):
         it = compute_iteration_details(scheduler_output)
         if self._last_step is not None:
             t, pt, work = self._last_step
             dt = now - t
+            self._step_dt = dt
             if work:
                 STATE.speeds.step(now, dt, pt)
             STATE.live.add(now, nw=len(self._waiting) * dt, pf=(len(self._waiting) + it.num_ctx_requests) * dt)
@@ -425,29 +1043,61 @@ class ParkConnector(OffloadingConnector):
 
     def _on_finish(self, request, block_ids) -> None:
         now = time.monotonic()
-        self._waiting.pop(request.request_id, None)
-        self._deferred.pop(request.request_id, None)
-        ids = block_ids[0] if block_ids and isinstance(block_ids[0], (list, tuple)) else block_ids
+        rid = request.request_id
+        self._unhold(rid)          # finished or aborted while waiting
+        self.__dict__.get("_running", {}).pop(rid, None)
+        self._prefetched.pop(rid, None)
+        self._waiting.pop(rid, None)
+        self._deferred.pop(rid, None)
+        self.__dict__.get("_defer_accum", {}).pop(rid, None)
+        self.__dict__.get("_gave_up", set()).discard(rid)
+        self.__dict__.get("_pin_deferred", set()).discard(rid)
+        self._ready.pop(rid, None)
+        self.__dict__.get("_defer_ready", {}).pop(rid, None)
+        self.__dict__.get("_est0", {}).pop(rid, None)
+        groups = block_ids if block_ids and isinstance(block_ids[0], (list, tuple)) else [block_ids or []]
+        ids = groups[0]
         pool = getattr(self, "_pool", None)
         for bid in ids or ():
             if pool is None or pool.blocks[bid].ref_cnt <= 1:     # no other running request holds it
                 STATE.g_idle[bid] = now
-        req_status = self.connector_scheduler._req_status.get(request.request_id)
+        req_status = self.connector_scheduler._req_status.get(rid)
         if req_status is None:
             return
         params = request.kv_transfer_params
         if params is None:
             params = {}
             req_status.req_context.kv_transfer_params = params
-        key = str(params.get("park_key") or request.request_id)
-        entry = dict(keys=_request_keys(req_status), tokens=request.num_tokens,
+        key = str(params.get("park_key") or rid)
+        # per full-attention KV group keys for exact on_disk token count on hybrid models (Gemma-4, Qwen3.8, GLM)
+        g_cfgs = getattr(getattr(self.connector_scheduler, "config", None), "kv_group_configs", ())
+        group_keys = [(g.tokens_per_chunk, list(gs.offload_keys))
+                      for g, gs in zip(g_cfgs, req_status.group_states)
+                      if getattr(g, "sliding_window_size_in_chunks", None) is None]
+        if not group_keys and g_cfgs:
+            group_keys = [(g.tokens_per_chunk, list(gs.offload_keys))
+                          for g, gs in zip(g_cfgs, req_status.group_states)]
+        entry = dict(keys=_request_keys(req_status), group_keys=group_keys, tokens=request.num_tokens,
                      params=params, t=now)
+        if getattr(self, "_gpu_order", False) and pool is not None:
+            entry["gpu"] = [(b, pool.blocks[b].block_hash) for g in groups for b in g
+                            if pool.blocks[b].block_hash is not None]
         early = self._early.pop(key, None)
         if params.get("park_surv") is not None or early is not None:
             self._decide(entry, params["park_surv"] if params.get("park_surv") is not None else early[1], now)
         elif self._hints_on:
             self._finished[key] = entry
             self._finished.move_to_end(key)
+            # step-scaled pending-hint guard while awaiting /hint (never expires mid-step on large models
+            # whose prefill step exceeds 0.25s; cleared immediately when /hint arrives on the next step)
+            pol = STATE.policy
+            if pol is not None and hasattr(pol, "mark_pending_write"):
+                hint_ttl = max(2.0, 4.0 * getattr(self, "_step_dt", 0.0), 10.0 * STATE.speeds.t0())
+                pol.mark_pending_write(entry["keys"], now, ttl=hint_ttl, eta=None)
+        else:
+            pol = STATE.policy
+            if pol is not None and hasattr(pol, "clear_pending_write"):
+                pol.clear_pending_write(entry["keys"], restore_lru=True, now=now)
 
     def _drain_hints(self, now: float) -> None:
         while not STATE.hints.empty():
@@ -466,7 +1116,12 @@ class ParkConnector(OffloadingConnector):
         pol, fs = STATE.policy, STATE.fs_tier
         keys = entry["keys"]
         S = interp_surv(np.nan_to_num(np.asarray(surv, float), nan=0.5), TG)
-        on_disk = fs.count_on_disk(keys) * STATE.chunk_tokens if fs is not None else 0
+        if fs is None:
+            on_disk = 0
+        elif entry.get("group_keys"):
+            on_disk = min(fs.count_on_disk(gks) * tc for tc, gks in entry["group_keys"])
+        else:
+            on_disk = fs.count_on_disk(keys) * STATE.chunk_tokens
         idle_c = (np.zeros(0), np.zeros(0))
         if pol is not None and pol.idle_since:
             t = np.fromiter(pol.idle_since.values(), float, len(pol.idle_since))
@@ -474,25 +1129,48 @@ class ParkConnector(OffloadingConnector):
         d = decide(S, entry["tokens"], on_disk, STATE.idle_g(now), idle_c, STATE.live, STATE.params(), now,
                    write=STATE.write_mode)
         sess = session_of(entry["params"].get("park_key"))
-        if STATE.write_mode == "through" and sess is not None:
-            (STATE.nowrite.discard if d["disk"] else STATE.nowrite.add)(sess)
-        if STATE.write_mode == "demand" and sess is not None:
-            (STATE.thru.add if d["disk"] else STATE.thru.discard)(sess)
-            if d.get("spill"):
-                for k in keys:
-                    STATE.spill[k] = sess
+        if sess is not None:
+            if STATE.write_mode == "through":
+                (STATE.nowrite.discard if d["disk"] else STATE.nowrite.add)(sess)
+            elif STATE.write_mode == "demand":
+                (STATE.thru.add if d["disk"] else STATE.thru.discard)(sess)
+                if d.get("spill"):
+                    for k in keys:
+                        STATE.spill[k] = sess
+                else:
+                    for k in keys:
+                        STATE.spill.pop(k, None)
             else:
-                for k in keys:
-                    STATE.spill.pop(k, None)
+                # default 'rule' mode: track the cost rule's per-session disk decision for adaptive streaming
+                if d["disk"]:
+                    STATE.thru.add(sess)
+                    STATE.nowrite.discard(sess)
+                else:
+                    STATE.nowrite.add(sess)
+                    STATE.thru.discard(sess)
         if fs is None and d["disk"]:
             d["opt"] = "none" if d["opt"] == "ins" else "drop"     # no disk tier: the same CPU placement
             d["disk"] = False
         STATE.counts[d["opt"]] += 1
         entry["params"]["park_eta"] = d["eta"]
+        if d["disk"] and fs is not None:
+            need = fs.queue_write(keys)
+            if need is None:
+                need = keys
+            if pol is not None:
+                if hasattr(pol, "clear_pending_write"):
+                    need_set = set(need)
+                    done_keys = [k for k in keys if k not in need_set]
+                    if done_keys:
+                        pol.clear_pending_write(done_keys)
+                if need and hasattr(pol, "mark_pending_write"):
+                    pol.mark_pending_write(need, now, eta=d["eta"])
+        elif pol is not None and hasattr(pol, "clear_pending_write"):
+            pol.clear_pending_write(keys)
         if pol is not None:
             pol.apply(keys, d["eta"], now)
-        if d["disk"] and fs is not None:
-            fs.queue_write(keys)
+        if getattr(self, "_gpu_order", False) and d["opt"] in ("park", "drop") and entry.get("gpu"):
+            self._gpu_demote.append(entry["gpu"])
         STATE.last_decisions.append(dict(opt=d["opt"], eta=round(d["eta"], 2), tokens=entry["tokens"],
                                          Q=round(d["Q"], 3), price_c=round(d["price_c"], 4)))
         del STATE.last_decisions[:-100]
@@ -506,12 +1184,30 @@ class ParkConnector(OffloadingConnector):
                                npf=round(L.rate("pf", now), 3)))
         del STATE.dlog[:-20000]
 
+    def _apply_gpu_order(self) -> None:
+        """Move each queued session's free cached blocks to the front of the free queue, tail first."""
+        pool = self._pool
+        q = pool.free_block_queue
+        pending, self._gpu_demote = self._gpu_demote, []
+        for blocks in pending:
+            move = []
+            for bid, h in reversed(blocks):                 # the session's tail goes first
+                b = pool.blocks[bid]
+                if b.ref_cnt == 0 and not b.is_null and b.block_hash == h and b.prev_free_block is not None:
+                    move.append(b)
+            for b in move:
+                q.remove(b)
+            q.prepend_n(move)
+            STATE.counts["gpu_demoted"] += len(move)
+
     def _prune(self, now: float) -> None:
         self._last_prune = now
         for d in (STATE.g_evicted, getattr(STATE.policy, "c_evicted", {})):
             old = [k for k, t in d.items() if now - t > HORIZON]
             for k in old:
                 del d[k]
+        if STATE.policy is not None:
+            STATE.policy.c_first.intersection_update(STATE.policy.c_evicted)
         while self._finished:
             k, e = next(iter(self._finished.items()))
             if now - e["t"] <= HORIZON:
@@ -520,3 +1216,5 @@ class ParkConnector(OffloadingConnector):
         self._early = {k: v for k, v in self._early.items() if now - v[0] <= HORIZON}
         self._loads = {j: v for j, v in self._loads.items() if now - v[0] <= HORIZON}
         self._giveups = {k: g for k, g in self._giveups.items() if now - g["t"] <= HORIZON}
+        if "_est0" in self.__dict__:
+            self._est0 = {k: v for k, v in self._est0.items() if now - v[0] <= HORIZON}

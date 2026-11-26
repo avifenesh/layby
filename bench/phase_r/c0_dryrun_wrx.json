@@ -1,0 +1,7 @@
+{
+ "_note": "C0 (no-disk) dry runs of the wrx start block (2026-11-09, queue jobs 1-4, integ e2782df cells, each run as an A/A pair on GPUs 2 and 3): the last turn's end from replay start, seconds (max over rows of sent + e2e), mean of the valid copies (qwen measured: the GPU 2 copy is invalid for a 0.36 s sw thermal slowdown, so the GPU 3 copy alone; the pairs agree within 1%). make_cells.py --host wrx sets each cell's hard_cap_s to 1.5 x this. Data: ~/park-predictor-data/phase_r/wrx/pr/s-MODEL-c0dry-LOAD-AA.",
+ "qwen38_27b.measured": 2902,
+ "qwen38_27b.sweep_1.5x": 2710,
+ "gemma4_31b.measured": 3142,
+ "gemma4_31b.sweep_1.5x": 3186
+}

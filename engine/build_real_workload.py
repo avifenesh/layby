@@ -5,7 +5,7 @@ Draws N sessions over the pools like eval_pop.workload (an even share per pool, 
 seconds), except that a pool with fewer sessions than its share gives the rest to the others, so N is reached when
 the pools hold N sessions in all. Gaps are capped at --gap-cap (the replay cap; a longer wait is a 300 s return).
 Every turn carries surv_v6 from PROBS (ref, p0..p14) joined on the pool's refs (sid, turn, feat_ref); a turn with no
-curve is reported and left without one.
+curve is reported and left without one. Tool and program names (tool, prog) are kept when the pool has them.
 
 Prints the load: per-session max context, token-turns, the peak over time of the KV tokens of started, unfinished
 sessions (each at its current context, ignoring service time), and the replay length (latest start plus gap sum).
@@ -56,7 +56,8 @@ for k, (js, S, R) in zip(take, pools):
         s = S[j]
         turns = []
         for i, t in enumerate(s["turns"]):
-            t = {x: t[x] for x in ("new_tokens", "out_len", "kind", "ctx", "gap_after")}
+            t = {x: t[x] for x in ("new_tokens", "out_len", "kind", "ctx", "gap_after")} | \
+                {x: t[x] for x in ("tool", "prog") if t.get(x) is not None}     # tool names: Continuum's per-tool TTL
             if t["gap_after"] is not None:
                 t["gap_after"] = float(min(t["gap_after"], a.gap_cap))
             ref = R.get((s["id"], i))

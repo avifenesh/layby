@@ -1,19 +1,23 @@
 """Run placement policies on workloads sampled from ReturnBench pools, in the engine simulator.
 
 A cell is (pool, n, disk). A workload draws n sessions from a pool (several pools joined with +, drawn
-evenly) with fresh starts uniform over 600 s. Each workload runs under `seeds` engine seeds at each disk
+evenly) with fresh starts uniform over 600 s. n = 0 with a replay workload file (engine/replay.py format, every
+session with its own start, e.g. a Phase R workload) runs that file as it is, every session at its start, so the
+workload index only names a repeat. Each workload runs under `seeds` engine seeds at each disk
 speed. Per cell and rule: the median over workloads of the per-workload median-over-seeds p50 and p95
 TTFT of returning turns, and the geometric mean over workloads of the ratio against C0.
 """
-import importlib, json, os, sys
+import importlib, json, os, re, sys
 from multiprocessing import Pool
 import numpy as np
 
 from .engine_sim import simulate, summarize, Params
 from .cost_rule import StkRule, CostRule, Oracle
-from .baselines import ContinuumTTL, ChoiJoshi, KeepAlive, WriteThroughDisk
+from .baselines import ContinuumTTL, ChoiJoshi, KeepAlive, WriteThroughDisk, WriteThroughHit
+from layby import curves as LC
 
-POOLS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bench", "pools")
+# RETURNBENCH_POOLS: a directory of pools to read instead (same files with extra curve fields, e.g. surv_km)
+POOLS = os.environ.get("RETURNBENCH_POOLS") or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bench", "pools")
 # engine calibration of the reference runs (Qwen3-8B on vLLM 0.30, see README)
 CAL = dict(f0=1 / 6000, att=0.0, t0=0.025, bw=600e9, jitter=0.05)
 # stk_p constants (tuned in simulation in the Layby work); load_gate is not applied
@@ -23,6 +27,52 @@ REFERENCE = [("swechat", 6), ("swechat", 12), ("swechat", 18), ("tracelab_claude
              ("tracelab_claude", 25), ("wildchat", 60), ("wildchat", 120), ("wildchat", 211),
              ("swechat+tracelab_claude+wildchat", 18), ("swechat+tracelab_claude+wildchat", 36)]
 DISKS = (0.5, 1.5, 3.0)
+# engine profiles: Params on top of CAL. glm53_flash: one TP4 GLM 5.3 Flash engine on 4x RTX PRO 6000, vLLM 0.31, as
+# the pre-registered GLM prediction (park-predictor tools/predict_glm53.py: constants from the 2026-10-08 round's
+# telemetry; CPU and disk tiers move all four ranks' latent copies, 30,316 B/token; att 0 fitted on C0 only)
+PROFILES = dict(
+    qwen3_8b={},
+    glm53_flash=dict(gpu_tokens=1178582, cpu_tokens=int(68719476736 // 30316.444), budget=4096, max_seqs=32, t0=0.170,
+                     f0=5.12e-5, att=0.0, cpu_gbps=52.4, kib=30316.444 / 1024, hbm_kib=7579 / 1024, bw=525e9),
+)
+# RETURNBENCH_KM: per-kind KM curves (python -m layby.curves fit-km, on waits outside the evaluated sessions) for the
+# cost_km and cost_ewma controls; returnbench eval --km sets it
+_KM = {}
+
+
+def _curve(W, name):
+    """CostRule on the field surv_NAME, which every turn of the workload must carry (no silent 0.5 curves)."""
+    if any(f"surv_{name}" not in t for s in W["sessions"] for t in s["turns"]):
+        raise ValueError(f"a pool lacks surv_{name}; pass --pools with pools that carry it")
+    return CostRule(name)
+
+
+def _km():
+    path = os.environ.get("RETURNBENCH_KM")
+    if not path:
+        return None
+    if path not in _KM:
+        _KM[path] = json.load(open(path))
+    return _KM[path]
+
+
+def _control(W, which, alpha=LC.ALPHA):
+    """The no-model controls, curves from layby.curves (the code that annotates the engine workloads, so K_km and
+    K_ewma on the engine get the same curves as here): which "km" (the per-kind KM curve) or "ewma" (exponential with
+    the EWMA of the session's own earlier waits of the turn's kind, the KM curve before two such waits). With
+    RETURNBENCH_KM the curves are computed for W's turns into surv_km and surv_ewma_a<alpha>; without it, cost_km
+    reads the pool's own surv_km and cost_ewma has no curve to fall back on (an error)."""
+    KM = _km()
+    if KM is None:
+        if which == "km":
+            return _curve(W, "km")
+        raise ValueError("cost_ewma needs the KM curves of its first waits: pass --km KM.json (layby.curves fit-km)")
+    name = "km" if which == "km" else f"ewma_a{alpha:g}"
+    for sess in W["sessions"]:
+        for t, (ce, ck) in zip(sess["turns"], LC.session_curves(sess["turns"], KM, alpha)):
+            if ce is not None:
+                t[f"surv_{name}"] = ce if which == "ewma" else ck
+    return CostRule(name)
 
 
 def _oracle(options):
@@ -34,6 +84,7 @@ def _oracle(options):
 RULES = dict(
     C0=lambda W, c: None,
     wt=lambda W, c: WriteThroughDisk(W),
+    wt2=lambda W, c: WriteThroughHit(W),
     stk=lambda W, c: StkRule(c, STK),
     cost=lambda W, c: CostRule(c),
     orc=lambda W, c: Oracle(),
@@ -43,7 +94,42 @@ RULES = dict(
     c_nopark=lambda W, c: CostRule(c, ("none", "ins", "drop")),
     c_disk=lambda W, c: CostRule(c, ("ins", "park")),
     o_disk=lambda W, c: _oracle(("ins", "park")),
+    # controls: the cost rule on a curve from no learned model (fields surv_km, surv_kmpool, surv_kmsrc that a pool
+    # must carry: Kaplan-Meier curves per wait kind, one pooled curve, per source and kind)
+    cost_km=lambda W, c: _control(W, "km"),
+    # cost_ewma: K_ewma's curve, alpha 0.5; cost_ewma_a<ALPHA> (e.g. cost_ewma_a0.3) sets the weight
+    cost_ewma=lambda W, c: _control(W, "ewma"),
+    cost_kmpool=lambda W, c: _curve(W, "kmpool"),
+    cost_kmsrc=lambda W, c: _curve(W, "kmsrc"),
+    # ablations: the cost rule with one cost term set to zero (sim.rule.ABLATE)
+    cost_noprice=lambda W, c: CostRule(c, ablate=("price",)),
+    cost_noext=lambda W, c: CostRule(c, ablate=("ext",)),
+    cost_noW=lambda W, c: CostRule(c, ablate=("W",)),
+    cost_noQ=lambda W, c: CostRule(c, ablate=("Q",)),
 )
+
+
+def rule_known(name):
+    try:
+        return name in RULES or _ewma_alpha(name) is not None
+    except ValueError:
+        return False
+
+
+def _ewma_alpha(name):
+    m = re.fullmatch(r"cost_ewma_a([0-9]*\.?[0-9]+)", name)
+    if m is None:
+        return None
+    a = float(m.group(1))
+    if not 0.0 < a <= 1.0:
+        raise ValueError(f"{name}: alpha must be in (0, 1]")
+    return a
+
+
+def make_rule(name, W, curve):
+    if name in RULES:
+        return RULES[name](W, curve)
+    return _control(W, "ewma", _ewma_alpha(name))
 
 
 def register(spec):
@@ -68,6 +154,9 @@ def pool_path(name):
 
 
 def workload(pool, n, w):
+    if n == 0:                               # a replay workload file, run as it is
+        W = json.load(open(pool_path(pool)))
+        return dict(gap_cap=W.get("gap_cap", 300.0), ctx_cap=W.get("ctx_cap", 32768), sessions=W["sessions"])
     rng = np.random.default_rng(w)
     parts = pool.split("+")
     ss = []
@@ -82,18 +171,21 @@ def workload(pool, n, w):
 
 
 def run(job):
-    pool, n, w, seed, disk, name, curve, window, extra = job
+    pool, n, w, seed, disk, name, curve, window, extra = job[:9]
+    params = dict(CAL, **(job[9] if len(job) > 9 else {}))   # engine profile and overrides on top of CAL
     for spec in extra:                       # policies added with register() must exist in the worker too
         register(spec)
     W = workload(pool, n, w)
-    rule = RULES[name](W, curve)
-    rows, info = simulate(W, None if rule is None else "x", Params(seed=seed, disk_gbps=disk, window=window, **CAL), rule)
+    rule = make_rule(name, W, curve)
+    rows, info = simulate(W, None if rule is None else "x", Params(seed=seed, disk_gbps=disk, window=window, **params), rule)
     s = summarize(rows)
     return dict(pool=pool, n=n, w=w, seed=seed, disk=disk, rule=name, p50=s["p50"], p95=s["p95"], p99=s["p99"], warms=info["warms"])
 
 
-def evaluate(cells, rules, workloads=8, seeds=3, disks=DISKS, curve="v6", window=None, procs=8, extra=()):
-    jobs = [(p, n, w, s, d, r, curve, window, tuple(extra)) for p, n in cells for d in disks
+def evaluate(cells, rules, workloads=8, seeds=3, disks=DISKS, curve="v6", window=None, procs=8, extra=(), params=None):
+    """params: Params values on top of CAL (an engine profile, capacities); None keeps the reference engine."""
+    tail = (dict(params),) if params else ()
+    jobs = [(p, n, w, s, d, r, curve, window, tuple(extra)) + tail for p, n in cells for d in disks
             for w in range(workloads) for s in range(seeds) for r in rules]
     with Pool(procs) as P:
         return P.map(run, jobs, chunksize=1)

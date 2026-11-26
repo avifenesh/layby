@@ -37,3 +37,12 @@ t.submit_store(TransferJob(job_id=5, keys=["f"], chunk_ids=np.arange(1), is_prom
 assert stored[-1] == ["e"] and noio[-1] == 5
 STATE.write_mode = "rule"
 print("through ok")
+
+# arm PT: write_all writes every stored chunk with no rule (default write mode), the default tier writes none of them
+assert STATE.write_mode == "rule"
+t.submit_store(TransferJob(job_id=6, keys=["g"], chunk_ids=np.arange(1), is_promotion=False, req_context=plain("s2-0")))
+assert stored[-1] == ["e"] and noio[-1] == 6, "the default tier wrote a chunk the rule did not place"
+t._write_all = True
+t.submit_store(TransferJob(job_id=7, keys=["g", "e"], chunk_ids=np.arange(2), is_promotion=False, req_context=plain("s2-0")))
+assert stored[-1] == ["g"], stored                       # e is in flight from job 4: deduplicated
+print("write_all ok")

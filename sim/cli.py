@@ -1,14 +1,17 @@
 """returnbench: run placement policies on ReturnBench pools in the engine simulator.
 
   returnbench eval [--rules C0 wt cost ...] [--cells POOL:N ...] [--workloads 8] [--seeds 3]
-                   [--disk 0.5 1.5 3] [--policy NAME=module:Class ...] [--out rows.jsonl]
+                   [--disk 0.5 1.5 3] [--policy NAME=module:Class ...] [--pools DIR] [--km KM.json]
+                   [--profile qwen3_8b|glm53_flash] [--set gpu_tokens=N cpu_tokens=N ...] [--out rows.jsonl]
   returnbench table rows.jsonl [--cells] [--ref wt]
 
 eval runs the 33-cell reference set unless --cells is given, prints the summary, and appends one JSON
 row per (cell, workload, seed, rule) to --out. table summarizes rows written earlier. C0 always runs:
-every ratio is against it.
+every ratio is against it. A cell PATH.json:0 runs a replay workload file as it is (sessions at their own starts).
+--profile picks the engine constants (default: the reference Qwen3-8B engine) and --set overrides single Params
+values (e.g. the capacities of a Phase R cell); neither changes the reference set's defaults.
 """
-import argparse, json, sys
+import argparse, json, os, sys
 
 from . import eval_pop as E
 
@@ -47,6 +50,11 @@ def main(argv=None):
     e.add_argument("--disk", type=float, nargs="+", default=list(E.DISKS))
     e.add_argument("--curve", default="v6", help="survival curve field surv_NAME the curve-driven rules read")
     e.add_argument("--window", type=float, help="run length in seconds (no send after it)")
+    e.add_argument("--pools", help="directory of pools to read instead of bench/pools (sets RETURNBENCH_POOLS)")
+    e.add_argument("--km", help="per-kind KM curves (python -m layby.curves fit-km) for cost_km and cost_ewma[_aALPHA] "
+                   "(sets RETURNBENCH_KM)")
+    e.add_argument("--profile", choices=sorted(E.PROFILES), default="qwen3_8b")
+    e.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE", help="Params overrides, numbers")
     e.add_argument("--procs", type=int, default=8); e.add_argument("--out")
     e.add_argument("--ref", default="wt"); e.add_argument("--per-cell", action="store_true")
     t = sub.add_parser("table", help="summarize rows written by eval")
@@ -54,14 +62,22 @@ def main(argv=None):
     a = ap.parse_args(argv)
 
     if a.cmd == "eval":
+        if a.pools:
+            os.environ["RETURNBENCH_POOLS"] = E.POOLS = os.path.abspath(a.pools)   # workers read it at import
+        if a.km:
+            os.environ["RETURNBENCH_KM"] = os.path.abspath(a.km)
         extra = [x for x in a.policy]
         names = [E.register(x) for x in extra]
         rules = ["C0"] + [r for r in a.rules + names if r != "C0"]
-        bad = [r for r in rules if r not in E.RULES]
+        bad = [r for r in rules if not E.rule_known(r)]
         if bad:
             ap.error(f"unknown rules {bad}; known: {list(E.RULES)}")
         cells = [(c.rsplit(":", 1)[0], int(c.rsplit(":", 1)[1])) for c in a.cells] if a.cells else E.REFERENCE
-        rows = E.evaluate(cells, rules, a.workloads, a.seeds, a.disk, a.curve, a.window, a.procs, extra)
+        params = dict(E.PROFILES[a.profile])
+        for kv in a.set:
+            k, v = kv.split("=", 1)
+            params[k] = float(v) if "." in v or "e" in v else int(v)
+        rows = E.evaluate(cells, rules, a.workloads, a.seeds, a.disk, a.curve, a.window, a.procs, extra, params or None)
         if a.out:
             with open(a.out, "a") as f:
                 for x in rows:

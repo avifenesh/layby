@@ -1,0 +1,68 @@
+{
+ "cell": "t-gemma-c0-slow-s1",
+ "tuning": {
+  "model": "gemma4_31b",
+  "family": "C0",
+  "disk": "slow",
+  "stage": 1,
+  "workload": "gemma4_31b.tuning_20min",
+  "grid": [
+   "C0_lru",
+   "C0_arc"
+  ],
+  "carried": {},
+  "dropped": []
+ },
+ "block": {
+  "host": "tune-gemma",
+  "repeat": 1,
+  "attempt": 1,
+  "dir": "/home/avifenesh/park-predictor-data/phase_r/tune/gemma/pr/t-gemma-c0-slow-s1/tune-gemma/r1/a1"
+ },
+ "rule": "p95 TTFT on resumed turns (failed and censored +inf), ties by p50 then grid order",
+ "arms": [
+  {
+   "n": 106,
+   "served": 106,
+   "failed": 0,
+   "censored": 0,
+   "missing": 0,
+   "p50": 38.653016,
+   "p95": 65.192035,
+   "label": "C0_arc",
+   "rank": 1,
+   "code": "C0",
+   "knobs": {
+    "eviction": "arc",
+    "budget": null
+   },
+   "grid_index": 1
+  },
+  {
+   "n": 106,
+   "served": 106,
+   "failed": 0,
+   "censored": 0,
+   "missing": 0,
+   "p50": 38.016428,
+   "p95": 66.718752,
+   "label": "C0_lru",
+   "rank": 2,
+   "code": "C0",
+   "knobs": {
+    "eviction": "lru",
+    "budget": null
+   },
+   "grid_index": 0
+  }
+ ],
+ "unranked": [],
+ "complete": true,
+ "next_stage": 3,
+ "advance": [
+  "C0_arc",
+  "C0_lru"
+ ],
+ "winner": null,
+ "cell_spec": "/home/avifenesh/.cache/layby-wt/integ/engine/phase_r/cells/tune/t-gemma-c0-slow-s1.json"
+}

@@ -1,0 +1,190 @@
+[
+ {
+  "name": "qwen38_27b",
+  "hf": "Qwen/Qwen3.8-27B-FP8@017b9c7af6b5689d5dd426a76e0bc077eb5ca20a",
+  "config_sha256": "74227dd615bf1ea975aa676bdf355a0379858c12f394b5365cd9dfa5fc2c70bc",
+  "cap": 32768,
+  "cap_source": "owner decision 2026-10-12: --max-model-len 32768 (sessions restart past the cap by the compaction rule)",
+  "kv": {
+   "dtype": "bf16",
+   "grow_bytes_per_token": 65536,
+   "state_bytes_per_session": 153944064,
+   "window_tokens": 0,
+   "window_bytes_per_token": 0,
+   "window_bytes_per_session_max": 0,
+   "longest_request_bytes": 2301427712,
+   "state_block_tokens": 784,
+   "state_block_source": "vLLM 0.31.0 boot log, compat check 2026-10-11 (attention block set to 784 tokens so its page equals the mamba page)",
+   "gpu_request_bytes": 2466250752,
+   "gpu_request_source": "the 131,072 formula (which reproduces every compat log figure) at max_model_len 32,768: 48 blocks x 51,380,224 B",
+   "arch": {
+    "full_layers": 16,
+    "kv_heads": 4,
+    "head_dim": 256,
+    "gdn_layers": 48,
+    "ssm_state_bytes_per_layer": 3145728,
+    "conv_state_bytes_per_layer": 61440,
+    "ssm_dtype": "float32",
+    "max_position_embeddings": 262144
+   },
+   "gpu_request_check": {
+    "exact_bytes": 2466250752,
+    "blocks": 48,
+    "block_bytes": 51380224,
+    "formula": "cdiv(32768, 784) = 42 attention blocks + 3 mamba groups x 2 blocks = 48 blocks x 51,380,224 B (16 layers x 784 tokens x 4 KV heads x 256 x K,V x 2 B)",
+    "connector": "same with a KV connector: OffloadingConnector (and ParkConnector, its subclass) implements SupportsHMA, so vLLM 0.31.0 keeps the hybrid KV manager on; no compat log says 'Turning off hybrid kv cache manager'",
+    "reproduces": "compat logs: 8 GiB pool = 167 blocks / 59 (40,960 tokens) = 2.83x, 115,937 tokens; boot 1,185 blocks / 174 = 6.810345x (cache_config kv_cache_max_concurrency 6.810344827586207), 892,645 tokens",
+    "note": "at 32,768 one request needs 2.30 GiB; floor 1.1x = 2.71 GB",
+    "checked": "2026-10-11, vllm/v1/kv_cache_interface.py and v1/core/kv_cache_utils.py of vLLM 0.31.0"
+   },
+   "tier_bytes_per_token": 72472,
+   "tier_chunk_bytes": 51380224,
+   "tier_source": "pilot 1 micro tier_measured (vLLM 0.31.0 CPU tier bytes per token; chunk = the tier's block)",
+   "disk_write_factor": 0.8816,
+   "disk_write_factor_source": "pilot 2 job 16 (T, qwen38_27b.pilot, network_ssd): 39,768,297,434 B for 45,108,494,336 B; job 17 (NRD): 39,408,635,866 B"
+  },
+  "c0": 1.2235,
+  "tpot": 0.02836,
+  "b": 0.05015,
+  "inflight": 1.4317,
+  "service_assumption": {
+   "status": "MEASURED: sizing uses the C0 service model fitted on the pilot C0 runs (bench/phase_r/fit_service.py, fit_qwen38_27b.json); c0, tpot and b are the old scaled estimates, not used by the sizing",
+   "measured": [
+    "prefill (C0, B)"
+   ],
+   "ref_model": "Qwen3-8B BF16 (Qwen/Qwen3-8B config sha256 f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30)",
+   "ref_fit": {
+    "c0": 0.649,
+    "tpot": 0.019,
+    "b": 0.0266,
+    "source": "least squares on the C0 arms of the 2026-10 Qwen3-8B heavy rounds (nebius_q8 p1, p2, p4: 2,748 turns; BF16, vLLM, 1x RTX PRO 6000 Nebius); work/svc_fit2.py"
+   },
+   "c_ref_tokens": 23015,
+   "prefill_ratio": 1.8852,
+   "prefill_ratio_source": "MEASURED: 16983 / b1 prefill 9009 tok/s at 23015 tokens (compat prefill.json sha256 f3fe02f674316b726bd59497a5ac960e9a482ab2450d7b452de1c84e314ab73f)",
+   "decode_ratio": 1.4925,
+   "ref_prefill_flops_per_token": 27466334208.0,
+   "prefill_flops_per_token": 58599276544.0,
+   "ref_decode_bytes_per_seq_step": 13965882950.986938,
+   "decode_bytes_per_seq_step": 20843931570.039536,
+   "linear_params_fp8": 24699207680.0,
+   "lm_head_params_bf16": 1271398400.0,
+   "fp8_compute_credit": false,
+   "ref_prefill_tok_s": 16983.0,
+   "prefill_tok_s_at_c_ref": 9009.0,
+   "flop_ratio": 2.1335
+  },
+  "service_fit": {
+   "file": "fit_qwen38_27b.json",
+   "sha256": "aeb80b1f94aa20e4f2782cf1d7c2af6db635ec080f27e1d91b17879b1df8b92c",
+   "kp": 1.0,
+   "kd": 0.75,
+   "base": {
+    "t0": 0.01813724542468324,
+    "bw": 276066011028.87885,
+    "f0": 9.232187735073999e-05,
+    "att": 0.013690633347734118,
+    "gpu_tokens": 153314,
+    "cpu_tokens": 369710,
+    "req_tokens": 2349,
+    "cpu_gbps": 56.0
+   }
+  }
+ },
+ {
+  "name": "gemma4_31b",
+  "hf": "google/gemma-4-31B-it@842da3794eaa0b77d5f08bae87a17459d91ff475 (vLLM online fp8)",
+  "config_sha256": "e967dd38bc5cfd38bd09a995a7bf4a754075df2b46aba68f7fbb5a791e6d8dd1",
+  "cap": 32768,
+  "cap_source": "owner decision 2026-10-12: --max-model-len 32768 (sessions restart past the cap by the compaction rule)",
+  "kv": {
+   "dtype": "bf16",
+   "grow_bytes_per_token": 81920,
+   "state_bytes_per_session": 0,
+   "window_tokens": 1024,
+   "window_bytes_per_token": 819200,
+   "window_bytes_per_session_max": 838860800,
+   "longest_request_bytes": 3523215360,
+   "state_block_tokens": null,
+   "state_block_source": null,
+   "gpu_request_bytes": 5214044160,
+   "gpu_request_source": "vLLM 0.31.0 at --max-num-batched-tokens 1024, max_model_len 32768: the formula, and vLLM's own 'Maximum concurrency 3.58x' at an 18,653,904,896 B pool (5.21 GB per request), pilot-2 micro_chunk 2026-10-12",
+   "arch": {
+    "global_layers": 10,
+    "global_kv_heads": 4,
+    "global_head_dim": 512,
+    "k_eq_v": true,
+    "k_eq_v_cached_as": "K and V slots (the K weights load into both; vLLM gemma4.py)",
+    "sliding_layers": 50,
+    "sliding_kv_heads": 16,
+    "sliding_head_dim": 256,
+    "sliding_window": 1024,
+    "max_position_embeddings": 262144
+   },
+   "gpu_request_check": {
+    "exact_bytes": 5214044160,
+    "blocks": 1989,
+    "block_bytes": 2621440,
+    "formula": "5 sliding groups x (cdiv(min(1023 + max_in_flight_tokens 2 x 1024, L), 16) + 1) = 965 blocks + global group cdiv(32768, 32) = 1024 blocks = 1989 blocks x 2,621,440 B",
+    "connector": "same with a KV connector: OffloadingConnector (and ParkConnector, its subclass) implements SupportsHMA, so vLLM 0.31.0 keeps the hybrid KV manager on and the sliding groups stay capped at window + in-flight tokens; no compat log says 'Turning off hybrid kv cache manager'",
+    "reproduces": "compat logs: 40,960 tokens need 6,725 blocks = 16.418 GiB (logged 16.42 GiB); 20 GiB pool = 8,192 blocks = 1.218x, 49,895 tokens (logged 1.22x, 49,895); boot num_gpu_blocks 21,975 / 9,541 = 2.303218x (logged 2.303217692065821), 301,887 tokens",
+    "note": "one request 5.21 GB at chunk 1,024; floor 1.1x = 5.74 GB",
+    "checked": "2026-10-11, vllm/v1/kv_cache_interface.py and v1/core/kv_cache_utils.py of vLLM 0.31.0"
+   },
+   "tier_bytes_per_token": 131714,
+   "tier_chunk_bytes": 2621440,
+   "tier_source": "pilot 1 micro tier_measured (vLLM 0.31.0 CPU tier bytes per token; chunk = the tier's block)",
+   "disk_write_factor": 1.2665,
+   "disk_write_factor_source": "pilot 2 job 19 (T, gemma4_31b.kdisk): tier reached 148,423,315,476 B for 117,164,851,200 B of unique KV at turn ends"
+  },
+  "c0": 2.4786,
+  "tpot": 0.03421,
+  "b": 0.10159,
+  "inflight": 1.4317,
+  "service_assumption": {
+   "status": "MEASURED: sizing uses the C0 service model fitted on the pilot C0 runs (bench/phase_r/fit_service.py, fit_gemma4_31b.json); c0, tpot and b are the old scaled estimates, not used by the sizing",
+   "measured": [
+    "prefill (C0, B)"
+   ],
+   "ref_model": "Qwen3-8B BF16 (Qwen/Qwen3-8B config sha256 f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30)",
+   "ref_fit": {
+    "c0": 0.649,
+    "tpot": 0.019,
+    "b": 0.0266,
+    "source": "least squares on the C0 arms of the 2026-10 Qwen3-8B heavy rounds (nebius_q8 p1, p2, p4: 2,748 turns; BF16, vLLM, 1x RTX PRO 6000 Nebius); work/svc_fit2.py"
+   },
+   "c_ref_tokens": 23015,
+   "prefill_ratio": 3.8192,
+   "prefill_ratio_source": "MEASURED: 16983 / b1 prefill 4447 tok/s at 23015 tokens (compat prefill.json sha256 b7397939e439299aeb0a96a3e2a521431754f52f0d11d4edc3fca19694798bb1)",
+   "decode_ratio": 1.8007,
+   "ref_prefill_flops_per_token": 27466334208.0,
+   "prefill_flops_per_token": 75334287360.0,
+   "ref_decode_bytes_per_seq_step": 13965882950.986938,
+   "decode_bytes_per_seq_step": 25148849703.37361,
+   "linear_params_fp8": 29286727680.0,
+   "lm_head_params_bf16": 1409286144.0,
+   "fp8_compute_credit": false,
+   "ref_prefill_tok_s": 16983.0,
+   "prefill_tok_s_at_c_ref": 4447.0,
+   "flop_ratio": 2.7428
+  },
+  "service_fit": {
+   "file": "fit_gemma4_31b.json",
+   "sha256": "b2388a6e6e986f3b4923b7ebc77ff01fb49c37e81c8b52cee6e4feef52f7e8ec",
+   "kp": 1.0,
+   "kd": 1.0,
+   "base": {
+    "t0": 0.022295124354763003,
+    "bw": 210899764972.3748,
+    "f0": 0.00011488886162023371,
+    "att": 0.07814603041187554,
+    "gpu_tokens": 339494,
+    "cpu_tokens": 563066,
+    "req_tokens": 10240,
+    "cpu_gbps": 56.0
+   }
+  },
+  "max_num_batched_tokens": 1024,
+  "chunk_source": "derive_chunk.py 2026-10-12 (integ df4c0f4): no measured chunk meets GPU KV <= 0.15 P at the drained load; 1,024 is the measured chunk closest to it (0.27 P); prefill b1 -4% (2K), -5% (8K), -0.5% (32K) vs 8,192"
+ }
+]

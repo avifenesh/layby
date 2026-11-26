@@ -1,0 +1,5 @@
+{
+ "_note": "C0 dry runs of the start block (2026-10-13, park-r-start-qwen and park-r-start-gemma, integ 3349da9 cells, every verdict valid): the last turn's end from replay start, seconds (max over rows of sent + e2e). make_cells.py sets each cell's hard_cap_s to 1.5 x this for its workload (BENCH_PLAN draft 6: 1.5x the C0 dry-run makespan). Data: ~/park-predictor-data/phase_r/start/MODEL/pr/s-MODEL-c0dry-LOAD.",
+ "qwen38_27b.measured": 2801, "qwen38_27b.sweep_1.5x": 2508, "qwen38_27b.light": 2919,
+ "gemma4_31b.measured": 2816, "gemma4_31b.sweep_1.5x": 2962, "gemma4_31b.light": 2890
+}

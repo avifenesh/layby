@@ -1,0 +1,27 @@
+Layby Phase R: HiCacheFile (SGLang v0.5.21, tag object 7337b27) drops its page-cache pages, so every L3 read
+in every SGLang arm comes from the disk, as vLLM's O_DIRECT tier does. After a write: flush, fdatasync, then
+posix_fadvise(DONTNEED) (DONTNEED only drops clean pages, so the data must reach the disk first). After a read:
+posix_fadvise(DONTNEED) on the file, so a later read of the same page is not served from memory.
+Apply: engine/phase_r/sglang/apply_patch.sh PYTHON apply (patch -p2 in the directory that holds the sglang package).
+
+--- a/python/sglang/srt/mem_cache/hicache_storage.py
++++ b/python/sglang/srt/mem_cache/hicache_storage.py
+@@ -486,6 +486,7 @@
+                 buf = memoryview(target_location.view(torch.uint8).contiguous().numpy())
+                 if f.readinto(buf) != expected:
+                     raise IOError(f"Short read for {suffixed}")
++                os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)  # layby-fadvise: later reads come from disk
+             self._evictor.touch(suffixed, tensor_path)
+             if self.metadata_cache is not None:
+                 self.metadata_cache.add(suffixed)
+@@ -535,7 +536,9 @@
+             reserved = True
+ 
+             tmp_path = os.path.join(self.file_path, f".{uuid.uuid4().hex}.tmp")
+-            value.contiguous().view(dtype=torch.uint8).numpy().tofile(tmp_path)
++            with open(tmp_path, "wb") as f:  # layby-fadvise: write, flush to disk, drop the cached pages
++                value.contiguous().view(dtype=torch.uint8).numpy().tofile(f)
++                f.flush(); os.fdatasync(f.fileno()); os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+             os.replace(tmp_path, tensor_path)
+             self._evictor.commit(suffixed)
+             if self.metadata_cache is not None:

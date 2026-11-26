@@ -15,8 +15,11 @@ ChoiJoshi     Choi and Joshi (arXiv 2608.30830), host-retain branch: keep the KV
 KeepAlive     Serverless in the Wild (ATC'20) hybrid histogram, as a keep-alive: pin on the GPU until the 99th
               percentile of this user's earlier gaps (at least 3 of them), else no pin. CPU tier LRU, no disk.
 
-All three keep vLLM's LRU order in the CPU tier (eta None) and only add a GPU pin; engine_sim holds a pinned
-session's idle blocks until the pin ends unless nothing else can be evicted (the earliest pin goes first).
+WriteThroughDisk and WriteThroughHit are the disk tier without prediction: write every session at finish, or only
+the part of it that has been reused (frequency >= 2).
+
+ContinuumTTL, ChoiJoshi and KeepAlive keep vLLM's LRU order in the CPU tier (eta None) and only add a GPU pin;
+engine_sim holds a pinned session's idle blocks until the pin ends unless nothing else can be evicted (the earliest pin goes first).
 """
 import math
 from collections import defaultdict
@@ -43,7 +46,7 @@ def _restore_c(v):
     p, live, now, N = v["p"], v["live"], v["now"], v["tokens"]
     lam = live.rate("n_cpu", now)
     wait = live.rate("wait_cpu", now) / lam if lam > 0 else 0.0
-    return wait + N * KIB * 1024 / (p.cpu_gbps * 1e9) + p.t0
+    return wait + N * getattr(p, "kib", KIB) * 1024 / (p.cpu_gbps * 1e9) + p.t0
 
 
 class _History:
@@ -129,3 +132,21 @@ class WriteThroughDisk:
 
     def decide(self, v):
         return dict(eta=None, disk=True, pre=None, warm_eta=None)
+
+
+class WriteThroughHit:
+    """Frequency-gated write-through to disk (SGLang HiCache write_through_selective, write threshold 2; NVIDIA
+    Dynamo KVBM's frequency filter for offload): a prefix is written only once it has been hit at least once
+    after it was made, i.e. its access count reaches 2. A session's prefix up to the end of its previous request
+    is hit when the next request reuses it, so at a request's finish the policy writes that reused prefix (the
+    tokens of the previous finish) and not the new tail, which has one access so far. A session's first request
+    writes nothing. LRU everywhere, no prediction."""
+
+    def __init__(self, W=None):
+        self.prev = {}                       # session -> tokens at its previous finish
+
+    def decide(self, v):
+        k, N = v["sess"], v["tokens"]
+        hit = min(self.prev.get(k, 0), N)
+        self.prev[k] = N
+        return dict(eta=None, disk=hit > 0, disk_tokens=hit, pre=None, warm_eta=None)

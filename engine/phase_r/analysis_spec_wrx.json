@@ -1,0 +1,24 @@
+{
+  "_comment": "Phase R main campaign on wrx (BENCH_PLAN sections 1 and 9, draft 6.8 matrix). Repeats stand for hosts (wrx-r1..r3). Arms by readable label: no-disk (C0), write-through (T), write-hot (T2), lmcache (LM), continuum (CT), layby (K), layby-ewma (K_ewma), layby-avg (K_km). best = the lowest stage-3 tuning p95 among the tuned baselines per model and disk (cells/wrx/tune/tuned.json, sha b9f44784), restricted to the arms the cell runs: Qwen slow write-hot 9.93 s; Gemma slow write-hot 42.38 s; Qwen fast write-through 8.53 s; Gemma fast write-hot 32.55 s is not in the draft 6.8 fast matrix, so write-through 32.69 s. H5 here is TPOT only (draft 6.8 dropped the throughput sweep); H6 needs the simulator's committed predictions and is run separately.",
+  "alpha": 0.05,
+  "best": {
+    "qwen-slow-pressure": "write-hot",
+    "gemma-slow-pressure": "write-hot",
+    "qwen-fast-heavy": "write-through",
+    "gemma-fast-heavy": "write-through"
+  },
+  "live_arms": ["layby"],
+  "tests": [
+    {"name": "H1", "rule": "iut", "cells": ["qwen-slow-pressure", "gemma-slow-pressure"],
+     "pairs": ["layby:no-disk", "layby:best"], "threshold": 1.0, "metric": "p95"},
+    {"name": "H2", "rule": "iut", "cells": ["qwen-fast-heavy", "gemma-fast-heavy"],
+     "pairs": ["layby:best"], "threshold": 1.10, "metric": "p95"},
+    {"name": "H3", "rule": "iut", "cells": "all", "pairs": ["layby:no-disk"], "threshold": 1.10, "metric": "p95"},
+    {"name": "H4a", "rule": "pooled", "cells": ["qwen-slow-pressure", "gemma-slow-pressure"],
+     "pair": "layby:layby-ewma", "threshold": 1.0, "metric": "p95"},
+    {"name": "H4b", "rule": "iut", "cells": ["qwen-slow-pressure"], "pairs": ["layby:layby-avg"],
+     "threshold": 1.0, "metric": "p95"},
+    {"name": "H5", "rule": "tost", "cells": "all", "pairs": ["layby:no-disk"], "metric": "tpot_p50", "margin": 0.05}
+  ],
+  "holm": [["H4a", "H4b"]]
+}

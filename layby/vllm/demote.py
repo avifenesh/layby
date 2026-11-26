@@ -24,7 +24,7 @@ from vllm.v1.kv_offload.base import ReqContext
 
 from layby.vllm.state import STATE
 
-logger = init_logger(__name__)
+logger = init_logger("vllm." + __name__)   # under vLLM's handler: a module name outside "vllm" prints nothing
 
 
 class Demoter:

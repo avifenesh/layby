@@ -1,0 +1,80 @@
+{
+ "cell": "t-gemma-lm-fast-s3",
+ "tuning": {
+  "model": "gemma4_31b",
+  "family": "LM",
+  "disk": "fast",
+  "stage": 3,
+  "workload": "gemma4_31b.tuning",
+  "grid": [
+   "lmcache-c256-default",
+   "lmcache-c256-default-eager",
+   "lmcache-c256-retain",
+   "lmcache-c256-retain-eager",
+   "lmcache-c512-default",
+   "lmcache-c512-default-eager",
+   "lmcache-c512-retain",
+   "lmcache-c512-retain-eager"
+  ],
+  "carried": {
+   "C0": {
+    "budget": null,
+    "eviction": "lru"
+   }
+  },
+  "dropped": [
+   "eviction ARC: LMCache 0.5.5's --eviction-policy takes LRU, IsolatedLRU or noop only (lmcache/v1/distributed/config.py); eviction stays LRU"
+  ]
+ },
+ "block": {
+  "host": "wrx",
+  "repeat": 1,
+  "attempt": 1,
+  "dir": "/home/avifenesh/park-predictor-data/phase_r/wrx/pr/t-gemma-lm-fast-s3/wrx/r1/a1"
+ },
+ "rule": "p95 TTFT on resumed turns (failed and censored +inf), ties by p50 then grid order",
+ "arms": [
+  {
+   "n": 351,
+   "served": 351,
+   "failed": 0,
+   "censored": 0,
+   "missing": 0,
+   "p50": 12.612279,
+   "p95": 54.481538,
+   "label": "lmcache-c512-default-eager",
+   "rank": 1,
+   "code": "LM",
+   "knobs": {
+    "chunk": 512,
+    "prefetch": "default",
+    "eager": true
+   },
+   "grid_index": 5
+  },
+  {
+   "n": 351,
+   "served": 351,
+   "failed": 0,
+   "censored": 0,
+   "missing": 0,
+   "p50": 17.238056,
+   "p95": 57.008843,
+   "label": "lmcache-c256-default-eager",
+   "rank": 2,
+   "code": "LM",
+   "knobs": {
+    "chunk": 256,
+    "prefetch": "default",
+    "eager": true
+   },
+   "grid_index": 1
+  }
+ ],
+ "unranked": [],
+ "complete": true,
+ "next_stage": null,
+ "advance": [],
+ "winner": "lmcache-c512-default-eager",
+ "cell_spec": "/home/avifenesh/.cache/layby-wt/integ/engine/phase_r/cells/wrx/tune/t-gemma-lm-fast-s3.json"
+}

@@ -1,37 +1,48 @@
-# park on SGLang 0.5.21
+# park on SGLang 0.5.21 and 0.5.23
 
-The SGLang adapter for the park cost rule (`layby.rule.decide`). It mirrors the vLLM 0.30 adapter in
+The SGLang adapter for the park cost rule (`layby.rule.decide`). It mirrors the vLLM adapter in
 `layby/vllm/`: the engine measures itself, the rule places each finished request's KV, the host tier
-evicts by predicted next use, and storage holds only what the rule puts on disk. Target: SGLang 0.5.21
-from PyPI with HiCache (host memory tier, optional L3 storage).
+evicts by predicted next use, and storage holds only what the rule puts on disk. Targets: SGLang
+0.5.21 and 0.5.23 (`lmsysorg/sglang:v0.5.23-cu130-runtime` or PyPI) with HiCache (host memory tier,
+optional L3 storage).
 
 ## Install
 
 ```
 uv venv .venv-sglang -p 3.12
-uv pip install -p .venv-sglang/bin/python --prerelease=allow "sglang[all]==0.5.21"   # pins cuda-tile 1.6.0rc5
+uv pip install -p .venv-sglang/bin/python --prerelease=allow "sglang[all]==0.5.23"   # or 0.5.21
 uv pip install -p .venv-sglang/bin/python -e . --no-deps                            # park, with its plugin entry point
 ```
 
-`sglang[all]==0.5.21` brings torch 2.13.0+cu130 and sglang-kernel 0.4.7 (CUDA 13). The editable
-install registers the entry point `park = layby.sglang.plugin:register` in group `sglang.srt.plugins`.
-SGLang runs it in the main process (before it parses arguments) and in every scheduler process.
+The editable install registers the entry point `park = layby.sglang.plugin:register` in group
+`sglang.srt.plugins`. SGLang runs it in the main process (before it parses arguments) and in every
+scheduler process.
 
 ## Launch
 
 ```
-SGLANG_PLUGINS=park SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=/nvme/park \
+SGLANG_PLUGINS=park SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python \
+SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=/nvme/park \
 sglang serve --model-path Qwen/Qwen3-8B --page-size 64 --max-total-tokens N \
-  --enable-hierarchical-cache --hicache-ratio R --hicache-write-policy write_through \
+  --enable-hierarchical-cache --hicache-ratio R --hicache-write-policy write_through_selective \
   --hicache-storage-backend file \
   --radix-cache-backend park --radix-eviction-policy park \
   --radix-eviction-policy-config '{"port": 8765}'
 ```
 
+- **Choosing `--hicache-write-policy`:** Use `write_through_selective` (default in `run_arms_sglang.sh`
+  on 0.5.23) when host RAM is close to GPU KV capacity (`CPU <= 1.5x GPU`), so 1-hit GPU tokens do not
+  consume the entire host tier. Use `write_through` when host RAM has ample headroom beyond the GPU
+  mirror (`CPU >= 2x GPU`), where eager D->H mirroring absorbs 1-hit GPU evictions cleanly.
 - `--radix-cache-backend park` builds `ParkRadixCache` (a `UnifiedRadixCache` subclass) on the
-  Python TreeCore. The Rust TreeCore, SGLang's default, keeps eviction native and has no
-  `node_by_id`. The backend refuses to start without `--radix-eviction-policy park`, and refuses
-  hybrid SWA or Mamba models.
+  Python TreeCore (`SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python`). The Rust TreeCore, SGLang's
+  default, keeps eviction native and has no `node_by_id`. The backend refuses to start without
+  `--radix-eviction-policy park`, and refuses hybrid SWA or Mamba models.
+- **SGLang 0.5.23 adapter fixes (v2.0):** Hooks `dec_lock_ref` / `dec_host_lock_ref` so write-through
+  ack release starts idle-residency timers accurately; excludes H->D load-back stalls and overlap idle
+  ticks from `Speeds.step` prefill speed `f0`; allows placement on pending write-through nodes; and
+  falls back to the deepest surviving prompt ancestor when a 1-hit split output leaf is evicted under
+  `write_through_selective`.
 - `--radix-eviction-policy-config` takes `port`: the local hint port (TP rank 0, 127.0.0.1). Without
   it, curves can only ride on the request.
 - Without `--hicache-storage-backend` the rule has no disk option: ins becomes none, and park becomes

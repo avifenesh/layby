@@ -71,10 +71,12 @@ class StkRule:
 
 
 class CostRule:
-    """sim.rule.decide driven from the simulator view (see sim/rule.py for the rule)."""
-    def __init__(self, name, options=None):
+    """sim.rule.decide driven from the simulator view (see sim/rule.py for the rule). ablate: cost terms set
+    to zero (sim.rule.ABLATE), for ablations only; the default keeps every term."""
+    def __init__(self, name, options=None, ablate=()):
         self.name = name
         self.options = options
+        self.ablate = tuple(ablate)
         self.log = []
 
     def curve(self, t):
@@ -82,9 +84,10 @@ class CostRule:
 
     def decide(self, v):
         t, p = v["turn"], v["p"]
-        p.bytes_per_token = KIB * 1024
+        p.bytes_per_token = getattr(p, "kib", KIB) * 1024
         d = decide(self.curve(t), v["tokens"], v["on_disk"], v["idle_g"], v["idle_c"], v["live"], p, v["now"],
-                   **({"options": self.options} if self.options else {}))
+                   **({"options": self.options} if self.options else {}),
+                   **({"ablate": self.ablate} if self.ablate else {}))
         self.log.append(dict(opt=d["opt"], Q=d["Q"], pc=d["price_c"], wd=d["wait_disk"], npf=d["npf"], N=v["tokens"],
                              kind=t["kind"], gap=t["gap_after"]))
         return dict(eta=d["eta"], disk=d["disk"], pre=None, warm_eta=None)

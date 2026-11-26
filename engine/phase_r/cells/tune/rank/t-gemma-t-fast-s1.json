@@ -1,0 +1,109 @@
+{
+ "cell": "t-gemma-t-fast-s1",
+ "tuning": {
+  "model": "gemma4_31b",
+  "family": "T",
+  "disk": "fast",
+  "stage": 1,
+  "workload": "gemma4_31b.tuning_20min",
+  "grid": [
+   "T_b1_t16",
+   "T_b1_t32",
+   "T_b16_t16",
+   "T_b16_t32"
+  ],
+  "carried": {
+   "C0": {
+    "budget": null,
+    "eviction": "lru"
+   }
+  },
+  "dropped": []
+ },
+ "block": {
+  "host": "tune-gemma2",
+  "repeat": 1,
+  "attempt": 1,
+  "dir": "/home/avifenesh/park-predictor-data/phase_r/tune/gemma2/pr/t-gemma-t-fast-s1/tune-gemma2/r1/a1"
+ },
+ "rule": "p95 TTFT on resumed turns (failed and censored +inf), ties by p50 then grid order",
+ "arms": [
+  {
+   "n": 106,
+   "served": 106,
+   "failed": 0,
+   "censored": 0,
+   "missing": 0,
+   "p50": 10.927599,
+   "p95": 46.462819,
+   "label": "T_b16_t16",
+   "rank": 1,
+   "code": "T",
+   "knobs": {
+    "blocks_per_chunk": 16,
+    "fs_threads": 16
+   },
+   "grid_index": 2
+  },
+  {
+   "n": 106,
+   "served": 106,
+   "failed": 0,
+   "censored": 0,
+   "missing": 0,
+   "p50": 8.465918,
+   "p95": 48.817191,
+   "label": "T_b1_t16",
+   "rank": 2,
+   "code": "T",
+   "knobs": {
+    "blocks_per_chunk": 1,
+    "fs_threads": 16
+   },
+   "grid_index": 0
+  },
+  {
+   "n": 106,
+   "served": 106,
+   "failed": 0,
+   "censored": 0,
+   "missing": 0,
+   "p50": 12.944261,
+   "p95": 53.866444,
+   "label": "T_b16_t32",
+   "rank": 3,
+   "code": "T",
+   "knobs": {
+    "blocks_per_chunk": 16,
+    "fs_threads": 32
+   },
+   "grid_index": 3
+  },
+  {
+   "n": 106,
+   "served": 106,
+   "failed": 0,
+   "censored": 0,
+   "missing": 0,
+   "p50": 11.530522,
+   "p95": 63.940536,
+   "label": "T_b1_t32",
+   "rank": 4,
+   "code": "T",
+   "knobs": {
+    "blocks_per_chunk": 1,
+    "fs_threads": 32
+   },
+   "grid_index": 1
+  }
+ ],
+ "unranked": [],
+ "complete": true,
+ "next_stage": 3,
+ "advance": [
+  "T_b16_t16",
+  "T_b1_t16"
+ ],
+ "winner": null,
+ "cell_spec": "/home/avifenesh/.cache/layby-wt/integ/engine/phase_r/cells/tune/t-gemma-t-fast-s1.json"
+}

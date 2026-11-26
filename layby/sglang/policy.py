@@ -88,11 +88,13 @@ class ParkStrategy(EvictionStrategy):
 
 def place(path, t_pred: float) -> int:
     """Set the predicted next use of the path's idle nodes (in use ones are skipped, as in the vLLM
-    policy); a node another session placed earlier keeps the earlier use."""
+    policy; a node locked only by its own pending D->H write-through is still placed); a node
+    another session placed earlier keeps the earlier use."""
     stamp = counter()
     n = 0
     for node in path:
-        if node.component_data[FULL].lock_ref > 0:
+        wt_lock = 1 if getattr(node, "write_through_pending_id", None) is not None else 0
+        if node.component_data[FULL].lock_ref > wt_lock:
             continue
         old = valid_next_use(node)
         STATE.next_use[node.id] = (t_pred if old is None else min(old, t_pred), stamp)

@@ -1,0 +1,31 @@
+{
+ "_comment": "SGLang 0.5.21 fast regime: the disk tier is a tmpfs of ram_tier_bytes (same size for every arm), charged to the engine's cgroup, so memory.max adds it. The 10% fio health probe runs on the NVMe volume (probe_dir). HC-sel is HiCache file L3 with write_through_selective. kv_chunk_bytes is one HiCache page (64 tokens). sglang_patch_variant: the page-cache patch every SGLang arm runs with (fdatasync or sync_file_range), chosen by orchestrate.py hicache-pilot (its write size and threads in hicache_pilot). Capacities from capacities.json (qwen38_27b.measured, workloads v2); ram_tier_bytes = disk_bytes, so this fast cell is a harness example only (no host RAM holds that tier; plan 4.3 drops the Qwen fast cell). PLACEHOLDER values: the rest.",
+ "cell": "main-sglang-fast-heavy",
+ "plan": "BENCH_PLAN draft 4 (freeze commit to fill)",
+ "seed": 20261010,
+ "engine": "sglang",
+ "model": "Qwen/Qwen3.8-27B-FP8",
+ "regime": "fast",
+ "load": "heavy",
+ "pilot": "pilot_qwen3_8b_sglang.json",
+ "workload": {"path": "/root/phase_r/measured.json", "sessions": 28, "turns": 1133},
+ "capacities": {"gpu_kv_bytes": "10047622348", "cpu_bytes": "26776436736", "disk_bytes": "346861102694"},
+ "ram_tier_bytes": "346861102694",
+ "hard_cap_s": 9000,
+ "kv_chunk_bytes": 9437184,
+ "sglang_patch_variant": "fdatasync",
+ "hicache_pilot": {"bytes": "4G", "threads": 1},
+ "live_scoring": {"side_file": "/root/phase_r/measured.side.jsonl", "ckpt": "/root/dwell/model.safetensors", "calib": "/root/dwell/config.json"},
+ "runner": {"mode": "host", "layby_root": "/root/layby", "venv": "/root/.venv-sglang", "env": {"REPLAY_TIMEOUT": "10800"}, "timeout_s": 14400},
+ "cuda": "0", "port": 30000, "park_port": 28765, "cpus": "2-25", "mems": "0",
+ "disk": {"mount": "/mnt/layby/ram", "wipe": "ram", "probe_dir": "/mnt/layby/A"},
+ "arms": [
+  {"label": "C0", "code": "C0"},
+  {"label": "HC-wt", "code": "T"},
+  {"label": "HC-sel", "code": "T", "env": {"WRITE_POLICY": "write_through_selective"}},
+  {"label": "K", "code": "K"},
+  {"label": "K_ewma", "code": "K_ewma"}
+ ],
+ "dry_run": {"probe": {"seq_read_Bps": 3.6e9, "seq_write_Bps": 2.4e9, "rand_read_Bps": 2.0e9},
+             "ram_probe": {"seq_read_Bps": 2.0e10, "seq_write_Bps": 8.0e9, "rand_read_Bps": 1.0e10}}
+}

@@ -1,0 +1,35 @@
+{
+ "_comment": "Pilot 1 measurements (BENCH_PLAN draft 6, bench/phase_r/make_cells.py docstring). kv_bytes_per_token: the disk tier's measured bytes per token; prefill_tok_s: micro batch 8 at 8,192 tokens; wt_offered_write_Bps: T's measured bytes per unique token x the load's workload unique tokens / its projected C0 makespan; RSS: pilot 1 peak beyond the CPU tier and the page cache (C0, T, T2, CT, PT about 5.2 to 6.9 GiB, K 7.2 to 7.4 GiB with the sidecar, LM 6.3 GiB beyond its L1) plus headroom; pilot 2 re-measures each.",
+ "model": "Qwen/Qwen3.8-27B-FP8",
+ "engine": "vllm",
+ "kv_bytes_per_token": 72472,
+ "arm_rss_bytes": {
+  "C0": 7516192768,
+  "T": 7516192768,
+  "T2": 7516192768,
+  "PT": 7516192768,
+  "CT": 7516192768,
+  "K_ewma": 7516192768,
+  "K_km": 7516192768,
+  "K": 7516192768,
+  "LM": {
+   "vllm": 6442450944,
+   "lmcache_server": 2147483648
+  }
+ },
+ "sidecar_rss_bytes": 2147483648,
+ "loads": {
+  "heavy": {
+   "prefill_tok_s": 10477.5,
+   "wt_offered_write_Bps": 21316359
+  },
+  "light": {
+   "prefill_tok_s": 10477.5,
+   "wt_offered_write_Bps": 9163062
+  },
+  "pressure": {
+   "prefill_tok_s": 10477.5,
+   "wt_offered_write_Bps": 30594083
+  }
+ }
+}

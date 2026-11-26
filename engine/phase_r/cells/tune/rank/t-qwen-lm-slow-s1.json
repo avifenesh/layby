@@ -1,0 +1,192 @@
+{
+ "cell": "t-qwen-lm-slow-s1",
+ "tuning": {
+  "model": "qwen38_27b",
+  "family": "LM",
+  "disk": "slow",
+  "stage": 1,
+  "workload": "qwen38_27b.tuning_20min",
+  "grid": [
+   "LM_c784_default",
+   "LM_c784_default_eager",
+   "LM_c784_retain",
+   "LM_c784_retain_eager",
+   "LM_c1568_default",
+   "LM_c1568_default_eager",
+   "LM_c1568_retain",
+   "LM_c1568_retain_eager"
+  ],
+  "carried": {
+   "C0": {
+    "budget": 8192,
+    "eviction": "lru"
+   }
+  },
+  "dropped": [
+   "eviction ARC: LMCache 0.5.5's --eviction-policy takes LRU, IsolatedLRU or noop only (lmcache/v1/distributed/config.py); eviction stays LRU"
+  ]
+ },
+ "block": {
+  "host": "tune-qwen",
+  "repeat": 1,
+  "attempt": 1,
+  "dir": "/home/avifenesh/park-predictor-data/phase_r/tune/qwen/pr/t-qwen-lm-slow-s1/tune-qwen/r1/a1"
+ },
+ "rule": "p95 TTFT on resumed turns (failed and censored +inf), ties by p50 then grid order",
+ "arms": [
+  {
+   "n": 206,
+   "served": 206,
+   "failed": 0,
+   "censored": 0,
+   "missing": 0,
+   "p50": 4.569058,
+   "p95": 12.215149,
+   "label": "LM_c1568_default",
+   "rank": 1,
+   "code": "LM",
+   "knobs": {
+    "chunk": 1568,
+    "prefetch": "default",
+    "eager": false
+   },
+   "grid_index": 4
+  },
+  {
+   "n": 206,
+   "served": 206,
+   "failed": 0,
+   "censored": 0,
+   "missing": 0,
+   "p50": 4.087441,
+   "p95": 12.330376,
+   "label": "LM_c1568_default_eager",
+   "rank": 2,
+   "code": "LM",
+   "knobs": {
+    "chunk": 1568,
+    "prefetch": "default",
+    "eager": true
+   },
+   "grid_index": 5
+  },
+  {
+   "n": 206,
+   "served": 206,
+   "failed": 0,
+   "censored": 0,
+   "missing": 0,
+   "p50": 4.788951,
+   "p95": 12.350416,
+   "label": "LM_c784_default",
+   "rank": 3,
+   "code": "LM",
+   "knobs": {
+    "chunk": 784,
+    "prefetch": "default",
+    "eager": false
+   },
+   "grid_index": 0
+  },
+  {
+   "n": 206,
+   "served": 206,
+   "failed": 0,
+   "censored": 0,
+   "missing": 0,
+   "p50": 4.783134,
+   "p95": 13.346362,
+   "label": "LM_c784_default_eager",
+   "rank": 4,
+   "code": "LM",
+   "knobs": {
+    "chunk": 784,
+    "prefetch": "default",
+    "eager": true
+   },
+   "grid_index": 1
+  },
+  {
+   "n": 206,
+   "served": 206,
+   "failed": 0,
+   "censored": 0,
+   "missing": 0,
+   "p50": 3.251051,
+   "p95": 14.490363,
+   "label": "LM_c784_retain_eager",
+   "rank": 5,
+   "code": "LMR",
+   "knobs": {
+    "chunk": 784,
+    "prefetch": "retain",
+    "eager": true
+   },
+   "grid_index": 3
+  },
+  {
+   "n": 206,
+   "served": 206,
+   "failed": 0,
+   "censored": 0,
+   "missing": 0,
+   "p50": 3.148462,
+   "p95": 16.551116,
+   "label": "LM_c784_retain",
+   "rank": 6,
+   "code": "LMR",
+   "knobs": {
+    "chunk": 784,
+    "prefetch": "retain",
+    "eager": false
+   },
+   "grid_index": 2
+  },
+  {
+   "n": 206,
+   "served": 206,
+   "failed": 0,
+   "censored": 0,
+   "missing": 0,
+   "p50": 5.774635,
+   "p95": 16.707563,
+   "label": "LM_c1568_retain",
+   "rank": 7,
+   "code": "LMR",
+   "knobs": {
+    "chunk": 1568,
+    "prefetch": "retain",
+    "eager": false
+   },
+   "grid_index": 6
+  },
+  {
+   "n": 206,
+   "served": 206,
+   "failed": 0,
+   "censored": 0,
+   "missing": 0,
+   "p50": 6.592169,
+   "p95": 18.744746,
+   "label": "LM_c1568_retain_eager",
+   "rank": 8,
+   "code": "LMR",
+   "knobs": {
+    "chunk": 1568,
+    "prefetch": "retain",
+    "eager": true
+   },
+   "grid_index": 7
+  }
+ ],
+ "unranked": [],
+ "complete": true,
+ "next_stage": 2,
+ "advance": [
+  "LM_c1568_default",
+  "LM_c1568_default_eager",
+  "LM_c784_default"
+ ],
+ "winner": null,
+ "cell_spec": "/home/avifenesh/.cache/layby-wt/integ/engine/phase_r/cells/tune/t-qwen-lm-slow-s1.json"
+}

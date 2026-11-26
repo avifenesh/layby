@@ -61,8 +61,11 @@ def build(n_chunks, root):
     prim._kv_memoryview = memoryview(buf).cast("B", (n_chunks, B))
     par = NS(tp_size=1, pp_size=1, pcp_size=1, dcp_size=1, rank=0, is_parallelism_agnostic=True)
     spec = NS(blocks_per_chunk=1, tokens_per_hash=T, offload_prompt_only=False, tokens_per_block=[T],
+              extra_config={},
               kv_events_config=NS(enable_kv_cache_events=False, self_describing_kv_events=False),
-              config=NS(groups=[NS(group_id=0, tokens_per_block=T, layer_names=["l0"])], model=NS(name="test/m", dtype="bf16"),
+              config=NS(groups=[NS(group_id=0, tokens_per_block=T, layer_names=["l0"],
+                                   sliding_window_size_in_chunks=None)],
+                        model=NS(name="test/m", dtype="bf16"),
                         cache=NS(tokens_per_hash=T), parallel=par, canonical_layout=False, replicated_layout=False))
     fs = F.ParkFsTier(spec, prim.get_kv_memoryview(), "ParkFsTier", root_dir=root, n_read_threads=2, n_write_threads=2)
     mgr = TieringOffloadingManager(prim, [fs])
@@ -70,13 +73,13 @@ def build(n_chunks, root):
     kvc = KVCacheConfig(num_blocks=64, kv_cache_tensors=[], kv_cache_groups=[KVCacheGroupSpec(
         layer_names=["l0"], kv_cache_spec=FullAttentionSpec(block_size=T, num_kv_heads=1, head_size=8, dtype=torch.bfloat16))])
     vc = NS(cache_config=NS(prefix_cache_retention_interval=None, enable_prefix_caching=True), speculative_config=None,
-            parallel_config=NS(world_size=1, decode_context_parallel_size=1))
+            parallel_config=NS(world_size=1, decode_context_parallel_size=1), num_hash_lookahead_tokens=0)
     cs = OffloadingConnectorScheduler(spec, vc, kvc)
     # ParkConnector's scheduler side without a vLLM config: the request-tracking state its __init__ sets
     conn = object.__new__(C.ParkConnector)
     conn.connector_scheduler, conn.connector_worker = cs, None
     conn.__dict__["_bounding_group_ids"] = ()          # every group is offloaded: no bound on the load
-    conn._waiting, conn._deferred, conn._local, conn._giveups = {}, {}, {}, {}
+    conn._waiting, conn._deferred, conn._local, conn._giveups, conn._ready, conn._prefetched = {}, {}, {}, {}, {}, {}
     conn._loads, conn._finished, conn._early, conn._hints_on = {}, {}, {}, False
     return conn, cs, mgr, prim, fs, prim._policy
 
@@ -123,7 +126,7 @@ def check(prim, pol):
 def request(rid, hs, prompt):
     return NS(request_id=rid, num_computed_tokens=0, num_prompt_tokens=prompt, num_tokens=prompt, block_hashes=hs,
               kv_transfer_params={"park_key": rid}, kv_hints=None, skip_reading_prefix_cache=False,
-              is_finished=lambda: False)
+              skip_reading_external_kv=False, resumable=False, num_in_flight_tokens=0, is_finished=lambda: False)
 
 
 def lookup(conn, cs, mgr, req, local=0):
@@ -269,6 +272,34 @@ try:
     assert STATE.live.acc["n_giveup"] == 3.0, STATE.live.acc
     assert STATE.live.acc["giveup_saved"] > saved, "no saving recorded for a promotion that completed after the give-up"
     assert not conn._giveups, conn._giveups
-    print("defer cap ok: base defers forever; rule admits at the cap with 0 or the ready prefix; promotions land safely")
+
+    # --- 6. a promotion that lands under the cap: the restore costs the promotion, not the admission queue --------
+    # Phase R (Gemma fast heavy, wrx): the wait from first deferral to admission had p50 4.4 s for a 1.9 s transfer;
+    # the rule read that as the disk's restore time, on top of the admission wait Q it prices separately
+    store(mgr, "c-3", [key(h) for h in hashes("e", 8)])   # evicts a again
+    settle(mgr, fs)
+    assert not any(k in pol.chunks for k in A) and all(k in fs._on_disk for k in A)
+    seen = []
+    real_add = STATE.live.add
+    STATE.live.add = lambda now, **kw: (seen.append(kw), real_add(now, **kw))[1]
+    r3 = request("r3", HP, 5 * T)
+    conn.on_new_request(r3)
+    t_first = clock[0]
+    assert lookup(conn, cs, mgr, r3)[0] is None
+    promo = recompute_cost(5 * T) * 0.2
+    clock[0] += promo
+    real_submit_load(held.pop())
+    settle(mgr, fs)
+    out = lookup(conn, cs, mgr, r3)
+    assert out == (4 * T, True), f"the landed prefix should load: {out}"
+    clock[0] += 50.0                                     # the scheduler admits it 50 s later (queue)
+    conn.update_state_after_alloc(r3, blocks_for(4 * T), 4 * T)
+    STATE.live.add = real_add
+    d = [kw["defer"] for kw in seen if "defer" in kw]
+    assert len(d) == 1 and abs(d[0] - promo) < 1e-6, f"defer sample {d}: expected the promotion {promo:.3f} s, not +50 s"
+    row = STATE.rlog[-1]
+    assert abs(row["promo"] - promo) < 1e-3 and abs(row["defer"] - (clock[0] - t_first)) < 1e-3, row
+    print("defer cap ok: base defers forever; rule admits at the cap with 0 or the ready prefix; promotions land safely;"
+          " a landed promotion is measured to its landing")
 finally:
     shutil.rmtree(root, ignore_errors=True)

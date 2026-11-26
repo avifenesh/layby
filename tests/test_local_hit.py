@@ -23,8 +23,9 @@ for h in hashes:
 STATE.policy = None
 
 req = NS(request_id="r1", num_computed_tokens=0, num_prompt_tokens=P, block_hashes=hashes, kv_transfer_params={})
-me = NS(_waiting={}, _deferred={}, _local={}, _giveups={}, connector_scheduler=NS(_req_status={}))
-me._account_misses = lambda *a: PC._account_misses(me, *a)
+me = NS(_waiting={}, _deferred={}, _local={}, _giveups={}, _ready={}, _prefetched={}, _unhold=lambda rid: None,
+        connector_scheduler=NS(_req_status={}))
+me._account_misses = lambda *a, **k: PC._account_misses(me, *a, **k)
 me._waiting["r1"] = now - 0.01
 # the scheduler's lookup saw the whole prompt as a GPU prefix hit (block-aligned), nothing external; this is what
 # ParkConnector.get_num_new_matched_tokens records before it asks the offloading tiers

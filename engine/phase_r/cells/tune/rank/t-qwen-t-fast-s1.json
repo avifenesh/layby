@@ -1,0 +1,73 @@
+{
+ "cell": "t-qwen-t-fast-s1",
+ "tuning": {
+  "model": "qwen38_27b",
+  "family": "T",
+  "disk": "fast",
+  "stage": 1,
+  "workload": "qwen38_27b.tuning_20min",
+  "grid": [
+   "T_b1_t16",
+   "T_b1_t32"
+  ],
+  "carried": {
+   "C0": {
+    "budget": 8192,
+    "eviction": "lru"
+   }
+  },
+  "dropped": []
+ },
+ "block": {
+  "host": "tune-qwen",
+  "repeat": 1,
+  "attempt": 1,
+  "dir": "/home/avifenesh/park-predictor-data/phase_r/tune/qwen/pr/t-qwen-t-fast-s1/tune-qwen/r1/a1"
+ },
+ "rule": "p95 TTFT on resumed turns (failed and censored +inf), ties by p50 then grid order",
+ "arms": [
+  {
+   "n": 206,
+   "served": 206,
+   "failed": 0,
+   "censored": 0,
+   "missing": 0,
+   "p50": 0.867738,
+   "p95": 10.252626,
+   "label": "T_b1_t32",
+   "rank": 1,
+   "code": "T",
+   "knobs": {
+    "blocks_per_chunk": 1,
+    "fs_threads": 32
+   },
+   "grid_index": 1
+  },
+  {
+   "n": 206,
+   "served": 206,
+   "failed": 0,
+   "censored": 0,
+   "missing": 0,
+   "p50": 0.876859,
+   "p95": 10.256044,
+   "label": "T_b1_t16",
+   "rank": 2,
+   "code": "T",
+   "knobs": {
+    "blocks_per_chunk": 1,
+    "fs_threads": 16
+   },
+   "grid_index": 0
+  }
+ ],
+ "unranked": [],
+ "complete": true,
+ "next_stage": 3,
+ "advance": [
+  "T_b1_t32",
+  "T_b1_t16"
+ ],
+ "winner": null,
+ "cell_spec": "/home/avifenesh/.cache/layby-wt/integ/engine/phase_r/cells/tune/t-qwen-t-fast-s1.json"
+}

@@ -13,6 +13,8 @@ LAYBY_ROOT=${LAYBY_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}
 REPLAY=${REPLAY:-$HOME/replay.json}; OUT=${OUT:-$HOME/out}; KV_DIR=${KV_DIR:-$HOME/kvdisk}
 sed -i 's/^ALL_ARMS_DONE$/ARMS_DONE_BEFORE_QUEUE/' $OUT/runner.log
 export VENV=${VENV:-$HOME/venv} ENGINE_DIR=$LAYBY_ROOT/engine REPO=$LAYBY_ROOT PORT=8000 PARK_PORT=28765 MODEL=Qwen/Qwen3-8B
+# pre-Phase R runs: LM's former 340 GiB L2 cap as the disk-tier capacity, arm K on the precomputed curves
+export DISK_BYTES=${DISK_BYTES:-365072220160} LIVE_SCORING=${LIVE_SCORING:-off}
 for spec in "$@"; do
   A=${spec%%:*}; TAG=""; [ "$spec" != "$A" ] && TAG=${spec#*:}
   if [ -n "$TAG" ]; then

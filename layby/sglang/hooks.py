@@ -82,13 +82,26 @@ def _drain_threads():
         if not STATE.leader:
             continue
         if ev[0] == "disk_job":
-            _, t_end, t_sub, nbytes = ev
+            if len(ev) >= 6:
+                _, t_end, t_sub, nbytes, is_load, io_span = ev
+            else:
+                _, t_end, t_sub, nbytes = ev
+                is_load, io_span = None, 0.0
             x = nbytes / (STATE.speeds.gbps("disk") * 1e9)
-            STATE.live.add(t_end, n_disk=1.0, wait_disk=max(t_end - t_sub - x, 0.0))
+            wait = max(t_end - t_sub - x, 0.0)
+            kw = dict(n_disk=1.0, wait_disk=wait)
+            if is_load is True:
+                kw.update(n_disk_r=1.0, wait_disk_r=wait)
+                if nbytes > 0 and io_span > 0:
+                    STATE.speeds.link(t_end, "disk", nbytes, io_span)
+            elif is_load is False:
+                kw.update(n_disk_w=1.0)
+            STATE.live.add(t_end, **kw)
         else:
             _, t_end, span, nbytes = ev
             if span > 0:
-                if nbytes:
+                # only feed combined bytes into disk speed before reads have run
+                if nbytes and STATE.live.acc.get("n_disk_r", 0.0) == 0.0:
                     STATE.speeds.link(t_end, "disk", nbytes, span)
                 STATE.live.add(t_end, busy_disk=span)
 
@@ -184,8 +197,12 @@ def _account_misses(req, now):
     p, L = STATE.params(), STATE.live
     n_cpu = L.rate("n_cpu", now)
     wait_cpu = L.rate("wait_cpu", now) / n_cpu if n_cpu > 0 else 0.0
-    n_disk = L.rate("n_disk", now)
-    wait_disk = L.rate("wait_disk", now) / n_disk if n_disk > 0 else 0.0
+    if L.acc.get("n_disk_r", 0.0) > 0.0 or L.acc.get("n_disk_w", 0.0) > 0.0:
+        n_disk = L.rate("n_disk_r", now)
+        wait_disk = L.rate("wait_disk_r", now) / n_disk if n_disk > 0 else 0.0
+    else:
+        n_disk = L.rate("n_disk", now)
+        wait_disk = L.rate("wait_disk", now) / n_disk if n_disk > 0 else 0.0
     u = min(L.rate("busy_cpu", now), 1.0)
     npf = L.rate("pf", now)
     bpt = p.bytes_per_token
@@ -221,10 +238,18 @@ def _step(sched, batch):
         pt = sum(n for n in lens if n > 1)
         npre = sum(1 for n in lens if n > 1)
     _mark(sched, now, npre)
+    # A 1-tick overlap idle gap sets _sched_idled without calling on_idle; never time across it.
+    if getattr(sched, "_sched_idled", False):
+        STATE.step_last = None
+    # Batches with an active H->D HiCache load-back stall forward_stream on PCIe, not compute;
+    # exclude them from Speeds.step so H->D transfer latency does not inflate f0.
+    has_load = getattr(batch, "hicache_consumer_index", -1) >= 0
     if STATE.step_last is not None:
-        t, p_tokens = STATE.step_last
-        STATE.speeds.step(now, now - t, p_tokens)
-    STATE.step_last = (now, pt)
+        t, p_tokens = STATE.step_last[0], STATE.step_last[1]
+        prev_load = STATE.step_last[2] if len(STATE.step_last) >= 3 else False
+        if not prev_load:
+            STATE.speeds.step(now, now - t, p_tokens)
+    STATE.step_last = (now, pt, has_load)
 
 
 def _mark(sched, now, npre):

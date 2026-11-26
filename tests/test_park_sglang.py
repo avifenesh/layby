@@ -5,7 +5,7 @@
 Eviction order and placement on mock nodes; the plugin's registration and hook targets against the
 installed SGLang; a real ParkRadixCache on the Python TreeCore with a CPU allocator (no host tier:
 HiCache needs CUDA) for split, eviction events and the tick path; the hint port; the sidecar tag;
-replay.py against a mock SGLang server, with and without --window.
+replay.py against a mock SGLang server, with and without --hard-cap.
 """
 import json
 import os
@@ -164,7 +164,8 @@ def test_plugin_registers_and_hooks_resolve():
     assert "park" in RADIX_EVICTION_POLICY_CHOICES and get_radix_cache_factory("park") is not None
     assert type(get_eviction_strategy("park", {"port": 8765})).__name__ == "ParkStrategy"
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-    for m in ("insert", "insert_req", "on_release", "inc_lock_ref", "loading_check", "init_hicache",
+    assert callable(getattr(UnifiedRadixCache, "insert_req", None)) or callable(getattr(UnifiedRadixCache, "checkpoint", None))
+    for m in ("insert", "on_release", "inc_lock_ref", "loading_check", "init_hicache",
               "_log_write_ack_metrics", "write_backup_storage"):
         assert callable(getattr(UnifiedRadixCache, m)), m
 
@@ -341,28 +342,29 @@ def run_replay(tmp_path, port, hint_port, extra=()):
     return [json.loads(l) for l in open(out)], time.time() - t0
 
 
-def test_replay_sglang_and_window(tmp_path):
+def test_replay_sglang_and_hard_cap(tmp_path):
     port, hport, seen = free_port(), free_port(), []
     mock_sglang(port, hport, seen)
-    rows, wall = run_replay(tmp_path, port, hport, ["--window", "2"])
-    turns = [r for r in rows if "ttft" in r]
-    trunc = [r for r in rows if r.get("truncated_at_window")]
-    # s0: turn 0 and 1 sent; turn 1's 5 s gap would pass the 2 s window: stop at once at turn 2.
-    # s1 starts at 30 s, past the window: stopped before turn 0 without waiting for it.
+    rows, wall = run_replay(tmp_path, port, hport, ["--hard-cap", "2"])
+    turns = [r for r in rows if "ttft" in r and not r.get("censored")]
+    cens = [r for r in rows if "ttft" in r and r.get("censored")]
+    # s0: turn 0 and 1 served; the cap hits during turn 1's 5 s gap: turn 2 censored.
+    # s1 starts at 30 s, past the cap: all three turns censored, without waiting for its start.
     assert [(r["session"], r["turn"]) for r in turns] == [("s0", 0), ("s0", 1)]
-    assert sorted((r["session"], r["turn"]) for r in trunc) == [("s0", 2), ("s1", 0)]
-    assert wall < 10
+    assert sorted((r["session"], r["turn"]) for r in cens) == [("s0", 2), ("s1", 0), ("s1", 1), ("s1", 2)]
+    assert all(r["ttft"] == float("inf") for r in cens)
+    assert next(r["wall_s"] for r in rows if "wall_s" in r) < 5      # the cap, not s1's 30 s start (startup excluded)
     gens = [b for k, _, b in seen if k == "gen"]
     assert gens[0]["sampling_params"]["custom_params"] == {"park_key": "s0-0"}
     assert gens[0]["sampling_params"]["ignore_eos"] and gens[0]["sampling_params"]["max_new_tokens"] == 3
     # turn 1's prompt is turn 0's prompt, its output ids, and 8 new tokens
     assert gens[1]["input_ids"][:11] == gens[0]["input_ids"] + [7, 8, 9] and len(gens[1]["input_ids"]) == 19
     hints = sorted(b["key"] for k, _, b in seen if k == "hint")
-    assert hints == ["s0-0", "s0-1"]                  # the truncated session's last hint still goes out
+    assert hints == ["s0-0", "s0-1"]                  # the censored session's last served hint still goes out
     assert turns[0]["usage"]["prompt_tokens"] == 8 and turns[0]["out_tokens"] == 3
 
 
-def test_replay_sglang_without_window_runs_all_turns(tmp_path):
+def test_replay_sglang_without_cap_runs_all_turns(tmp_path):
     port, hport, seen = free_port(), free_port(), []
     mock_sglang(port, hport, seen)
     turns = [dict(new_tokens=8, out_len=2, kind="tool", gap_after=0.1, surv_v6=[0.5] * 15),
@@ -374,7 +376,7 @@ def test_replay_sglang_without_window_runs_all_turns(tmp_path):
                     "sglang", "--url", f"http://127.0.0.1:{port}"], check=True, timeout=60)
     rows = [json.loads(l) for l in open(out)]
     assert [r["turn"] for r in rows if "ttft" in r] == [0, 1]
-    assert not any(r.get("truncated_at_window") for r in rows)
+    assert not any(r.get("censored") or r.get("failed") for r in rows if "ttft" in r)
 
 
 def test_replay_vllm_path_unchanged(tmp_path):
@@ -423,3 +425,148 @@ def test_link_telemetry_from_storage_jobs_and_load_acks():
     cache._park_load_ack(ack)
     assert abs(STATE.speeds.gbps("cpu") - 20.0) < 1e-9
     assert abs(STATE.live.acc["n_cpu"] - 1.0) < 0.01 and 0.9 < STATE.live.acc["wait_cpu"] < 1.0
+
+
+def test_account_misses_uses_read_only_disk_wait():
+    from layby.sglang import hooks
+    cache, _ = make_cache()
+    STATE.page_size, STATE.bytes_per_token = 64, 1000.0
+    now = time.monotonic()
+    # Background write had huge wait (50s), foreground read had tiny wait (0.05s)
+    STATE.live.add(now, n_disk=2.0, wait_disk=50.05, n_disk_r=1.0, wait_disk_r=0.05, n_disk_w=1.0)
+    STATE.g_evicted["h0"] = now - 5.0
+    cache.park_prompt_hashes = lambda req: ["h0"]
+    req = SimpleNamespace(origin_input_ids=list(range(64)), cached_tokens_device=0,
+                          cached_tokens_host=0, cached_tokens_storage=64)
+    hooks._account_misses(req, now)
+    # Loss must reflect ~0.05s read wait (not 25s combined write+read wait)
+    assert STATE.live.acc["miss_g"] < 1.0, f"miss_g polluted by write wait: {STATE.live.acc['miss_g']}"
+
+
+def test_dec_lock_ref_and_host_lock_start_idle_after_write_through():
+    cache, alloc = make_cache()
+    r = insert(cache, alloc, list(range(200, 264)))
+    leaf = r.last_device_node
+    # Simulate SGLang 0.5.23 write-through lifecycle: request + write-through both hold lock_ref
+    req_lock = cache.inc_lock_ref(leaf).to_dec_params()
+    cache._park_in_backup = True
+    try:
+        wt_lock = cache.inc_lock_ref(leaf).to_dec_params()
+    finally:
+        cache._park_in_backup = False
+    # Request finishes and unlocks while write-through still holds lock_ref == 1
+    cache.dec_lock_ref(leaf, req_lock)
+    assert leaf not in STATE.g_idle and leaf not in STATE.c_idle
+    # Write-through completes: node becomes backuped, then dec_lock_ref drops lock_ref -> 0
+    node = cache.tree_core._node_arena[leaf]
+    node.component_data[ComponentType.FULL].host_value = torch.zeros(64, dtype=torch.int64)
+    cache._park_cpu_store(node)  # called before dec_lock_ref in SGLang 0.5.23
+    assert leaf not in STATE.c_idle
+    cache.dec_lock_ref(leaf, wt_lock)
+    assert leaf in STATE.g_idle and leaf in STATE.c_idle
+    # A subsequent real request lock ends both idle periods as censored reuses (non-zero age)
+    STATE.g_idle[leaf] = (time.monotonic() - 12.0, 64.0)
+    STATE.c_idle[leaf] = (time.monotonic() - 12.0, 64.0)
+    reuse_lock = cache.inc_lock_ref(leaf).to_dec_params()
+    assert leaf not in STATE.g_idle and leaf not in STATE.c_idle
+    assert STATE.live.km["ce_g"].sum() >= 64.0 and STATE.live.km["ce_c"].sum() >= 64.0
+    # Releasing while host_lock_ref > 0 starts g_idle only; dec_host_lock_ref then starts c_idle
+    host_lock = cache.inc_host_lock_ref(leaf).to_dec_params()
+    cache.dec_lock_ref(leaf, reuse_lock)
+    assert leaf in STATE.g_idle and leaf not in STATE.c_idle
+    cache.dec_host_lock_ref(leaf, host_lock)
+    assert leaf in STATE.c_idle
+    # Internal checkpoint relock must not create fake idle or fake reuse events
+    ce_before = float(STATE.live.km["ce_g"].sum())
+    cache._park_in_checkpoint = True
+    try:
+        lk = cache.inc_lock_ref(leaf).to_dec_params()
+        cache.dec_lock_ref(leaf, lk)
+    finally:
+        cache._park_in_checkpoint = False
+    assert float(STATE.live.km["ce_g"].sum()) == ce_before
+
+
+def test_step_excludes_hicache_load_back_and_overlap_idle_gap(monkeypatch):
+    from layby.sglang import hooks
+    cache, _ = make_cache()
+    now = [100.0]
+    monkeypatch.setattr(hooks.time, "monotonic", lambda: now[0])
+    sched = SimpleNamespace(waiting_queue=[], _sched_idled=False)
+    mk = lambda extend, lens, hci=-1: SimpleNamespace(
+        forward_mode=SimpleNamespace(is_extend=lambda: extend),
+        extend_lens=lens,
+        hicache_consumer_index=hci,
+    )
+    # 1. Pure compute prefill (1000 tok in 0.11s -> f0 ~ 0.00010 s/tok)
+    hooks._step(sched, mk(True, [1000], hci=-1))
+    now[0] += 0.11
+    # 2. Load-back stalled prefill (300 tok, 0.30s PCIe stall, hci=5) -> must NOT pollute f0
+    hooks._step(sched, mk(True, [300], hci=5))
+    f0_clean = STATE.speeds.f0()
+    now[0] += 0.30
+    hooks._step(sched, mk(False, [], hci=-1))
+    assert abs(STATE.speeds.f0() - f0_clean) < 1e-12
+    # 3. 1-tick overlap idle gap (_sched_idled=True) -> must NOT time across idle
+    now[0] += 5.0
+    sched._sched_idled = True
+    hooks._step(sched, mk(False, [], hci=-1))
+    assert STATE.speeds.acc.get("ds", 0.0) < 1.0
+
+
+def test_place_handles_pending_write_through_lock(monkeypatch):
+    ticks((0, 100.0), (20, 120.0))
+    monkeypatch.setattr(policy, "counter", lambda: 21.0)
+    wt_only = Node(10, lock=1)
+    wt_only.write_through_pending_id = 42
+    wt_and_req = Node(10, lock=2)
+    wt_and_req.write_through_pending_id = 42
+    req_only = Node(10, lock=1)
+    assert policy.place([wt_only, wt_and_req, req_only], 180.0) == 1
+    assert STATE.next_use[wt_only.id][0] == 180.0
+    assert wt_and_req.id not in STATE.next_use and req_only.id not in STATE.next_use
+
+
+def test_park_write_path_defers_unbacked_gpu_nodes_without_forcing_d2h(monkeypatch):
+    cache, alloc = make_cache()
+    a = list(range(300, 332))
+    r1 = insert(cache, alloc, a)
+    insert(cache, alloc, a[:16] + list(range(800, 816)))  # splits into parent (16) -> child (16)
+    leaf = r1.last_device_node
+    path = cache.park_path(leaf)
+    assert len(path) == 2
+    child, parent = path[0], path[1]
+    cache.enable_storage = True
+    called = []
+    monkeypatch.setattr(cache, "_execute_and_commit_kv_backup", lambda *a, **k: called.append(True))
+    cache.park_write_path(path)
+    assert parent.id in STATE.disk_ok and child.id in STATE.disk_ok
+    assert called == []  # never forces D->H / pins GPU memory outside SGLang's own write policy
+
+
+def test_decide_and_apply_fall_back_to_surviving_prompt_ancestor():
+    from layby.sglang import hooks
+    from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+    cache, alloc = make_cache()
+    a = list(range(400, 448))
+    r1 = insert(cache, alloc, a)
+    insert(cache, alloc, a[:32] + list(range(900, 916)))  # splits into prompt parent (32) + output leaf (16)
+    leaf = r1.last_device_node
+    parent = cache.park_path(leaf)[1].id
+    STATE.port, STATE.server = 1, False
+    req = SimpleNamespace(rid="r-anc", finished=lambda: True,
+                          sampling_params=SimpleNamespace(custom_params={"park_key": "s-anc"}))
+    cache._park_finish(req, 48, [r1])
+    assert STATE.entries["s-anc"]["ancestors"] == [leaf, parent]
+    # Evict the tiny unbacked output leaf (16 tok) while prompt parent (32 tok) remains in tree
+    cache.inc_lock_ref(parent)
+    cache.evict(EvictParams(num_tokens=16))
+    assert cache.park_path(leaf) == [] and len(cache.park_path(parent)) == 1
+    # Late hint arrives after output leaf was evicted -> must NOT hit gone, must place prompt parent!
+    STATE.hints.put(("s-anc", [0.9] * 15))
+    # Unlock parent so policy.place applies to it
+    node_p = cache.tree_core._node_arena[parent]
+    node_p.component_data[ComponentType.FULL].lock_ref = 0
+    tick_roundtrip(hooks)
+    assert STATE.counts["gone"] == 0
+    assert parent in STATE.next_use
